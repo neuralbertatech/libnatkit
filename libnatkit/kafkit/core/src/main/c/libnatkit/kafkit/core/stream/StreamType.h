@@ -75,6 +75,8 @@ const char* streamTypeToString(stream_type_t type) {
 
     default: assert(0);
   }
+
+  return NULL;
 }
 
 #endif // KAFKIT_CORE_STREAM_STREAM_TYPE_H_

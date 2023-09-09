@@ -14,7 +14,7 @@ typedef enum {
 
 
 // TODO: Return result rather than string
-const char* streamExtensionToString(stream_extension_t extension) {
+const char* __declspec(dllexport) streamExtensionToString(stream_extension_t extension) {
   switch (extension) {
     case STREAMEXTENSION_CORE:      return "Core";
     case STREAMEXTENSION_EXECUTION: return "Execution";

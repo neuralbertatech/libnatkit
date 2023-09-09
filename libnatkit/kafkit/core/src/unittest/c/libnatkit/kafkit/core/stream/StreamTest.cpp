@@ -23,6 +23,7 @@ TEST_F(StreamTest, parseStreamString_validMetaStream) {
     EXPECT_EQ(123, stream->id);
     EXPECT_STREQ("myEncoder", stream->encoder);
     EXPECT_STREQ("mySchema", stream->schema);
+    std::cout << "Hi there\n";
 
     freeStream(stream);
 }
