@@ -6,17 +6,17 @@
 
 #include <stdio.h>
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(__msvc_cplusplus)
 extern "C" {
 #endif
 
-struct Stream {
+typedef struct Stream {
   const char* name;
   const stream_type_t type;
   const stream_id_t id;
   const char* encoder;
   const char* schema;
-};
+} Stream;
 
 Stream* constructStreamByCopy(const char* name, const stream_type_t* type, const stream_id_t id, const char* encoder, const char* schema) {
   Stream* stream = (Stream*)malloc(sizeof(Stream));
@@ -120,7 +120,7 @@ int parseStreamString(const char* streamString, Stream** returnStream) {
   return 1;
 }
 
-#ifdef __cplusplus
+#if defined(__cplusplus) || defined(__msvc_cplusplus)
 }
 #endif
 
