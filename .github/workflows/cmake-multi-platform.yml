@@ -107,7 +107,7 @@ jobs:
       run: mv ${{ steps.strings.outputs.build-output-dir }}/libnatkit/kafkit/core/src/CTestTestfile.cmake ${{ steps.strings.outputs.build-output-dir }}/bin/Debug
 
     - name: Add Test Dir to CTest
-      run: echo "\nsubdirs(\"bin/Debug\")" >> ${{ steps.strings.outputs.build-output-dir }}/CTestTestfile.cmake
+      run: echo 'subdirs("bin/Debug")' >> ${{ steps.strings.outputs.build-output-dir }}/CTestTestfile.cmake
 
     - name: Check CTest config
       run: cat ${{ steps.strings.outputs.build-output-dir }}/CTestTestfile.cmake
