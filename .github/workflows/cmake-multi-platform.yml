@@ -91,6 +91,9 @@ jobs:
     - name: Add bin to Path
       run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+    - name: Echo Path (DEBUG)
+      run: echo $PATH
+
     - name: Test
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
       run: ctest --build-config Release --output-on-failure
