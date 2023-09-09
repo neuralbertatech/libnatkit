@@ -94,6 +94,30 @@ jobs:
     - name: Build
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config Release
 
+    - name: Check ls folder
+      run: ls ${{ steps.strings.outputs.build-output-dir }}
+
+    - name: Check bin folder
+      run: ls ${{ steps.strings.outputs.build-output-dir }}/bin
+
+    - name: Move Libraries
+      run: cp ${{ steps.strings.outputs.build-output-dir }}/lib/Debug/* ${{ steps.strings.outputs.build-output-dir }}/bin/Debug/
+
+    - name: Move CTest Config
+      run: mv ${{ steps.strings.outputs.build-output-dir }}/libnatkit/kafkit/core/src/CTestTestfile.cmake ${{ steps.strings.outputs.build-output-dir }}/bin/Debug
+
+    - name: Add Test Dir to CTest
+      run: echo "\nsubdirs(\"bin/Debug\")" >> ${{ steps.strings.outputs.build-output-dir }}/CTestTestfile.cmake
+
+    - name: Check CTest config
+      run: cat ${{ steps.strings.outputs.build-output-dir }}/CTestTestfile.cmake
+
+    - name: Check bin
+      run: ls ${{ steps.strings.outputs.build-output-dir }}/bin/Debug
+
+    - name: Check bin CTest config
+      run: cat ${{ steps.strings.outputs.build-output-dir }}/bin/Debug/CTestTestfile.cmake
+
     - name: Test
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
       run: ctest --build-config Release --output-on-failure

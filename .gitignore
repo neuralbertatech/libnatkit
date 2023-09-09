@@ -6,3 +6,4 @@ build/
 /.projectile
 cmake/
 /third-party/
+.vs/
