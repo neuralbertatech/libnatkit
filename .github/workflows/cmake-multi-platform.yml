@@ -74,6 +74,15 @@ jobs:
       run: |
         echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
+    - name: Add lib to Path
+      run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Add bin to Path
+      run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Echo Context (DEBUG)
+      run: echo "$GITHUB_CONTEXT"
+
     - name: Configure CMake
       run: >
         cmake -B ${{ steps.strings.outputs.build-output-dir }}
@@ -84,15 +93,6 @@ jobs:
 
     - name: Build
       run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config Release
-
-    - name: Add lib to Path
-      run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-    - name: Add bin to Path
-      run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-    - name: Echo Path (DEBUG)
-      run: echo $PATH
 
     - name: Test
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
