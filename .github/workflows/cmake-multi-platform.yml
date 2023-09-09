@@ -64,10 +64,10 @@ jobs:
 
     - name: Build
       # Build your program with the given configuration. Note that --config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
-      run: |
-        ${{ matrix.os == 'windows-latest' && echo "&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& HI &&&&&&&&&&&&&&&&&&&&&&&&&&&" }}
-        cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }}
-        ${{ matrix.os == 'windows-latest' && Add-Content $env:GITHUB_PATH "${{ github.workspace }}/build/lib/Debug" && Add-Content $env:GITHUB_PATH "${{ github.workspace }}/build/bin/Debug" }}
+      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config ${{ matrix.build_type }}
+
+    - name: Post-Build
+      run: ${{ matrix.os == 'windows-latest' && Add-Content $env:GITHUB_PATH "${{ github.workspace }}/build/lib/Debug" && Add-Content $env:GITHUB_PATH "${{ github.workspace }}/build/bin/Debug" }}
 
     - name: Test
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
