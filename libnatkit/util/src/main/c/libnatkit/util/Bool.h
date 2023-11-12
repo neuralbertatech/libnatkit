@@ -1,16 +1,30 @@
 #ifndef LIBNATKIT_UTIL_BOOL_H_
 #define LIBNATKIT_UTIL_BOOL_H_
 
-typedef char bool;
-#define true 1
-#define false 0
+#if defined(__cplusplus) || defined(__msvc_cplusplus)
+extern "C" {
+#endif
 
-bool not(bool val) {
+
+///typedef char bool_t;
+
+//#if !defined(__cplusplus) && !defined(__msvc_cplusplus)
+#define True 1
+#define False 0
+#define bool_t char
+
+bool_t Not(bool_t val) {
     if (val == 0) {
-        return false;
+        return True;
     } else {
-        return true;
+        return False;
     }
 }
+
+//#endif
+
+#if defined(__cplusplus) || defined(__msvc_cplusplus)
+}
+#endif
 
 #endif // LIBNATKIT_UTIL_BOOL_H_
