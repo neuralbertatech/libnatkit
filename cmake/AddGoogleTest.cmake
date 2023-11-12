@@ -7,25 +7,13 @@
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 
 if(CMAKE_VERSION VERSION_LESS 3.11)
-    set(UPDATE_DISCONNECTED_IF_AVAILABLE "UPDATE_DISCONNECTED 1")
-
-    include(DownloadProject)
-    download_project(PROJ                googletest
-		     GIT_REPOSITORY      https://github.com/google/googletest.git
-		     GIT_TAG             v1.14.0
-		     UPDATE_DISCONNECTED 1
-		     QUIET
-    )
-
-    # CMake warning suppression will not be needed in version 1.9
-    set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1 CACHE BOOL "")
-    add_subdirectory(${googletest_SOURCE_DIR} ${googletest_SOURCE_DIR} EXCLUDE_FROM_ALL)
-    unset(CMAKE_SUPPRESS_DEVELOPER_WARNINGS)
+  messagae(FATAL_ERROR "CMake version 3.11 or higher is required!")
 else()
     include(FetchContent)
     FetchContent_Declare(googletest
-      GIT_REPOSITORY      https://github.com/google/googletest.git
-      GIT_TAG             v1.14.0
+      #GIT_REPOSITORY      https://github.com/google/googletest.git
+      #GIT_TAG             v1.14.0
+      SOURCE_DIR          ${THIRD_PARTY_DIR}/googletest
     )
     FetchContent_GetProperties(googletest)
     if(NOT googletest_POPULATED)
@@ -65,7 +53,13 @@ endif()
 macro(add_gtest TESTNAME)
     target_link_libraries(${TESTNAME} PUBLIC gtest gmock gtest_main)
 
-    add_test(${TESTNAME} ${TESTNAME} WORKING_DIRECTORY ${BINARY_INSTALL_DIR}/Debug)
+    if (WIN32)
+      add_test(NAME ${TESTNAME}
+               COMMAND ${TESTNAME}
+               WORKING_DIRECTORY ${BINARY_INSTALL_DIR}/Debug)
+    else()
+      add_test(NAME ${TESTNAME} COMMAND ${TESTNAME})
+    endif()
     #set_target_properties(${TESTNAME} PROPERTIES FOLDER "Tests")
 
 endmacro()

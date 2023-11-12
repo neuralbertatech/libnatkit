@@ -5,5 +5,7 @@ tmp/
 build/
 /.projectile
 cmake/
-/third-party/
+#/third-party/
 .vs/
+compile_commands.json
+.ccls-cache/

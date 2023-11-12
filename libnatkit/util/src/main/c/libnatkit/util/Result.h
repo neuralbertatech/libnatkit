@@ -1,34 +1,38 @@
 #ifndef LIBNATKIT_UTIL_RESULT_H_
 #define LIBNATKIT_UTIL_RESULT_H_
 
-#include <libnatkit/util/Result.h>
+#if defined(__cplusplus) || defined(__msvc_cplusplus)
+extern "C" {
+#endif
 
-struct Result {
-    const bool isSuccess = false;
-    const char* failureMessage = NULL;
-};
+#include <libnatkit/util/Bool.h>
+#include <libnatkit/util/String.h>
 
-Result successfulResult() {
-    return Result {
-        .isSucces = true;
-        .failureMessage = NULL;
-    };
+typedef struct Result {
+    const bool_t isSuccess;
+    const char* failureMessage;
+} Result;
+
+void freeResult(Result* result);
+
+Result createResultWithCopy(bool_t isSuccess, const char* failureMessage);
+
+Result* newResultWithCopy(bool_t isSuccess, const char* failureMessage);
+
+Result createResultWithRef(bool_t isSuccess, const char* failureMessage);
+
+Result* newResultWithRef(bool_t isSuccess, const char* failureMessage);
+
+Result successfulResult();
+
+Result failedResult(const char* message);
+
+bool_t isResultSuccessful(const Result result);
+
+bool_t isResultFailure(const Result result);
+
+#if defined(__cplusplus) || defined(__msvc_cplusplus)
 }
-
-Result failedResult(const char* message) {
-    // TODO clone string
-    return Result {
-        .isSuccess = false;
-        .failureMessage = message;
-    };'
-}
-
-bool isResultSuccessful(Result result) {
-    return result.isSuccess;
-}
-
-bool isResultFailure(Result result) {
-    return not(result.isSuccess);
-}
+#endif
 
 #endif // LIBNATKIT_UTIL_RESULT_H_
