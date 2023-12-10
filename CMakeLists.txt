@@ -130,8 +130,8 @@ if (WIN32)
 	)
 endif()
 
-#add_library(nlohmann INTERFACE)
-#target_include_directories(nolohmann INTERFACE ${THIRD_PARTY_DIR}/nlohmann/include)
+add_library(nlohmann INTERFACE)
+target_include_directories(nlohmann INTERFACE ${THIRD_PARTY_DIR}/nlohmann/include)
 
 
 if(BUILD_TESTING)

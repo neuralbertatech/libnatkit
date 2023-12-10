@@ -8,7 +8,6 @@
 
 #include <libnatkit/util/Strings.hpp>
 
-
 namespace nat::kafkit {
 
 enum class StreamType {
@@ -51,9 +50,18 @@ static const std::unordered_map<std::string, StreamType>
       return newMap;
     }();
 
+static const std::unordered_map<std::string, StreamType>
+    lowercaseStringToStreamTypeMapping = []() {
+      std::unordered_map<std::string, StreamType> lowercaseMap{};
+      for (const auto& [key, val] : stringToStreamTypeMapping) {
+        lowercaseMap[util::Strings::toLowercase(key)] = val;
+      }
+      return lowercaseMap;
+    }();
+
 std::string toString(const StreamType &streamType);
 
 std::optional<StreamType>
 streamTypeFromString(const std::string &streamTypeString);
 
-}
+} // namespace nat::kafkit

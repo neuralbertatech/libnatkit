@@ -24,8 +24,9 @@ std::string toString(const StreamType &streamType) {
 
 std::optional<StreamType>
 streamTypeFromString(const std::string &streamTypeString) {
-  if (stringToStreamTypeMapping.contains(streamTypeString)) {
-    return stringToStreamTypeMapping.at(streamTypeString);
+  const auto lowercaseType = util::Strings::toLowercase(streamTypeString);
+  if (lowercaseStringToStreamTypeMapping.contains(lowercaseType)) {
+    return lowercaseStringToStreamTypeMapping.at(lowercaseType);
   } else {
     return {};
   }

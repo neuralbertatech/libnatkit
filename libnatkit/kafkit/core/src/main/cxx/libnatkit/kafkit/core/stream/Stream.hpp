@@ -58,6 +58,10 @@ public:
   SerializationType getSerializationType() const { return serializationType; }
 
   std::string getSchemaName() const { return schemaName; }
+
+  std::string toTopicString() const {
+    return toString(type) + "-" + std::to_string(id) + "-" + encoderName + "-" + schemaName;
+  }
 };
 
 } // namespace nat::kafkit
