@@ -15,6 +15,7 @@ class RawStream {
     const uint64_t id;
     std::vector<std::unique_ptr<BasicTopicInformation>> topics;
 
+  public:
 	RawStream(const uint64_t id, std::vector<std::unique_ptr<BasicTopicInformation>>&& topics) : id(id), topics(std::move(topics)) {}
 	
 	RawStream(const uint64_t id, const std::vector<BasicTopicInformation>& topics) : id(id), topics(nat::util::Vectors::wrapContainedValueWithUnique(topics)) {}

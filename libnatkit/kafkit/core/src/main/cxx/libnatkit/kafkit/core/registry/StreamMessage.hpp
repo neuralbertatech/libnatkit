@@ -1,21 +1,26 @@
 #pragma once
 
+#include <cstdint>
+
 #include <libnatkit/kafkit/core/registry/PlainTextMessage.hpp>
 #include <libnatkit/kafkit/core/stream/Stream.hpp>
 #include <libnatkit/kafkit/core/stream/StreamType.hpp>
 
+
 namespace nat::kafkit {
 
 class StreamMessage {
-  const std::string message;
+  const std::vector<uint8_t> message;
   const Stream stream;
 
-  public:
-    StreamMessage(const PlainTextMessage& message, const Stream& stream) : message(message.getPlainTextMessage()) stream(stream) {}
+public:
+  StreamMessage(const std::vector<uint8_t>& message, const Stream& stream) : message(message), stream(stream) {}
 
-    std::string getMessage() const { return message; }
+  std::vector<uint8_t> getMessage() const { return message; }
 
-    SerializationType getSerializationType() const { return stream.getSerializationType(); }     
+  SerializationType getSerializationType() const { return stream.getSerializationType(); }     
+
+  std::string getSchemaName() const { return stream.getSchemaName(); }
 };
 
 }

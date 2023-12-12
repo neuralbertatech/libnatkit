@@ -11,6 +11,7 @@ set(LIBNATKIT_UTIL_CXX_FILES
   ${LIBNATKIT_UTIL_ROOT}/main/cxx/libnatkit/util/Strings.hpp
   ${LIBNATKIT_UTIL_ROOT}/main/cxx/libnatkit/util/Strings.cpp
   ${LIBNATKIT_UTIL_ROOT}/main/cxx/libnatkit/util/Vectors.hpp
+  ${LIBNATKIT_UTIL_ROOT}/main/cxx/libnatkit/util/Casting.hpp
   )
 
 #add_library(libnatkit-util-c SHARED ${LIBNATKIT_UTIL_C_FILES})

@@ -1,18 +1,24 @@
 #pragma once
 
-#include <vector>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
 
 #include <libnatkit/kafkit/core/registry/SerializationType.hpp>
+#include <libnatkit/kafkit/core/registry/Message.hpp>
 
 namespace nat::kafkit {
 
-template <typename T>
 class Schema {
   public:
-    virtual std::vector<uint8_t> encode(const SerializationType& type) = 0;
+    virtual bool isSerializationTypeSupported(const SerializationType) const = 0;
 
-    virtual T decode(const std::vector<uint8_t>& message, const SerializationType& type) = 0;
+    virtual std::unique_ptr<message_t> encodeToBytes(const SerializationType& type) const = 0;
+
+    virtual std::string getName() const = 0;
+
+    virtual std::string toString() const = 0;
 };
 
 }

@@ -10,9 +10,9 @@ class Encoder {
   public:
     virtual ~Encoder();
 
-    bool isSerializationTypeSupported(const SerializationType) = 0;
+    virtual bool isSerializationTypeSupported(const SerializationType) = 0;
 
-    std::vector<uint8_t> encode(const StreamMessage& message) = 0;
+    virtual std::vector<uint8_t> encode(const StreamMessage& message) = 0;
 };
 
 }

@@ -8,15 +8,22 @@ set(KAFKIT_CORE_C_FILES
   )
 
 set(KAFKIT_CORE_CXX_FILES
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/schemas/BasicMetaInfoSchema.hpp
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/schemas/Schema.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/stream/BasicTopicInformation.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/stream/RawStream.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/stream/Stream.hpp
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/stream/StreamInfo.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/stream/StreamType.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/stream/StreamType.cpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/broker/BrokerManager.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/broker/BrokerManagerImpl.cpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/SerializationType.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/SerializationType.cpp
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/Message.hpp
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/TopicTranslator.hpp
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/Registry.hpp
+  ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/Registry.cpp
   )
 
 
@@ -25,7 +32,7 @@ set_target_properties(kafkit-core-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(kafkit-core-cxx PUBLIC
   librdkafka-cxx
   libnatkit-util-cxx
-  #nlohmann
+  nlohmann
 )
 target_include_directories(kafkit-core-cxx
   PUBLIC
@@ -42,6 +49,8 @@ if (BUILD_TESTING)
 
 set(KAFKIT_CORE_UNITTEST_CXX_FILES
     ${KAFKIT_CORE_ROOT}/unittest/cxx/libnatkit/kafkit/core/stream/StreamTest.cpp
+    ${KAFKIT_CORE_ROOT}/unittest/cxx/libnatkit/kafkit/core/registry/RegistryTest.cpp
+    ${KAFKIT_CORE_ROOT}/unittest/cxx/libnatkit/kafkit/core/schemas/BasicMetaInfoSchemaTest.cpp
     #${KAFKIT_CORE_ROOT}/unittest/cxx/libnatkit/kafkit/core/broker/BrokerManagerTest.cpp
     #${KAFKIT_CORE_ROOT}/unittest/cxx/libnatkit/kafkit/core/broker/BrokerManagerMock.hpp
     )

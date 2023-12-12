@@ -5,6 +5,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include <libnatkit/util/Casting.hpp>
+#include <libnatkit/kafkit/core/schemas/BasicMetaInfoSchema.hpp>
+
 #include <librdkafka/rdkafkacpp.h>
 
 namespace nat::kafkit {
@@ -17,23 +20,48 @@ static bool isTopicHidden(const std::string &topic_string) {
   }
 }
 
+class ExampleDeliveryReportCb : public RdKafka::DeliveryReportCb {
+public:
+  void dr_cb(RdKafka::Message &message) {
+    /* If message.err() is non-zero the message delivery failed permanently
+     * for the message. */
+    if (message.err())
+      std::cerr << "% Message delivery failed: " << message.errstr()
+                << std::endl;
+    else
+      std::cerr << "% Message delivered to topic " << message.topic_name()
+                << " [" << message.partition() << "] at offset "
+                << message.offset() << std::endl;
+  }
+};
+
 class BrokerManagerImpl : public BrokerManager {
   std::string address;
   std::string port;
   const std::unique_ptr<RdKafka::Conf> conf;
+  const std::unique_ptr<RdKafka::Conf> topicConfig;
   bool connectedToBroker{false};
+  std::shared_ptr<Registry> registry;
   mutable std::string errstr;
+  ExampleDeliveryReportCb ex_dr_cb{};
 
 public:
   BrokerManagerImpl(const std::string &address, const std::string &port)
       : address(address), port(port),
-        conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL)) {
+        conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL)),
+        topicConfig(RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC)),
+        registry(Registry::createDefaultInitalizeRegistry()) {
     if (conf->set("bootstrap.servers", address + ":" + port, errstr) ==
         RdKafka::Conf::CONF_OK) {
       connectedToBroker = true;
     } else {
       std::cout << "Error connecting to broker: " << errstr << '\n';
     }
+    if (conf->set("dr_cb", &ex_dr_cb, errstr) != RdKafka::Conf::CONF_OK) {
+      std::cerr << errstr << std::endl;
+      exit(1);
+    }
+
   }
 
   virtual bool isConnected() const override { return connectedToBroker; }
@@ -87,7 +115,8 @@ public:
     return topics;
   }
 
-  virtual std::vector<std::unique_ptr<RawStream>> getAllStreams() const override {
+  virtual std::vector<std::unique_ptr<RawStream>>
+  getAllStreams() const override {
     auto topics = getAllTopics();
     std::unordered_set<uint64_t> ids{};
     for (const auto &topic : topics) {
@@ -114,6 +143,50 @@ public:
     return streams;
   }
 
+  virtual std::unique_ptr<TopicMessenger> createMessenger(
+      const std::shared_ptr<BasicTopicInformation> &topicInfo) const override {
+    const auto topics = getAllTopics();
+    bool doesTopicExist = false;
+    for (const auto &topic : topics) {
+      if (*topic == *topicInfo) {
+        doesTopicExist = true;
+        break;
+      }
+    }
+
+    if (!doesTopicExist) {
+      // TODO?
+    }
+    // const auto stream = std::make_shared<Stream>("TODO", topicInfo->type,
+    // topicInfo->id, topicInfo->encoderName, topicInfo->schemaName);
+    const auto producer = createProducer();
+    const auto consumer = createConsumer();
+    const auto topicHandle = nat::util::asShared(createTopicHandle(topicInfo->toTopicString(), *consumer));
+    auto messagingQueue = std::make_unique<BrokerMessagingQueue>(
+        topicInfo->toTopicString(), producer, consumer, std::move(topicHandle));
+    auto translator = std::make_unique<TopicTranslator>(topicInfo, registry);
+    return std::make_unique<TopicMessenger>(std::move(messagingQueue),
+                                            std::move(translator));
+  }
+
+  virtual std::shared_ptr<Registry> getRegistry() const override {
+    return registry;
+  }
+
+  virtual std::unique_ptr<RdKafka::Topic>
+  createTopicHandle(const std::string &topicName,
+                    RdKafka::Consumer &consumer) const override {
+    std::string errorString;
+    std::unique_ptr<RdKafka::Topic> topic{
+        RdKafka::Topic::create(&consumer, topicName, topicConfig.get(), errorString)};
+    if (!topic) {
+      std::cerr << "Failed to create topic: " << errstr << std::endl;
+      exit(1);
+    }
+
+    return std::move(topic);
+  }
+
 private:
   std::unique_ptr<RdKafka::Conf> createTopicConfig() const {
     return std::unique_ptr<RdKafka::Conf>(
@@ -138,7 +211,8 @@ private:
 
 std::unique_ptr<BrokerManager> createBrokerManager(const std::string &address,
                                                    const std::string &port) {
-  return std::make_unique<BrokerManagerImpl>(address, port);
+  auto manager = std::make_unique<BrokerManagerImpl>(address, port);
+  return manager;
 }
 
-}
+} // namespace nat::kafkit
