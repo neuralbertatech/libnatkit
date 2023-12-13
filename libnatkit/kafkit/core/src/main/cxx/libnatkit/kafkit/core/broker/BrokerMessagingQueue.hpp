@@ -1,10 +1,13 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
+#include <thread>
 #include <vector>
 
 #include <librdkafka/rdkafkacpp.h>
@@ -13,13 +16,16 @@
 
 namespace nat::kafkit {
 
+using namespace std::chrono_literals;
+
 class BrokerMessagingQueue {
+
   class ConsumerCallback : public RdKafka::ConsumeCb {
     BrokerMessagingQueue
         &messagingQueue; // NOTE: This is a reference because we need to access
                          // the outter parent;
-    
-    static message_t stringToMessageType(const std::string& string) {
+
+    static message_t stringToMessageType(const std::string &string) {
       return message_t{string.begin(), string.end()};
     }
 
@@ -52,7 +58,13 @@ class BrokerMessagingQueue {
               printf(" Header:  %s = NULL\n", hdr.key().c_str());
           }
         }
-        messagingQueue.receivingQueue.push(std::make_unique<message_t>(stringToMessageType(std::string{static_cast<const char*>(msg.payload())})));
+        {
+          const std::lock_guard<std::mutex> lock(
+              messagingQueue.receivingQueueLock);
+          messagingQueue.receivingQueue.push(
+              std::make_unique<message_t>(stringToMessageType(
+                  std::string{static_cast<const char *>(msg.payload())})));
+        }
         printf("%.*s\n", static_cast<int>(msg.len()),
                static_cast<const char *>(msg.payload()));
         break;
@@ -78,13 +90,17 @@ class BrokerMessagingQueue {
 
   std::queue<std::shared_ptr<message_t>> receivingQueue{};
   std::queue<std::unique_ptr<message_t>> sendingQueue{};
+  std::mutex receivingQueueLock;
+  std::mutex sendingQueueLock;
   std::string topicName;
   std::shared_ptr<RdKafka::Producer> producer;
   std::shared_ptr<RdKafka::Consumer> consumer;
   std::shared_ptr<RdKafka::Topic> topicHandle;
   std::unique_ptr<ConsumerCallback> consumerCallback;
+  std::jthread thread;
   int partition{0};
   bool doesBrokerHaveMoreMessagesForReading{false};
+  bool running{true};
 
 public:
   BrokerMessagingQueue(const std::string &topicName,
@@ -95,22 +111,24 @@ public:
         topicHandle(topicHandle) {
     consumerCallback = std::make_unique<ConsumerCallback>(*this);
     startConsumer();
+    thread = std::jthread{&BrokerMessagingQueue::handleMessages, this};
   }
 
+  ~BrokerMessagingQueue() { running = false; }
+
   void enqueueMessageToSend(std::unique_ptr<message_t> &&message) {
+    const std::lock_guard<std::mutex> lock(sendingQueueLock);
     sendingQueue.push(std::move(message));
-    sendMessages(); // TODO: Deleteme and replace with threading
+    // sendMessages(); // TODO: Deleteme and replace with threading
   }
 
   void enqueueMessageToReceive(const std::shared_ptr<message_t> message) {
+    const std::lock_guard<std::mutex> lock(receivingQueueLock);
     receivingQueue.push(std::move(message));
   }
 
   std::optional<std::shared_ptr<message_t>> tryGetNextMessage() {
-    if (receivingQueue.empty()) {
-      readMessages();
-    }
-
+    const std::lock_guard<std::mutex> lock(receivingQueueLock);
     if (receivingQueue.empty()) {
       return {};
     } else {
@@ -123,6 +141,16 @@ public:
 private:
   static std::string byteArrayToString(const std::vector<uint8_t> &byteArray) {
     return std::string{byteArray.begin(), byteArray.end()};
+  }
+
+  void handleMessages() {
+    while (running) {
+      pollResources();
+      readMessages();
+      sendMessages();
+
+      std::this_thread::sleep_for(10ms);
+    }
   }
 
   void pollResources() {
@@ -164,7 +192,7 @@ private:
     doesBrokerHaveMoreMessagesForReading = true;
     do {
       if (consumer->consume_callback(topicHandle.get(), partition, 500,
-                                 consumerCallback.get(), nullptr) < 1) {
+                                     consumerCallback.get(), nullptr) < 1) {
         doesBrokerHaveMoreMessagesForReading = false;
       }
     } while (doesBrokerHaveMoreMessagesForReading);
@@ -172,7 +200,8 @@ private:
   }
 
   void startConsumer(int startOffset = 0) {
-    RdKafka::ErrorCode resp = consumer->start(topicHandle.get(), partition, startOffset);
+    RdKafka::ErrorCode resp =
+        consumer->start(topicHandle.get(), partition, startOffset);
     if (resp != RdKafka::ERR_NO_ERROR) {
       std::cerr << "Failed to start consumer: " << RdKafka::err2str(resp)
                 << std::endl;
@@ -180,9 +209,7 @@ private:
     }
   }
 
-  void stopConsumer() {
-    consumer->stop(topicHandle.get(), partition);
-  }
+  void stopConsumer() { consumer->stop(topicHandle.get(), partition); }
 };
 
 } // namespace nat::kafkit
