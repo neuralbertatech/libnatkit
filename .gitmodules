@@ -7,3 +7,6 @@
 [submodule "third-party/nlohmann"]
 	path = third-party/nlohmann
 	url = https://github.com/nlohmann/json
+[submodule "third-party/mosquitto"]
+	path = third-party/mosquitto
+	url = https://github.com/eclipse/mosquitto

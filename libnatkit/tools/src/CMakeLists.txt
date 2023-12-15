@@ -25,4 +25,16 @@ target_link_libraries(producer-demo PRIVATE
 	kafkit-core-cxx
 	)
 
+add_executable(mosquitto-subscriber ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/MosquittoSubscriber.cpp)
+target_link_libraries(mosquitto-subscriber PRIVATE
+	kafkit-core-cxx
+  libmosquitto
+	)
+
+add_executable(mosquitto-publisher ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/MosquittoPublisher.cpp)
+target_link_libraries(mosquitto-publisher PRIVATE
+	kafkit-core-cxx
+  libmosquitto
+	)
+
 

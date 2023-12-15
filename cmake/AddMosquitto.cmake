@@ -1,0 +1,35 @@
+#
+if(CMAKE_VERSION VERSION_LESS 3.11)
+  messagae(FATAL_ERROR "CMake version 3.11 or higher is required!")
+else()
+    include(FetchContent)
+    FetchContent_Declare(nat-mosquitto
+      SOURCE_DIR          ${THIRD_PARTY_DIR}/mosquitto
+    )
+    FetchContent_GetProperties(nat-mosquitto)
+    if(NOT nat-mosquitto_POPULATED)
+        FetchContent_Populate(nat-mosquitto)
+        #FetchContent_MakeAvailable(nat-mosquitto)
+        #set_target_properties(mosquitto PROPERTIES DOCUMENTATION OFF WITH_DLT ON WITH_CJSON OFF)
+        set(DOCUMENTATION OFF)
+        set(WITH_CJSON OFF)
+        set(WITH_DOCS OFF)
+        if (WIN32)
+          set(WITH_THREADING OFF)
+        endif()
+        set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1 CACHE BOOL "")
+        add_subdirectory(${nat-mosquitto_SOURCE_DIR} ${nat-mosquitto_BINARY_DIR} EXCLUDE_FROM_ALL)
+        unset(DOCUMENTATION)
+        unset(WITH_CJSON)
+        unset(WITH_DOCS)
+        if (WIN32)
+          unset(WITH_THREADING)
+        endif()
+        unset(CMAKE_SUPPRESS_DEVELOPER_WARNINGS)
+    endif()
+endif()
+
+target_include_directories(libmosquitto INTERFACE ${nat-mosquitto_SOURCE_DIR}/include)
+
+set_target_properties(libmosquitto
+    PROPERTIES FOLDER "Extern")

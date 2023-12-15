@@ -24,6 +24,7 @@ set(KAFKIT_CORE_CXX_FILES
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/TopicTranslator.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/Registry.hpp
   ${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/registry/Registry.cpp
+  #${KAFKIT_CORE_ROOT}/main/cxx/libnatkit/kafkit/core/mqtt/test.cpp
   )
 
 
@@ -33,6 +34,7 @@ target_link_libraries(kafkit-core-cxx PUBLIC
   librdkafka-cxx
   libnatkit-util-cxx
   nlohmann
+  #libmosquitto
 )
 target_include_directories(kafkit-core-cxx
   PUBLIC

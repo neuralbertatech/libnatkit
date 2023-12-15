@@ -4,7 +4,6 @@
 tmp/
 build/
 /.projectile
-cmake/
 #/third-party/
 .vs/
 compile_commands.json
