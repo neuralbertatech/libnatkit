@@ -133,6 +133,7 @@ endif()
 add_library(nlohmann INTERFACE)
 target_include_directories(nlohmann INTERFACE ${THIRD_PARTY_DIR}/nlohmann/include)
 
+include(AddMosquitto)
 
 if(BUILD_TESTING)
   enable_testing()
