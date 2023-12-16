@@ -1,12 +1,20 @@
 #include <mosquitto.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
+#include <chrono>
+#include <cstring>
 #include <iostream>
+#include <random>
+#include <string>
+#include <thread>
 
 #include <libnatkit/util/Strings.hpp>
 
+using namespace std::chrono_literals;
+
+std::random_device randomDevice;
+std::mt19937 rng(randomDevice());
+std::uniform_int_distribution<std::mt19937::result_type> randomDistribution(0, 99);
 
 /* Callback called when the client receives a CONNACK message from the broker. */
 void on_connect(struct mosquitto *mosq, void *obj, int reason_code)
@@ -41,8 +49,8 @@ void on_publish(struct mosquitto *mosq, void *obj, int mid)
 
 int get_temperature(void)
 {
-	sleep(1); /* Prevent a storm of messages - this pretend sensor works at 1Hz */
-	return random()%100;
+  std::this_thread::sleep_for(1000ms);
+	return randomDistribution(rng);
 }
 
 /* This function pretends to read some data from a sensor and publish it.*/
@@ -67,7 +75,7 @@ void publish_sensor_data(struct mosquitto *mosq, const std::string& topic)
 	 * qos = 2 - publish with QoS 2 for this example
 	 * retain = false - do not use the retained message feature for this message
 	 */
-	rc = mosquitto_publish(mosq, NULL, topic.c_str(), strlen(payload), payload, 2, false);
+	rc = mosquitto_publish(mosq, NULL, topic.c_str(), std::strlen(payload), payload, 2, false);
 	if(rc != MOSQ_ERR_SUCCESS){
 		fprintf(stderr, "Error publishing: %s\n", mosquitto_strerror(rc));
 	}
