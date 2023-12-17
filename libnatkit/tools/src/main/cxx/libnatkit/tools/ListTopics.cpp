@@ -1,5 +1,5 @@
 #include <iostream>
-#include <libnatkit/kafkit/core/broker/BrokerManager.hpp>
+#include <libnatkit/core/kafka/broker/BrokerManager.hpp>
 
 int main(int argc, char** argv) {
   if (argc != 2) {
@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
   const auto brokerHost = splitBroker[0];
   const auto brokerPort = splitBroker[1];
 
-  const auto manager = nat::kafkit::createBrokerManager(brokerHost, brokerPort);
+  const auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
 	const auto topics = manager->getAllTopicStrings();
 	for (size_t i = 0; i < std::ssize(topics); ++i) {
 		std::cout << topics[i] << std::endl;

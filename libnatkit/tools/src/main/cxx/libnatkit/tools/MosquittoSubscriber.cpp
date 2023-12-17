@@ -1,11 +1,16 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <mosquitto.h>
+#include <chrono>
 #include <iostream>
+#include <mosquitto.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <thread>
 
+#include <libnatkit/core/mqtt/MosquittoBroker.hpp>
 #include <libnatkit/util/Strings.hpp>
 
-int main(int argc, char** argv) {
+using namespace std::chrono_literals;
+
+int main(int argc, char **argv) {
   if (argc != 3) {
     std::cerr << "Usage: " << argv[0] << " <broker> <topic>\n";
     exit(1);
@@ -21,30 +26,19 @@ int main(int argc, char** argv) {
   const auto brokerHost = splitBroker[0];
   const auto brokerPort = std::stoi(splitBroker[1]);
 
+  {
+    const auto manager =
+        nat::mosquitto::createMosquittoBroker(brokerHost, brokerPort);
+    const auto client = manager->createClient(topic);
+    if (client.has_value()) {
+      std::cout << "Successfully created a client\n";
+      std::this_thread::sleep_for(30s);
+    } else {
+      std::cout << "Failed to create a client\n";
+    }
+  }
 
-  int rc;
-	struct mosquitto_message *msg;
+  std::this_thread::sleep_for(2s);
 
-	mosquitto_lib_init();
-
-	rc = mosquitto_subscribe_simple(
-			&msg, 1, true,
-			topic.c_str(), 0,
-			brokerHost.c_str(), brokerPort,
-			NULL, 60, true,
-			NULL, NULL,
-			NULL, NULL);
-
-	if(rc){
-		printf("Error: %s\n", mosquitto_strerror(rc));
-		mosquitto_lib_cleanup();
-		return rc;
-	}
-
-	printf("%s %s\n", msg->topic, (char *)msg->payload);
-	mosquitto_message_free(&msg);
-
-	mosquitto_lib_cleanup();
-
-	return 0;
+  return 0;
 }

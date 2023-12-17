@@ -1,3 +1,6 @@
 add_subdirectory(util/src)
-add_subdirectory(kafkit/core/src)
+add_subdirectory(core/streams/src)
+add_subdirectory(core/kafka/src)
+add_subdirectory(core/mqtt/src)
+add_subdirectory(core/bridge/src)
 add_subdirectory(tools/src)

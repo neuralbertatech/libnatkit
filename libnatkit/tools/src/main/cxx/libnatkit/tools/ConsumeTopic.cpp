@@ -2,9 +2,9 @@
 #include <iostream>
 #include <thread>
 
-#include <libnatkit/kafkit/core/broker/BrokerManager.hpp>
-#include <libnatkit/kafkit/core/schemas/BasicMetaInfoSchema.hpp>
-#include <libnatkit/kafkit/core/stream/BasicTopicInformation.hpp>
+#include <libnatkit/core/kafka/broker/BrokerManager.hpp>
+#include <libnatkit/core/streams/schemas/BasicMetaInfoSchema.hpp>
+#include <libnatkit/core/streams/stream/BasicTopicInformation.hpp>
 
 using namespace std::chrono_literals;
 
@@ -23,16 +23,16 @@ int main(int argc, char **argv) {
   }
   const auto brokerHost = splitBroker[0];
   const auto brokerPort = splitBroker[1];
-  const auto topicInfoMaybe = nat::kafkit::BasicTopicInformation::create(topic);
+  const auto topicInfoMaybe = nat::kafka::BasicTopicInformation::create(topic);
   if (!topicInfoMaybe.has_value()) {
     std::cerr
         << "<topic> takes the form of <stream-type>-<id>-<encoder>-<schema>\n";
     exit(1);
   }
-  const auto topicInfo = std::make_shared<nat::kafkit::BasicTopicInformation>(
+  const auto topicInfo = std::make_shared<nat::kafka::BasicTopicInformation>(
       *topicInfoMaybe.value());
 
-  const auto manager = nat::kafkit::createBrokerManager(brokerHost, brokerPort);
+  const auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
   const auto registry = manager->getRegistry();
   const auto messenger = manager->createMessenger(topicInfo);
   auto timeoutTimeStart = std::chrono::system_clock::now();
