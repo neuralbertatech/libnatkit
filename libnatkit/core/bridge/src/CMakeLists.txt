@@ -2,6 +2,7 @@ set(CORE_BRIDGE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(CORE_BRIDGE_CXX_FILES
   ${CORE_BRIDGE_ROOT}/main/cxx/libnatkit/core/bridge/KafkaToMosquittoBridge.hpp
+  ${CORE_BRIDGE_ROOT}/main/cxx/libnatkit/core/bridge/KafkaToMosquittoBridge.cpp
   ) 
 
 add_library(core-bridge-cxx SHARED ${CORE_BRIDGE_CXX_FILES})

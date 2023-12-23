@@ -16,10 +16,7 @@ class KafkaToMosquittoBridge {
   KafkaToMosquittoBridge(std::shared_ptr<kafka::BrokerManager> kafkaBroker, std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker)
     : kafkaBroker(kafkaBroker), mosquittoBroker(mosquittoBroker) {}
   public:
-  static std::optional<KafkaToMosquittoBridge> create(std::shared_ptr<kafka::BrokerManager> kafkaBroker, std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker) {
-
-    return {};
-  }
+  static std::optional<KafkaToMosquittoBridge> create(std::shared_ptr<kafka::BrokerManager> kafkaBroker, std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker);
 };
 
 }
