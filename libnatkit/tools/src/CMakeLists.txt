@@ -25,6 +25,12 @@ target_link_libraries(producer-demo PRIVATE
 	core-kafka-cxx
 	)
 
+add_executable(delete-topic ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeleteTopic.cpp)
+target_link_libraries(delete-topic PRIVATE
+	core-kafka-cxx
+	)
+
+
 add_executable(mosquitto-subscriber ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/MosquittoSubscriber.cpp)
 target_link_libraries(mosquitto-subscriber PRIVATE
   core-mqtt-cxx

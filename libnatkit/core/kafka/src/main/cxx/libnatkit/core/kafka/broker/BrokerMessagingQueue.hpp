@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -58,15 +59,12 @@ class BrokerMessagingQueue {
               printf(" Header:  %s = NULL\n", hdr.key().c_str());
           }
         }
-        {
-          const std::lock_guard<std::mutex> lock(
-              messagingQueue.receivingQueueLock);
-          messagingQueue.receivingQueue.push(
-              std::make_unique<message_t>(stringToMessageType(
-                  std::string{static_cast<const char *>(msg.payload())})));
-        }
+        messagingQueue.onMessageRecieved(
+            std::make_unique<message_t>(stringToMessageType(
+                std::string{static_cast<const char *>(msg.payload())})));
         printf("%.*s\n", static_cast<int>(msg.len()),
                static_cast<const char *>(msg.payload()));
+
         break;
 
       case RdKafka::ERR__PARTITION_EOF:
@@ -97,18 +95,29 @@ class BrokerMessagingQueue {
   std::shared_ptr<RdKafka::Consumer> consumer;
   std::shared_ptr<RdKafka::Topic> topicHandle;
   std::unique_ptr<ConsumerCallback> consumerCallback;
+  std::function<void(std::unique_ptr<message_t> &&)> onMessageRecieved;
   std::jthread thread;
   int partition{0};
   bool doesBrokerHaveMoreMessagesForReading{false};
   bool running{true};
 
 public:
-  BrokerMessagingQueue(const std::string &topicName,
-                       const std::shared_ptr<RdKafka::Producer> &producer,
-                       const std::shared_ptr<RdKafka::Consumer> &consumer,
-                       const std::shared_ptr<RdKafka::Topic> &topicHandle)
+  BrokerMessagingQueue(
+      const std::string &topicName,
+      const std::shared_ptr<RdKafka::Producer> &producer,
+      const std::shared_ptr<RdKafka::Consumer> &consumer,
+      const std::shared_ptr<RdKafka::Topic> &topicHandle,
+      std::optional<std::function<void(std::unique_ptr<message_t> &&)>>
+          onMessageRecievedHandlerMaybe = {})
       : topicName(topicName), producer(producer), consumer(consumer),
         topicHandle(topicHandle) {
+    if (onMessageRecievedHandlerMaybe.has_value()) {
+      onMessageRecieved = onMessageRecievedHandlerMaybe.value();
+    } else {
+      onMessageRecieved = [this](auto &&msg) {
+        this->defaultOnMessageRecieved(std::move(msg));
+      };
+    }
     consumerCallback = std::make_unique<ConsumerCallback>(*this);
     startConsumer();
     thread = std::jthread{&BrokerMessagingQueue::handleMessages, this};
@@ -119,7 +128,6 @@ public:
   void enqueueMessageToSend(std::unique_ptr<message_t> &&message) {
     const std::lock_guard<std::mutex> lock(sendingQueueLock);
     sendingQueue.push(std::move(message));
-    // sendMessages(); // TODO: Deleteme and replace with threading
   }
 
   void enqueueMessageToReceive(const std::shared_ptr<message_t> message) {
@@ -210,6 +218,13 @@ private:
   }
 
   void stopConsumer() { consumer->stop(topicHandle.get(), partition); }
+
+  void defaultOnMessageRecieved(std::unique_ptr<message_t> &&msg) {
+    {
+      const std::lock_guard<std::mutex> lock(receivingQueueLock);
+      receivingQueue.push(std::move(msg));
+    }
+  }
 };
 
 } // namespace nat::kafka

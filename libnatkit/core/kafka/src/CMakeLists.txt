@@ -17,6 +17,7 @@ add_library(core-kafka-cxx SHARED ${CORE_KAFKA_CXX_FILES})
 set_target_properties(core-kafka-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(core-kafka-cxx PUBLIC
   core-streams-cxx
+  librdkafka-c
   librdkafka-cxx
 )
 target_include_directories(core-kafka-cxx

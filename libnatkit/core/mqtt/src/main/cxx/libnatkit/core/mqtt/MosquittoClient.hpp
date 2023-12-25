@@ -28,6 +28,8 @@ private:
 
   MosquittoClient(const std::string &topic) : topic(topic) {}
 
+  void setOnMessageCallback(onMessageCallback_t callback) { onMessageCallback = callback; }
+
   void init(struct mosquitto *client) { this->client = client; }
 
 public:
@@ -38,9 +40,13 @@ public:
 
   static std::optional<std::unique_ptr<MosquittoClient>>
   create(const std::string &brokerHostname, int brokerPort,
-         const std::string &topic) {
+         const std::string &topic,
+         const std::optional<onMessageCallback_t>& onMessageCallbackMaybe = {}) {
     std::unique_ptr<MosquittoClient> mosquittoClient{
         new MosquittoClient(topic)};
+    if (onMessageCallbackMaybe.has_value()) {
+      mosquittoClient->setOnMessageCallback(onMessageCallbackMaybe.value());
+    }
     char *id{nullptr};
     bool cleanSession{true};
     void *callbackObj{convertCallbackObject(mosquittoClient.get())};
@@ -67,6 +73,7 @@ public:
     }
 
     mosquittoClient->init(client);
+    mosquittoClient->start();
     return mosquittoClient;
   }
 
@@ -76,10 +83,6 @@ public:
   }
 
   void stop() { running = false; }
-
-  void setOnMessageCallback(onMessageCallback_t callback) {
-    onMessageCallback = callback;
-  }
 
 private:
   void handleMessages() {
@@ -152,6 +155,7 @@ private:
     const auto mosquittoClient = convertCallbackObject(callbackObj);
     const std::string topic{message->topic};
     const std::string msg{(char *)message->payload};
+    std::cout << "% Mosquitto Client " << topic << " receivied a message: " << msg << '\n';
     mosquittoClient->onMessageCallback(mosquittoClient, topic, msg,
                                        message->qos);
   }

@@ -20,6 +20,8 @@ public:
 
   virtual std::shared_ptr<RdKafka::Consumer> createConsumer() const = 0;
 
+  virtual void deleteTopic(const std::string&) = 0;
+
   virtual std::vector<std::string>
   getAllTopicStrings(bool includeHiddenTopics = false) const = 0;
 
