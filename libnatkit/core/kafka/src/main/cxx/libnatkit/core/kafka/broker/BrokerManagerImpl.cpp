@@ -8,6 +8,7 @@
 #include <libnatkit/util/Casting.hpp>
 #include <libnatkit/core/streams/schemas/BasicMetaInfoSchema.hpp>
 
+#include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
 
 namespace nat::kafka {
@@ -82,6 +83,29 @@ public:
       std::cout << "Error creating consumer: " << errstr << '\n';
     }
     return std::move(consumer);
+  }
+
+  virtual void deleteTopic(const std::string& topicName) override {
+    auto topicDeleter = rd_kafka_DeleteTopic_new(topicName.c_str());
+    rd_kafka_DeleteTopic_destroy(topicDeleter);
+    /**
+ * @brief Delete topics from cluster as specified by the \p topics
+ *        array of size \p topic_cnt elements.
+ *
+ * @param topics Array of topics to delete.
+ * @param topic_cnt Number of elements in \p topics array.
+ * @param options Optional admin options, or NULL for defaults.
+ * @param rkqu Queue to emit result on.
+ *
+ * @remark The result event type emitted on the supplied queue is of type
+ *         \c RD_KAFKA_EVENT_DELETETOPICS_RESULT
+RD_EXPORT
+void rd_kafka_DeleteTopics (rd_kafka_t *rk,
+                                  rd_kafka_DeleteTopic_t **del_topics,
+                                  size_t del_topic_cnt,
+                                  const rd_kafka_AdminOptions_t *options,
+                                  rd_kafka_queue_t *rkqu);
+                                  */
   }
 
   virtual std::vector<std::string>
