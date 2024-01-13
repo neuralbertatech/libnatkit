@@ -5,7 +5,7 @@ else()
     
     include(FetchContent)
     FetchContent_Declare(natmosquitto
-      SOURCE_DIR          ${THIRD_PARTY_DIR}/mosquitto
+      SOURCE_DIR          ${LIBNATKIT_THIRD_PARTY_DIR}/mosquitto
     )
     FetchContent_GetProperties(natmosquitto)
     if(NOT natmosquitto_POPULATED)

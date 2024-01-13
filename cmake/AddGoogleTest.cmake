@@ -11,7 +11,7 @@ if(CMAKE_VERSION VERSION_LESS 3.11)
 else()
     include(FetchContent)
     FetchContent_Declare(googletest
-      SOURCE_DIR          ${THIRD_PARTY_DIR}/googletest
+      SOURCE_DIR          ${LIBNATKIT_THIRD_PARTY_DIR}/googletest
     )
     FetchContent_GetProperties(googletest)
     if(NOT googletest_POPULATED)
@@ -54,7 +54,7 @@ macro(add_gtest TESTNAME)
     if (WIN32)
       add_test(NAME ${TESTNAME}
                COMMAND ${TESTNAME}
-               WORKING_DIRECTORY ${BINARY_INSTALL_DIR}/Debug)
+               WORKING_DIRECTORY ${LIBNATKIT_BINARY_INSTALL_DIR}/Debug)
     else()
       add_test(NAME ${TESTNAME} COMMAND ${TESTNAME})
     endif()
