@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 project(libnatkit VERSION 0.0
                   LANGUAGES C CXX)
 
+if (NOT DEFINED LIBNATKIT_ESP_BUILD)
+  set(LIBNATKIT_ESP_BUILD OFF CACHE BOOL "Build a subsection of libnatkit for ESP32 devices")
+endif()
+
 set(LIBNATKIT_PROJECT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(LIBNATKIT_THIRD_PARTY_DIR ${LIBNATKIT_PROJECT_ROOT}/third-party)
 set(LIBNATKIT_BUILD_ROOT ${CMAKE_CURRENT_BINARY_DIR})
@@ -13,7 +17,9 @@ set(LIBNATKIT_BINARY_INSTALL_DIR ${LIBNATKIT_INSTALL_DIR}/bin)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 list(APPEND CMAKE_MODULE_PATH ${LIBNATKIT_PROJECT_ROOT}/cmake)
 
-if(WIN32)
+if(LIBNATKIT_ESP_BUILD)
+  message("ESP32 Build")
+elseif(WIN32)
   set (CMAKE_LIBRARY_OUTPUT_DIRECTORY ${LIBNATKIT_LIBRARY_INSTALL_DIR})
   set (CMAKE_RUNTIME_OUTPUT_DIRECTORY ${LIBNATKIT_BINARY_INSTALL_DIR})
   message("Detected OS is Windows")
@@ -27,7 +33,9 @@ else()
   message(WARNING "Unsupported OS!")
 endif()
 
-if(MSVC)
+if(LIBNATKIT_ESP_BUILD)
+  message("ESP32 Compiler")
+elseif(MSVC)
   message("------------------ Compiler is MSVC ------------------")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D__msvc_cplusplus /std:c++20")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /std:c11")
@@ -48,7 +56,9 @@ include(ExternalProject)
 
 #find_program(MEMORYCHECK_COMMAND valgrind)
 #set(MEMORYCHECK_COMMAND_OPTIONS "--leak-check=full --error-exitcode=1")
-include(CTest)
+if(NOT LIBNATKIT_ESP_BUILD)
+  include(CTest)
+endif()
 
 if(UNIX)
   set(LIBNATKIT_LIBRARY_PREFIX "lib")
@@ -67,8 +77,8 @@ if(WIN32)
   set(LIBNATKIT_LIBRARY_PREFIX "")
 endif(WIN32)
 
-
-if(WIN32)
+if(LIBNATKIT_ESP_BUILD)
+elseif(WIN32)
   set(LIBRDKAFKA_SOURCE_DIR "${LIBNATKIT_BUILD_ROOT}/third-party/librdkafka")
 	set(LIBRDKAFKA_BINARY_DIR "${CMAKE_BINARY_DIR}/archive/librdkafka")
   set(LIBRDKAFKA_INCLUDE_DIR ${LIBNATKIT_INCLUDE_INSTALL_DIR})
@@ -107,38 +117,42 @@ else()
   add_library(librdkafka-cxx SHARED IMPORTED)
   add_library(librdkafka-c SHARED IMPORTED)
 endif()
-message("librdkafka c++ is located at ${LIBRDKAFKA_CXX_LIBRARY}")
-message("librdkafka headers are located at ${LIBRDKAFKA_INCLUDE_DIR}")
-set_target_properties(librdkafka-cxx PROPERTIES
-  IMPORTED_LOCATION ${LIBRDKAFKA_CXX_LIBRARY}
-  INTERFACE_INCLUDE_DIRECTORIES ${LIBRDKAFKA_INCLUDE_DIR}
-  )
-  message("librdkafka c is located at ${LIBRDKAFKA_C_LIBRARY}")
-set_target_properties(librdkafka-c PROPERTIES
-  IMPORTED_LOCATION ${LIBRDKAFKA_C_LIBRARY}
-  INTERFACE_INCLUDE_DIRECTORIES ${LIBRDKAFKA_INCLUDE_DIR}
-  )
-if (WIN32)
-	set_target_properties(librdkafka-cxx PROPERTIES
-	  IMPORTED_IMPLIB ${LIBRDKAFKA_CXX_LIBRARY}
-	  IMPORTED_IMPLIB_DEBUG ${LIBRDKAFKA_CXX_LIBRARY}
-	)
-	set_target_properties(librdkafka-c PROPERTIES
-	  IMPORTED_IMPLIB ${LIBRDKAFKA_C_LIBRARY}
-	  IMPORTED_IMPLIB_DEBUG ${LIBRDKAFKA_C_LIBRARY}
-	)
+
+
+if(NOT LIBNATKIT_ESP_BUILD)
+  message("librdkafka c++ is located at ${LIBRDKAFKA_CXX_LIBRARY}")
+  message("librdkafka headers are located at ${LIBRDKAFKA_INCLUDE_DIR}")
+  set_target_properties(librdkafka-cxx PROPERTIES
+    IMPORTED_LOCATION ${LIBRDKAFKA_CXX_LIBRARY}
+    INTERFACE_INCLUDE_DIRECTORIES ${LIBRDKAFKA_INCLUDE_DIR}
+    )
+    message("librdkafka c is located at ${LIBRDKAFKA_C_LIBRARY}")
+  set_target_properties(librdkafka-c PROPERTIES
+    IMPORTED_LOCATION ${LIBRDKAFKA_C_LIBRARY}
+    INTERFACE_INCLUDE_DIRECTORIES ${LIBRDKAFKA_INCLUDE_DIR}
+    )
+  if (WIN32)
+    set_target_properties(librdkafka-cxx PROPERTIES
+      IMPORTED_IMPLIB ${LIBRDKAFKA_CXX_LIBRARY}
+      IMPORTED_IMPLIB_DEBUG ${LIBRDKAFKA_CXX_LIBRARY}
+    )
+    set_target_properties(librdkafka-c PROPERTIES
+      IMPORTED_IMPLIB ${LIBRDKAFKA_C_LIBRARY}
+      IMPORTED_IMPLIB_DEBUG ${LIBRDKAFKA_C_LIBRARY}
+    )
+  endif()
 endif()
 
 add_library(nlohmann INTERFACE)
 target_include_directories(nlohmann INTERFACE ${LIBNATKIT_THIRD_PARTY_DIR}/nlohmann/include)
 
-include(AddMosquitto)
+if(NOT LIBNATKIT_ESP_BUILD)
+  include(AddMosquitto)
 
-if(BUILD_TESTING)
-  enable_testing()
-  include(AddGoogleTest)
+  if(BUILD_TESTING)
+    enable_testing()
+    include(AddGoogleTest)
+  endif()
 endif()
-
-
 
 add_subdirectory(libnatkit)
