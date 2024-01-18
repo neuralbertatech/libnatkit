@@ -35,6 +35,7 @@ endif()
 
 if(LIBNATKIT_ESP_BUILD)
   message("ESP32 Compiler")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
 elseif(MSVC)
   message("------------------ Compiler is MSVC ------------------")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D__msvc_cplusplus /std:c++20")
