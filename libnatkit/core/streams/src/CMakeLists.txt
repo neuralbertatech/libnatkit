@@ -16,8 +16,11 @@ set(LIBNATKIT_CORE_STREAMS_CXX_FILES
   ${LIBNATKIT_CORE_STREAMS_ROOT}/main/cxx/libnatkit/core/streams/registry/Registry.cpp
   )
 
-
-add_library(libnatkit-core-streams-cxx SHARED ${LIBNATKIT_CORE_STREAMS_CXX_FILES})
+if(LIBNATKIT_ESP_BUILD)
+  add_library(libnatkit-core-streams-cxx STATIC ${LIBNATKIT_CORE_STREAMS_CXX_FILES})
+else()
+  add_library(libnatkit-core-streams-cxx SHARED ${LIBNATKIT_CORE_STREAMS_CXX_FILES})
+endif()
 set_target_properties(libnatkit-core-streams-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(libnatkit-core-streams-cxx PUBLIC
   libnatkit-util-cxx

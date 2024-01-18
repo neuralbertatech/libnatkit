@@ -23,7 +23,11 @@ set(LIBNATKIT_UTIL_CXX_FILES
 #)
 #set_property(TARGET libnatkit-util-c PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS true)
 
-add_library(libnatkit-util-cxx SHARED ${LIBNATKIT_UTIL_CXX_FILES})
+if(LIBNATKIT_ESP_BUILD)
+  add_library(libnatkit-util-cxx STATIC ${LIBNATKIT_UTIL_CXX_FILES})
+else()
+  add_library(libnatkit-util-cxx SHARED ${LIBNATKIT_UTIL_CXX_FILES})
+endif()
 set_target_properties(libnatkit-util-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(libnatkit-util-cxx
   PUBLIC
