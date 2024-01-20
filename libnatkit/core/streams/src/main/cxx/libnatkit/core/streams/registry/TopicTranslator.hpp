@@ -5,7 +5,6 @@
 #include <queue>
 #include <vector>
 
-#include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
 #include <libnatkit/core/streams/registry/Decoder.hpp>
 #include <libnatkit/core/streams/registry/Encoder.hpp>
 #include <libnatkit/core/streams/registry/Message.hpp>

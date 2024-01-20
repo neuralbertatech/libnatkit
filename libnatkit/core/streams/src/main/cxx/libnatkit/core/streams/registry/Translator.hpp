@@ -1,8 +1,8 @@
 #pragma once
 
 #include <memory>
-#include <libnatkit/core/streams/registry/encoder.hpp>
-#include <libnatkit/core/streams/registry/decoder.hpp>
+#include <libnatkit/core/streams/registry/Encoder.hpp>
+#include <libnatkit/core/streams/registry/Decoder.hpp>
 
 namespace nat::kafka {
 

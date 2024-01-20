@@ -6,6 +6,7 @@
 #include <thread>
 
 #include <libnatkit/core/kafka/broker/BrokerManager.hpp>
+#include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
 #include <libnatkit/core/streams/stream/BasicTopicInformation.hpp>
 #include <libnatkit/util/Casting.hpp>
 

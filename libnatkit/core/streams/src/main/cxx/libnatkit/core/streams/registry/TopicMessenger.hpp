@@ -1,17 +1,17 @@
 #pragma once
 
-#include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
+#include <libnatkit/core/streams/registry/MessagingQueue.hpp>
 #include <libnatkit/core/streams/registry/TopicTranslator.hpp>
 
 
 namespace nat::kafka {
 
 class TopicMessenger {
-  std::unique_ptr<BrokerMessagingQueue> messagingQueue;
+  std::unique_ptr<MessagingQueue> messagingQueue;
   std::shared_ptr<TopicTranslator> translator;
 
   public:
-  TopicMessenger(std::unique_ptr<BrokerMessagingQueue>&& messagingQueue, const std::shared_ptr<TopicTranslator> translator)
+  TopicMessenger(std::unique_ptr<MessagingQueue>&& messagingQueue, const std::shared_ptr<TopicTranslator> translator)
     : messagingQueue(std::move(messagingQueue)), translator(translator) {}
   
   void sendMessage(const Schema &schema) {

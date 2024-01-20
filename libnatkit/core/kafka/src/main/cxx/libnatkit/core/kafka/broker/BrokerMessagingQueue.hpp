@@ -14,12 +14,13 @@
 #include <librdkafka/rdkafkacpp.h>
 
 #include <libnatkit/core/streams/registry/Message.hpp>
+#include <libnatkit/core/streams/registry/MessagingQueue.hpp>
 
 namespace nat::kafka {
 
 using namespace std::chrono_literals;
 
-class BrokerMessagingQueue {
+class BrokerMessagingQueue : public MessagingQueue {
 
   class ConsumerCallback : public RdKafka::ConsumeCb {
     BrokerMessagingQueue
@@ -123,19 +124,19 @@ public:
     thread = std::jthread{&BrokerMessagingQueue::handleMessages, this};
   }
 
-  ~BrokerMessagingQueue() { running = false; }
+  virtual ~BrokerMessagingQueue() { running = false; }
 
-  void enqueueMessageToSend(std::unique_ptr<message_t> &&message) {
+  virtual void enqueueMessageToSend(std::unique_ptr<message_t> &&message) override {
     const std::lock_guard<std::mutex> lock(sendingQueueLock);
     sendingQueue.push(std::move(message));
   }
 
-  void enqueueMessageToReceive(const std::shared_ptr<message_t> message) {
+  virtual void enqueueMessageToReceive(const std::shared_ptr<message_t> message) override {
     const std::lock_guard<std::mutex> lock(receivingQueueLock);
     receivingQueue.push(std::move(message));
   }
 
-  std::optional<std::shared_ptr<message_t>> tryGetNextMessage() {
+  virtual std::optional<std::shared_ptr<message_t>> tryGetNextMessage() override {
     const std::lock_guard<std::mutex> lock(receivingQueueLock);
     if (receivingQueue.empty()) {
       return {};

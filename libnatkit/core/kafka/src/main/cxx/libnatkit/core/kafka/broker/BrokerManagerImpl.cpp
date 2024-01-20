@@ -7,6 +7,7 @@
 
 #include <libnatkit/util/Casting.hpp>
 #include <libnatkit/core/streams/schemas/BasicMetaInfoSchema.hpp>
+#include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
 
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
@@ -186,8 +187,8 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
     const auto producer = createProducer();
     const auto consumer = createConsumer();
     const auto topicHandle = nat::util::asShared(createTopicHandle(topicInfo->toTopicString(), *consumer));
-    auto messagingQueue = std::make_unique<BrokerMessagingQueue>(
-        topicInfo->toTopicString(), producer, consumer, std::move(topicHandle));
+    auto messagingQueue = std::unique_ptr<MessagingQueue>(new BrokerMessagingQueue(
+        topicInfo->toTopicString(), producer, consumer, std::move(topicHandle)));
     auto translator = std::make_unique<TopicTranslator>(topicInfo, registry);
     return std::make_unique<TopicMessenger>(std::move(messagingQueue),
                                             std::move(translator));
