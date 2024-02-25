@@ -13,22 +13,21 @@
 
 #include <librdkafka/rdkafkacpp.h>
 
-#include <libnatkit/core/streams/registry/Message.hpp>
-#include <libnatkit/core/streams/registry/MessagingQueue.hpp>
+#include <libnatkit-core.hpp>
 
 namespace nat::kafka {
 
 using namespace std::chrono_literals;
 
-class BrokerMessagingQueue : public MessagingQueue {
+class BrokerMessagingQueue : public core::MessagingQueue {
 
   class ConsumerCallback : public RdKafka::ConsumeCb {
     BrokerMessagingQueue
         &messagingQueue; // NOTE: This is a reference because we need to access
                          // the outter parent;
 
-    static message_t stringToMessageType(const std::string &string) {
-      return message_t{string.begin(), string.end()};
+    static core::message_t stringToMessageType(const std::string &string) {
+      return core::message_t{string.begin(), string.end()};
     }
 
   public:
@@ -61,7 +60,7 @@ class BrokerMessagingQueue : public MessagingQueue {
           }
         }
         messagingQueue.onMessageRecieved(
-            std::make_unique<message_t>(stringToMessageType(
+            std::make_unique<core::message_t>(stringToMessageType(
                 std::string{static_cast<const char *>(msg.payload())})));
         printf("%.*s\n", static_cast<int>(msg.len()),
                static_cast<const char *>(msg.payload()));
@@ -87,8 +86,8 @@ class BrokerMessagingQueue : public MessagingQueue {
     }
   };
 
-  std::queue<std::shared_ptr<message_t>> receivingQueue{};
-  std::queue<std::unique_ptr<message_t>> sendingQueue{};
+  std::queue<std::shared_ptr<core::message_t>> receivingQueue{};
+  std::queue<std::unique_ptr<core::message_t>> sendingQueue{};
   std::mutex receivingQueueLock;
   std::mutex sendingQueueLock;
   std::string topicName;
@@ -96,7 +95,7 @@ class BrokerMessagingQueue : public MessagingQueue {
   std::shared_ptr<RdKafka::Consumer> consumer;
   std::shared_ptr<RdKafka::Topic> topicHandle;
   std::unique_ptr<ConsumerCallback> consumerCallback;
-  std::function<void(std::unique_ptr<message_t> &&)> onMessageRecieved;
+  std::function<void(std::unique_ptr<core::message_t> &&)> onMessageRecieved;
   std::jthread thread;
   int partition{0};
   bool doesBrokerHaveMoreMessagesForReading{false};
@@ -108,7 +107,7 @@ public:
       const std::shared_ptr<RdKafka::Producer> &producer,
       const std::shared_ptr<RdKafka::Consumer> &consumer,
       const std::shared_ptr<RdKafka::Topic> &topicHandle,
-      std::optional<std::function<void(std::unique_ptr<message_t> &&)>>
+      std::optional<std::function<void(std::unique_ptr<core::message_t> &&)>>
           onMessageRecievedHandlerMaybe = {})
       : topicName(topicName), producer(producer), consumer(consumer),
         topicHandle(topicHandle) {
@@ -126,17 +125,17 @@ public:
 
   virtual ~BrokerMessagingQueue() { running = false; }
 
-  virtual void enqueueMessageToSend(std::unique_ptr<message_t> &&message) override {
+  virtual void enqueueMessageToSend(std::unique_ptr<core::message_t> &&message) override {
     const std::lock_guard<std::mutex> lock(sendingQueueLock);
     sendingQueue.push(std::move(message));
   }
 
-  virtual void enqueueMessageToReceive(const std::shared_ptr<message_t> message) override {
+  virtual void enqueueMessageToReceive(const std::shared_ptr<core::message_t> message) override {
     const std::lock_guard<std::mutex> lock(receivingQueueLock);
     receivingQueue.push(std::move(message));
   }
 
-  virtual std::optional<std::shared_ptr<message_t>> tryGetNextMessage() override {
+  virtual std::optional<std::shared_ptr<core::message_t>> tryGetNextMessage() override {
     const std::lock_guard<std::mutex> lock(receivingQueueLock);
     if (receivingQueue.empty()) {
       return {};
@@ -175,7 +174,7 @@ private:
     }
   }
 
-  void sendMessage(std::unique_ptr<message_t> message) {
+  void sendMessage(std::unique_ptr<core::message_t> message) {
     const auto stringMessage = byteArrayToString(*message);
     std::cout << "Attempting to send the following message to broker: "
               << stringMessage << '\n';
@@ -220,7 +219,7 @@ private:
 
   void stopConsumer() { consumer->stop(topicHandle.get(), partition); }
 
-  void defaultOnMessageRecieved(std::unique_ptr<message_t> &&msg) {
+  void defaultOnMessageRecieved(std::unique_ptr<core::message_t> &&msg) {
     {
       const std::lock_guard<std::mutex> lock(receivingQueueLock);
       receivingQueue.push(std::move(msg));

@@ -3,8 +3,8 @@
 #include <thread>
 
 #include <libnatkit/core/kafka/broker/BrokerManager.hpp>
-#include <libnatkit/core/streams/schemas/BasicMetaInfoSchema.hpp>
-#include <libnatkit/core/streams/stream/BasicTopicInformation.hpp>
+#include <libnatkit-core.hpp>
+#include <libnatkit/util/Strings.hpp>
 
 using namespace std::chrono_literals;
 
@@ -23,13 +23,13 @@ int main(int argc, char **argv) {
   }
   const auto brokerHost = splitBroker[0];
   const auto brokerPort = splitBroker[1];
-  const auto topicInfoMaybe = nat::kafka::BasicTopicInformation::create(topic);
+  const auto topicInfoMaybe = nat::core::BasicTopicInformation::create(topic);
   if (!topicInfoMaybe.has_value()) {
     std::cerr
         << "<topic> takes the form of <stream-type>-<id>-<encoder>-<schema>\n";
     exit(1);
   }
-  const auto topicInfo = std::make_shared<nat::kafka::BasicTopicInformation>(
+  const auto topicInfo = std::make_shared<nat::core::BasicTopicInformation>(
       *topicInfoMaybe.value());
 
   const auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);

@@ -1,5 +1,5 @@
 add_subdirectory(util/src)
-add_subdirectory(core/streams/src)
+#add_subdirectory(core/streams/src)
 if(NOT LIBNATKIT_ESP_BUILD)
     add_subdirectory(core/kafka/src)
     add_subdirectory(core/mqtt/src)

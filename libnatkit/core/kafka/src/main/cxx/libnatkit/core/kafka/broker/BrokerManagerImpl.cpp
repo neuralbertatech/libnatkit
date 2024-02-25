@@ -6,7 +6,6 @@
 #include <vector>
 
 #include <libnatkit/util/Casting.hpp>
-#include <libnatkit/core/streams/schemas/BasicMetaInfoSchema.hpp>
 #include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
 
 #include <librdkafka/rdkafka.h>
@@ -43,7 +42,7 @@ class BrokerManagerImpl : public BrokerManager {
   const std::unique_ptr<RdKafka::Conf> conf;
   const std::unique_ptr<RdKafka::Conf> topicConfig;
   bool connectedToBroker{false};
-  std::shared_ptr<Registry> registry;
+  std::shared_ptr<core::Registry> registry;
   mutable std::string errstr;
   ExampleDeliveryReportCb ex_dr_cb{};
 
@@ -52,7 +51,7 @@ public:
       : address(address), port(port),
         conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL)),
         topicConfig(RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC)),
-        registry(Registry::createDefaultInitalizeRegistry()) {
+        registry(core::Registry::createDefaultInitalizeRegistry()) {
     if (conf->set("bootstrap.servers", address + ":" + port, errstr) ==
         RdKafka::Conf::CONF_OK) {
       connectedToBroker = true;
@@ -127,11 +126,11 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
     return topics;
   }
 
-  virtual std::vector<std::unique_ptr<BasicTopicInformation>>
+  virtual std::vector<std::unique_ptr<core::BasicTopicInformation>>
   getAllTopics() const override {
-    std::vector<std::unique_ptr<BasicTopicInformation>> topics{};
+    std::vector<std::unique_ptr<core::BasicTopicInformation>> topics{};
     for (const auto &topicString : getAllTopicStrings()) {
-      auto topicMaybe = BasicTopicInformation::create(topicString);
+      auto topicMaybe = core::BasicTopicInformation::create(topicString);
       if (topicMaybe.has_value()) {
         topics.push_back(std::move(topicMaybe.value()));
       }
@@ -140,7 +139,7 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
     return topics;
   }
 
-  virtual std::vector<std::unique_ptr<RawStream>>
+  virtual std::vector<std::unique_ptr<core::RawStream>>
   getAllStreams() const override {
     auto topics = getAllTopics();
     std::unordered_set<uint64_t> ids{};
@@ -148,18 +147,18 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
       ids.insert(topic->id);
     }
     std::unordered_map<uint64_t,
-                       std::vector<std::unique_ptr<BasicTopicInformation>>>
+                       std::vector<std::unique_ptr<core::BasicTopicInformation>>>
         topicsById{};
     for (const auto &id : ids) {
       topicsById.insert(
-          {id, std::vector<std::unique_ptr<BasicTopicInformation>>{}});
+          {id, std::vector<std::unique_ptr<core::BasicTopicInformation>>{}});
     }
     for (auto &topic : topics) {
       topicsById[topic->id].push_back(std::move(topic));
     }
-    std::vector<std::unique_ptr<RawStream>> streams{};
+    std::vector<std::unique_ptr<core::RawStream>> streams{};
     for (auto &[id, topicsForId] : topicsById) {
-      auto streamMaybe = RawStream::create(std::move(topicsForId));
+      auto streamMaybe = core::RawStream::create(std::move(topicsForId));
       if (streamMaybe.has_value()) {
         streams.push_back(std::move(streamMaybe.value()));
       }
@@ -168,8 +167,8 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
     return streams;
   }
 
-  virtual std::unique_ptr<TopicMessenger> createMessenger(
-      const std::shared_ptr<BasicTopicInformation> &topicInfo) const override {
+  virtual std::unique_ptr<core::TopicMessenger> createMessenger(
+      const std::shared_ptr<core::BasicTopicInformation> &topicInfo) const override {
     const auto topics = getAllTopics();
     bool doesTopicExist = false;
     for (const auto &topic : topics) {
@@ -187,14 +186,14 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
     const auto producer = createProducer();
     const auto consumer = createConsumer();
     const auto topicHandle = nat::util::asShared(createTopicHandle(topicInfo->toTopicString(), *consumer));
-    auto messagingQueue = std::unique_ptr<MessagingQueue>(new BrokerMessagingQueue(
+    auto messagingQueue = std::unique_ptr<core::MessagingQueue>(new BrokerMessagingQueue(
         topicInfo->toTopicString(), producer, consumer, std::move(topicHandle)));
-    auto translator = std::make_unique<TopicTranslator>(topicInfo, registry);
-    return std::make_unique<TopicMessenger>(std::move(messagingQueue),
+    auto translator = std::make_unique<core::TopicTranslator>(topicInfo, registry);
+    return std::make_unique<core::TopicMessenger>(std::move(messagingQueue),
                                             std::move(translator));
   }
 
-  virtual std::shared_ptr<Registry> getRegistry() const override {
+  virtual std::shared_ptr<core::Registry> getRegistry() const override {
     return registry;
   }
 

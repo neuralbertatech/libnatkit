@@ -1,7 +1,7 @@
 #include <iostream>
 #include <libnatkit/core/kafka/broker/BrokerManager.hpp>
-#include <libnatkit/core/streams/schemas/BasicMetaInfoSchema.hpp>
-#include <libnatkit/core/streams/stream/BasicTopicInformation.hpp>
+#include <libnatkit-core.hpp>
+#include <libnatkit/util/Strings.hpp>
 
 int main(int argc, char **argv) {
   if (argc != 3) {

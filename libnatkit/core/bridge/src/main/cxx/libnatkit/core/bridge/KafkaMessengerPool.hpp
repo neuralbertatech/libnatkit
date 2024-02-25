@@ -7,7 +7,7 @@
 
 #include <libnatkit/core/kafka/broker/BrokerManager.hpp>
 #include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
-#include <libnatkit/core/streams/stream/BasicTopicInformation.hpp>
+#include <libnatkit-core.hpp>
 #include <libnatkit/util/Casting.hpp>
 
 namespace nat::bridge {
@@ -20,14 +20,14 @@ class KafkaMessengerPool {
       messengers;
   std::set<std::string> monitoredTopics{};
   std::jthread newTopicMonitor{};
-  std::function<void(const std::string &, std::unique_ptr<kafka::message_t> &&)>
+  std::function<void(const std::string &, std::unique_ptr<core::message_t> &&)>
       onMessageRecievedCallback;
   bool running{true};
 
 public:
   KafkaMessengerPool(std::shared_ptr<kafka::BrokerManager> kafkaManager,
                      std::function<void(const std::string &,
-                                        std::unique_ptr<kafka::message_t> &&)>
+                                        std::unique_ptr<core::message_t> &&)>
                          onMessageRecievedCallback)
       : kafkaManager(kafkaManager),
         onMessageRecievedCallback(onMessageRecievedCallback) {
@@ -38,7 +38,7 @@ public:
   ~KafkaMessengerPool() { running = false; }
 
   void sendMessage(const std::string &topicName,
-                   std::unique_ptr<kafka::message_t> &&msg) {
+                   std::unique_ptr<core::message_t> &&msg) {
     std::cout << "% Kafka attempting to send message to: " << topicName << '\n';
     if (auto it = messengers.find(topicName); it != messengers.end()) {
       it->second->enqueueMessageToSend(std::move(msg));
@@ -68,7 +68,7 @@ private:
     for (const auto &topicString : allTopicStrings) {
       if (!monitoredTopics.contains(topicString)) {
         const auto topicInfoMaybe =
-            kafka::BasicTopicInformation::create(topicString);
+            core::BasicTopicInformation::create(topicString);
         if (topicInfoMaybe.has_value()) {
           createNewMessenger(topicInfoMaybe.value());
         }
@@ -77,7 +77,7 @@ private:
   }
 
   void createNewMessenger(
-      const std::unique_ptr<kafka::BasicTopicInformation> &basicTopicInfo) {
+      const std::unique_ptr<core::BasicTopicInformation> &basicTopicInfo) {
     createNewMessenger(basicTopicInfo->toTopicString());
   }
 
@@ -98,7 +98,7 @@ private:
   }
 
   void defaultOnMessageReceived(const std::string &topicString,
-                                std::unique_ptr<kafka::message_t> &&msg) {
+                                std::unique_ptr<core::message_t> &&msg) {
     const std::string messageString{msg->begin(), msg->end()};
     std::cout << "KafkaMessengerPool Received the following message from "
               << topicString << ": " << messageString << '\n';

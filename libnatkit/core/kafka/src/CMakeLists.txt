@@ -1,22 +1,15 @@
 set(LIBNATKIT_CORE_KAFKA_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-set(LIBNATKIT_CORE_KAFKA_C_FILES
-  ${LIBNATKIT_CORE_KAFKA_ROOT}/main/c/libnatkit/core/streams/stream/Stream.h
-  ${LIBNATKIT_CORE_KAFKA_ROOT}/main/c/libnatkit/core/streams/stream/Stream.c
-  ${LIBNATKIT_CORE_KAFKA_ROOT}/main/c/libnatkit/core/streams/stream/StreamExtension.h
-  ${LIBNATKIT_CORE_KAFKA_ROOT}/main/c/libnatkit/core/streams/stream/StreamId.h
-  ${LIBNATKIT_CORE_KAFKA_ROOT}/main/c/libnatkit/core/streams/stream/StreamType.h
-  )
 
 set(LIBNATKIT_CORE_KAFKA_CXX_FILES
   ${LIBNATKIT_CORE_KAFKA_ROOT}/main/cxx/libnatkit/core/kafka/broker/BrokerManager.hpp
   ${LIBNATKIT_CORE_KAFKA_ROOT}/main/cxx/libnatkit/core/kafka/broker/BrokerManagerImpl.cpp
   )
 
-
 add_library(libnatkit-core-kafka-cxx SHARED ${LIBNATKIT_CORE_KAFKA_CXX_FILES})
 set_target_properties(libnatkit-core-kafka-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(libnatkit-core-kafka-cxx PUBLIC
-  libnatkit-core-streams-cxx
+  libnatkit-util-cxx
+  libnatkit-core
   librdkafka-c
   librdkafka-cxx
 )
