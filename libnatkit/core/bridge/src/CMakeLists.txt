@@ -8,6 +8,7 @@ set(LIBNATKIT_CORE_BRIDGE_CXX_FILES
 add_library(libnatkit-core-bridge-cxx SHARED ${LIBNATKIT_CORE_BRIDGE_CXX_FILES})
 set_target_properties(libnatkit-core-bridge-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(libnatkit-core-bridge-cxx PUBLIC
+  libnatkit-util-cxx
   libnatkit-core-mqtt-cxx
   libnatkit-core-kafka-cxx
 )

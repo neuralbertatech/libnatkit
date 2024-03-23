@@ -17,7 +17,7 @@ std::optional<std::unique_ptr<KafkaMosquittoBridge>> KafkaMosquittoBridge::creat
   }
 }
 
-std::optional<std::shared_ptr<kafka::message_t>> KafkaMosquittoBridge::getNextKafkaMessage() {
+std::optional<std::shared_ptr<core::message_t>> KafkaMosquittoBridge::getNextKafkaMessage() {
   //return kafkaMessenger->tryGetNextMessage(); 
   return {};
 }

@@ -9,7 +9,8 @@
 #include <libnatkit/core/bridge/KafkaMessengerPool.hpp>
 #include <libnatkit/core/kafka/broker/BrokerManager.hpp>
 #include <libnatkit/core/mqtt/MosquittoBroker.hpp>
-#include <libnatkit/core/streams/registry/Message.hpp> // TODO: Remove
+#include <libnatkit-core.hpp> // TODO: Remove
+#include <libnatkit/util/Strings.hpp>
 
 namespace nat::bridge {
 
@@ -21,16 +22,16 @@ class KafkaMosquittoBridge {
   std::unique_ptr<mosquitto::MosquittoPublisher> mosquittoPublisher;
   std::unique_ptr<mosquitto::MosquittoClient> mosquittoClient;
   std::unique_ptr<KafkaMessengerPool> kafkaMessengerPool;
-  std::queue<std::pair<std::string, std::unique_ptr<kafka::message_t>>>
+  std::queue<std::pair<std::string, std::unique_ptr<core::message_t>>>
       kafkaBrokerReceivingQueue;
   std::mutex kafkaBrokerRecievingQueueLock;
-  std::queue<std::pair<std::string, std::unique_ptr<kafka::message_t>>>
+  std::queue<std::pair<std::string, std::unique_ptr<core::message_t>>>
       mosquittoBrokerSendingQueue;
   std::mutex mosquittoBrokerSendingQueueLock;
-  std::queue<std::pair<std::string, std::unique_ptr<kafka::message_t>>>
+  std::queue<std::pair<std::string, std::unique_ptr<core::message_t>>>
       kafkaBrokerSendingQueue;
   std::mutex kafkaBrokerSendingQueueLock;
-  std::queue<std::pair<std::string, std::unique_ptr<kafka::message_t>>>
+  std::queue<std::pair<std::string, std::unique_ptr<core::message_t>>>
       mosquittoBrokerReceivingQueue;
   std::mutex mosquittoBrokerRecievingQueueLock;
   std::map<std::string, std::unique_ptr<mosquitto::MosquittoPublisher>>
@@ -80,7 +81,7 @@ class KafkaMosquittoBridge {
         std::shared_ptr<kafka::BrokerManager> kafkaBroker,
         std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker);
 
-    std::optional<std::shared_ptr<kafka::message_t>> getNextKafkaMessage();
+    std::optional<std::shared_ptr<core::message_t>> getNextKafkaMessage();
 
   private:
     void tryCreateMosquittoPublisher(const std::string &topicName) {
@@ -93,7 +94,7 @@ class KafkaMosquittoBridge {
     }
 
     void onKafkaMessageReceived(const std::string &topicName,
-                                std::unique_ptr<kafka::message_t> &&msg) {
+                                std::unique_ptr<core::message_t> &&msg) {
       {
         const std::lock_guard<std::mutex> lock(kafkaBrokerRecievingQueueLock);
         kafkaBrokerReceivingQueue.emplace(topicName, std::move(msg));
@@ -104,7 +105,7 @@ class KafkaMosquittoBridge {
                                     const std::string &topic,
                                     const std::string &message, int qos) {
       auto encodedMessage =
-          std::make_unique<kafka::message_t>(message.begin(), message.end());
+          std::make_unique<core::message_t>(message.begin(), message.end());
       const auto splitTopic = util::Strings::split(topic, '/');
       if (splitTopic.size() == 0) {
         std::cout << "Error: Mosquitto recieved unrecognized topic " << topic

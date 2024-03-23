@@ -36,6 +36,7 @@ if(LIBNATKIT_ESP_BUILD)
 else()
   add_library(libnatkit-util-cxx SHARED ${LIBNATKIT_UTIL_CXX_FILES})
 endif()
+
 set_target_properties(libnatkit-util-cxx PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(libnatkit-util-cxx
   PUBLIC

@@ -10,3 +10,9 @@
 [submodule "third-party/mosquitto"]
 	path = third-party/mosquitto
 	url = https://github.com/eclipse/mosquitto
+[submodule "lib/libnatkit-core"]
+	path = lib/libnatkit-core
+	url = https://github.com/neuralbertatech/libnatkit-core
+[submodule "third-party/libnatkit-core"]
+	path = third-party/libnatkit-core
+	url = https://github.com/neuralbertatech/libnatkit-core

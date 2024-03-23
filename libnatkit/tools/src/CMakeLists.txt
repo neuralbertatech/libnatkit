@@ -56,4 +56,9 @@ target_link_libraries(libnatkit-kafka-mosquitto-bridge PRIVATE
   libnatkit-core-bridge-cxx
 	)
 
+add_executable(libnatkit-natkit-menu ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitMenu.cpp)
+target_link_libraries(libnatkit-natkit-menu PRIVATE
+  libnatkit-core-kafka-cxx
+	)
+
 

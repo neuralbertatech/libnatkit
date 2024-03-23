@@ -2,11 +2,7 @@
 
 #include <memory>
 
-#include <libnatkit/core/streams/registry/Decoder.hpp>
-#include <libnatkit/core/streams/registry/Registry.hpp>
-#include <libnatkit/core/streams/registry/TopicMessenger.hpp>
-#include <libnatkit/core/streams/stream/BasicTopicInformation.hpp>
-#include <libnatkit/core/streams/stream/RawStream.hpp>
+#include <libnatkit-core.hpp>
 
 #include <librdkafka/rdkafkacpp.h>
 
@@ -25,15 +21,15 @@ public:
   virtual std::vector<std::string>
   getAllTopicStrings(bool includeHiddenTopics = false) const = 0;
 
-  virtual std::vector<std::unique_ptr<BasicTopicInformation>>
+  virtual std::vector<std::unique_ptr<core::BasicTopicInformation>>
   getAllTopics() const = 0;
 
-  virtual std::vector<std::unique_ptr<RawStream>> getAllStreams() const = 0;
+  virtual std::vector<std::unique_ptr<core::RawStream>> getAllStreams() const = 0;
 
-  virtual std::unique_ptr<TopicMessenger> createMessenger(
-      const std::shared_ptr<BasicTopicInformation> &topicInfo) const = 0;
+  virtual std::unique_ptr<core::TopicMessenger> createMessenger(
+      const std::shared_ptr<core::BasicTopicInformation> &topicInfo) const = 0;
 
-  virtual std::shared_ptr<Registry> getRegistry() const = 0;
+  virtual std::shared_ptr<core::Registry> getRegistry() const = 0;
 
   virtual std::unique_ptr<RdKafka::Topic>
   createTopicHandle(const std::string &topicName,
