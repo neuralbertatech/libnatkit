@@ -1,7 +1,7 @@
 #include <chrono>
 #include <iostream>
 
-#include <libnatkit/core/bridge/KafkaMosquittoBridge.hpp>
+#include <libnatkit-bridge.hpp>
 #include <libnatkit/util/Casting.hpp>
 #include <libnatkit/util/Strings.hpp>
 

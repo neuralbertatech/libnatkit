@@ -1,5 +1,5 @@
 #include <iostream>
-#include <libnatkit/core/kafka/broker/BrokerManager.hpp>
+#include <libnatkit-kafka.hpp>
 #include <libnatkit/util/Strings.hpp>
 
 int main(int argc, char** argv) {
