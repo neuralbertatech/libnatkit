@@ -2,7 +2,7 @@
 #include <iostream>
 #include <thread>
 
-#include <libnatkit/core/kafka/broker/BrokerManager.hpp>
+#include <libnatkit-kafka.hpp>
 #include <libnatkit-core.hpp>
 #include <libnatkit/util/Strings.hpp>
 

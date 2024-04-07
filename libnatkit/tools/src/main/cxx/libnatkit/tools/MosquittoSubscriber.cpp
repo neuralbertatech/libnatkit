@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <thread>
 
-#include <libnatkit/core/mqtt/MosquittoBroker.hpp>
+#include <libnatkit-mqtt.hpp>
 #include <libnatkit/util/Strings.hpp>
 
 using namespace std::chrono_literals;

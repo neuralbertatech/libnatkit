@@ -1,4 +1,4 @@
-#include <libnatkit/core/kafka/broker/BrokerManager.hpp>
+#include <libnatkit-kafka.hpp>
 
 #include <iostream>
 #include <string>
@@ -6,7 +6,6 @@
 #include <vector>
 
 #include <libnatkit/util/Casting.hpp>
-#include <libnatkit/core/kafka/broker/BrokerMessagingQueue.hpp>
 
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>

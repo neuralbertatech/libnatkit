@@ -1,8 +1,4 @@
-#include <string>
-
-#include <libnatkit/core/mqtt/MosquittoBroker.hpp>
-
-#include <mosquitto.h>
+#include <libnatkit-mqtt.hpp>
 
 namespace nat::mosquitto {
 

@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include <libnatkit/core/mqtt/MosquittoBroker.hpp>
+#include <libnatkit-mqtt.hpp>
 #include <libnatkit/util/Strings.hpp>
 
 
