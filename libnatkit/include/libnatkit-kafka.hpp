@@ -89,7 +89,7 @@ public:
   virtual ~BrokerMessagingQueue();
   virtual void enqueueMessageToSend(std::unique_ptr<core::message_t> &&message) override;
   virtual void enqueueMessageToReceive(const std::shared_ptr<core::message_t> message) override;
-  virtual std::optional<std::shared_ptr<core::message_t>> tryGetNextMessage() override;
+  virtual nat::core::Optional<std::shared_ptr<core::message_t>> tryGetNextMessage() override;
 
 private:
   static std::string byteArrayToString(const std::vector<uint8_t> &byteArray);

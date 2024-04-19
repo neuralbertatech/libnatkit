@@ -95,14 +95,14 @@ void BrokerMessagingQueue::enqueueMessageToReceive(const std::shared_ptr<core::m
   receivingQueue.push(std::move(message));
 }
 
-std::optional<std::shared_ptr<core::message_t>> BrokerMessagingQueue::tryGetNextMessage() {
+nat::core::Optional<std::shared_ptr<core::message_t>> BrokerMessagingQueue::tryGetNextMessage() {
   const std::lock_guard<std::mutex> lock(receivingQueueLock);
   if (receivingQueue.empty()) {
     return {};
   } else {
     auto message = std::move(receivingQueue.front());
     receivingQueue.pop();
-    return std::move(message);
+    return {std::move(message)};
   }
 }
 
