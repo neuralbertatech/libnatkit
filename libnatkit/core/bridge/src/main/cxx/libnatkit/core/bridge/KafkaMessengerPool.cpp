@@ -1,3 +1,4 @@
+#include <libnatkit-core.hpp>
 #include <libnatkit-bridge.hpp>
 
 #include <libnatkit/util/Casting.hpp>

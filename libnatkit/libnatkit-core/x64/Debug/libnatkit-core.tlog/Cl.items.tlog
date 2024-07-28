@@ -1,0 +1,12 @@
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\BasicMetaInfoSchema.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\BasicMetaInfoSchema.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\BasicTopicInformation.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\BasicTopicInformation.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\JsonDecoder.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\JsonDecoder.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\JsonEncoder.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\JsonEncoder.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\NatImuDataSchema.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\NatImuDataSchema.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\RawStream.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\RawStream.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\Registry.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\Registry.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\SerializationType.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\SerializationType.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\Stream.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\Stream.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\StreamType.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\StreamType.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\TopicMessenger.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\TopicMessenger.obj
+C:\Users\zach\sync\code\libnatkit\lib\libnatkit-core\src\TopicTranslator.cpp;C:\Users\zach\sync\code\libnatkit\libnatkit\libnatkit-core\x64\Debug\TopicTranslator.obj

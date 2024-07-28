@@ -2,13 +2,31 @@
 #include <iostream>
 #include <cmath>
 #include <thread>
+#include <mutex>
 
+#include <librdkafka/rdkafka.h>
+#include <librdkafka/rdkafkacpp.h>
 #include <libnatkit-kafka.hpp>
 #include <libnatkit-core.hpp>
 #include <libnatkit/util/Strings.hpp>
 #include <libnatkit/util/Vectors.hpp>
 
 using namespace std::chrono_literals;
+
+class ExampleDeliveryReportCbOther : public RdKafka::DeliveryReportCb {
+public:
+    void dr_cb(RdKafka::Message& message) {
+        /* If message.err() is non-zero the message delivery failed permanently
+         * for the message. */
+        if (message.err())
+            std::cerr << "% Message delivery failed: " << message.errstr()
+            << std::endl;
+        else
+            std::cerr << "% Message delivered to topic " << message.topic_name()
+            << " [" << message.partition() << "] at offset "
+            << message.offset() << std::endl;
+    }
+};
 
 enum class MenuOptions {
   DeleteTopic,
@@ -66,7 +84,7 @@ void printTopics(const std::vector<std::unique_ptr<nat::core::BasicTopicInformat
 std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
   auto topics = manager->getAllTopics();
   printTopics(topics);
-  int maxIndex = std::max(static_cast<int>(topics.size()-1), 0);
+  int maxIndex = max(static_cast<int>(topics.size()-1), 0);
   std::cout << "Select a topic [0-" << maxIndex << "]: ";
   std::string selectedTopicIndex;
   std::getline(std::cin, selectedTopicIndex);
@@ -79,13 +97,16 @@ std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const 
 }
 
 std::pair<std::string, std::string> getBroker() {
-  const auto hostCStr = std::getenv("NATKIT_SERVER_HOST");
-  const auto portCStr = std::getenv("NATKIT_SERVER_PORT");
+  char envHostBuffer[256];
+  char envPortBuffer[256];
+  size_t bufferSize;
+  errno_t hostEnvError = getenv_s(&bufferSize, envHostBuffer, sizeof(envHostBuffer), "NATKIT_SERVER_HOST");
+  errno_t portEnvError = getenv_s(&bufferSize, envPortBuffer, sizeof(envPortBuffer), "NATKIT_SERVER_PORT");
   std::string host = "localhost";
   std::string port = "9092";
-  if (hostCStr != nullptr && portCStr != nullptr) {
-    host = hostCStr;
-    port = portCStr;
+  if (hostEnvError != 0 && portEnvError != 0) {
+      host = std::string(envHostBuffer);
+      port = std::string(envPortBuffer);
   }
   std::cout << "Enter broker in the format <hostname>:<port> [" << host << ":" << port << "]: ";
   std::string broker;
@@ -218,6 +239,9 @@ int main(int argc, char **argv) {
   //  std::cerr << "Usage: " << argv[0] << " takes no arguments\n";
   //  exit(1);
   //}
+    std::mutex mtx;
+    mtx.lock();
+    mtx.unlock();
 
   const auto [brokerHost, brokerPort] = getBroker();
 
