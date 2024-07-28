@@ -2,10 +2,10 @@
 <Project>
   <ProjectOutputs>
     <ProjectOutput>
-      <FullPath>C:\Users\zach\sync\code\libnatkit\Solution1\x64\Release\libnatkit-public.exe</FullPath>
+      <FullPath>C:\Users\zach\sync\code\libnatkit\libnatkit-solution\x64\Release\libnatkit-public.exe</FullPath>
     </ProjectOutput>
     <ProjectOutput>
-      <FullPath>C:\Users\zach\sync\code\libnatkit\Solution1\x64\Release\libnatkit-menu.exe</FullPath>
+      <FullPath>C:\Users\zach\sync\code\libnatkit\libnatkit-solution\x64\Release\libnatkit-menu.exe</FullPath>
     </ProjectOutput>
   </ProjectOutputs>
   <ContentFiles />

@@ -9,3 +9,10 @@ build/
 compile_commands.json
 .ccls-cache/
 .cache/
+packages/
+**/Release/
+**/Debug/
+**/x64/
+*.lastbuildstate
+*.tlog
+.vscode/

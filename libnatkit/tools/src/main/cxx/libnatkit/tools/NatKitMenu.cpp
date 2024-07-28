@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <chrono>
-#include <iostream>
 #include <cmath>
-#include <thread>
+#include <iostream>
 #include <mutex>
+#include <stdlib.h>
+#include <thread>
 
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
@@ -84,7 +86,7 @@ void printTopics(const std::vector<std::unique_ptr<nat::core::BasicTopicInformat
 std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
   auto topics = manager->getAllTopics();
   printTopics(topics);
-  int maxIndex = max(static_cast<int>(topics.size()-1), 0);
+  int maxIndex = (std::max)(static_cast<int>(topics.size()-1), 0);
   std::cout << "Select a topic [0-" << maxIndex << "]: ";
   std::string selectedTopicIndex;
   std::getline(std::cin, selectedTopicIndex);
@@ -100,8 +102,8 @@ std::pair<std::string, std::string> getBroker() {
   char envHostBuffer[256];
   char envPortBuffer[256];
   size_t bufferSize;
-  errno_t hostEnvError = getenv_s(&bufferSize, envHostBuffer, sizeof(envHostBuffer), "NATKIT_SERVER_HOST");
-  errno_t portEnvError = getenv_s(&bufferSize, envPortBuffer, sizeof(envPortBuffer), "NATKIT_SERVER_PORT");
+  auto hostEnvError = getenv_s(&bufferSize, envHostBuffer, sizeof(envHostBuffer), "NATKIT_SERVER_HOST");
+  auto portEnvError = getenv_s(&bufferSize, envPortBuffer, sizeof(envPortBuffer), "NATKIT_SERVER_PORT");
   std::string host = "localhost";
   std::string port = "9092";
   if (hostEnvError != 0 && portEnvError != 0) {

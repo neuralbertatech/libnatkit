@@ -150,18 +150,21 @@
     <ProjectReference Include="..\..\kafka\libnatkit-core-kafka\libnatkit-core-kafka.vcxproj">
       <Project>{88f22f2d-e275-4af4-a6ff-3b9ebfdeba6c}</Project>
     </ProjectReference>
+    <ProjectReference Include="..\..\mqtt\libnatkit-core-mqtt\libnatkit-core-mqtt.vcxproj">
+      <Project>{6c563497-85c7-4a7c-9205-6a49484b4898}</Project>
+    </ProjectReference>
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="..\..\..\..\Solution1\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets" Condition="Exists('..\..\..\..\Solution1\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets')" />
+    <Import Project="..\..\..\..\libnatkit-solution\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets" Condition="Exists('..\..\..\..\libnatkit-solution\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets')" />
   </ImportGroup>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
     </PropertyGroup>
-    <Error Condition="!Exists('..\..\..\..\Solution1\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\..\..\..\Solution1\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets'))" />
+    <Error Condition="!Exists('..\..\..\..\libnatkit-solution\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\..\..\..\libnatkit-solution\packages\librdkafka.redist.2.4.0\build\native\librdkafka.redist.targets'))" />
   </Target>
 </Project>
