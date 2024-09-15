@@ -46,17 +46,17 @@ int main(int argc, char **argv) {
   }
 
   auto bridge = std::move(bridgeMaybe.value());
-  int max = 6000;
-  int current = 0;
-  while (current < max) {
+  //int max = 6000;
+  //int current = 0;
+  while (true) {
     auto messageMaybe = bridge->getNextKafkaMessage();
     if (messageMaybe.has_value()) {
       std::string message{messageMaybe.value()->begin(),
                           messageMaybe.value()->end()};
       std::cout << "Recieved message from kafka broker: " << message << '\n';
-      current = 0;
+      //current = 0;
     } else {
-      ++current;
+      //++current;
       std::this_thread::sleep_for(5ms);
     }
   }

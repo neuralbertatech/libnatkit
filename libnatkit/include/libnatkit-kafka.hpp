@@ -64,8 +64,8 @@ class BrokerMessagingQueue : public core::MessagingQueue {
 
   std::queue<std::shared_ptr<core::message_t>> receivingQueue{};
   std::queue<std::unique_ptr<core::message_t>> sendingQueue{};
-  std::mutex receivingQueueLock{};
-  std::mutex sendingQueueLock{};
+  mutable std::mutex receivingQueueLock{};
+  mutable std::mutex sendingQueueLock{};
   std::string topicName;
   std::shared_ptr<RdKafka::Producer> producer;
   std::shared_ptr<RdKafka::Consumer> consumer;

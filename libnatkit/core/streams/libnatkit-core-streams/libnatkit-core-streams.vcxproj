@@ -134,6 +134,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\..\..\third-party\nlohmann\single_include\nlohmann\json.hpp" />
     <ClInclude Include="..\src\main\cxx\libnatkit\core\streams\registry\Decoder.hpp" />
     <ClInclude Include="..\src\main\cxx\libnatkit\core\streams\registry\Encoder.hpp" />
     <ClInclude Include="..\src\main\cxx\libnatkit\core\streams\registry\JsonDecoder.hpp" />

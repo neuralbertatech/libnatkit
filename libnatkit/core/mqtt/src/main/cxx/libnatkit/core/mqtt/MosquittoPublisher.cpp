@@ -57,7 +57,15 @@ MosquittoPublisher::create(const std::string &brokerHostname, int brokerPort,
 
 void MosquittoPublisher::stop() { running = false; }
 
-void MosquittoPublisher::sendMessage(const std::string &msg) { messages.emplace(std::make_unique<std::string>(msg)); }
+void MosquittoPublisher::sendMessage(const std::string &msg) { 
+    auto msgPtr = std::make_unique<std::string>(std::string{ msg.c_str() });
+    uint64_t pointerAddress = reinterpret_cast<uint64_t>(msgPtr.get());
+    if (pointerAddress > 0xc000000000000000) {
+        std::cout << "Uh oh, something weird is going on with the mosquitto send message method" << std::endl;
+    }
+    std::lock_guard<std::mutex> gaurd(messageLock);
+    messages.push(std::move(msgPtr));
+}
 
 void MosquittoPublisher::handleMessages() {
   while (running && producer) {
@@ -73,9 +81,21 @@ void MosquittoPublisher::publishMessages() {
   int *messageId{nullptr};
   const int qualityOfService{2};
   const bool retain{false};
-  while (!messages.empty()) {
-    const auto message = std::move(messages.front());
-    messages.pop();
+  std::queue<std::unique_ptr<std::string>> messagesToSend{};
+  {
+      std::lock_guard<std::mutex> gaurd(messageLock);
+      while (!messages.empty()) {
+          messagesToSend.push(std::move(messages.front()));
+          messages.pop();
+      }
+  }
+  while (!messagesToSend.empty()) {
+      const auto message = std::move(messagesToSend.front());
+      messagesToSend.pop();
+    if (!message) {
+        std::cout << "$ Mosquitto publisher error: An empty message was added to the queue!\n";
+        return;
+    }
     int returnCode =
         mosquitto_publish(producer, messageId, topic.c_str(), message->size(),
                           message->c_str(), qualityOfService, retain);
@@ -85,7 +105,7 @@ void MosquittoPublisher::publishMessages() {
                 << *message << "\" because " << mosquitto_strerror(returnCode)
                 << '\n';
     } else {
-      std::cout << "% Mosquitto publisher successfully sent \"" << *message << "\"\n";
+      //std::cout << "% Mosquitto publisher successfully sent \"" << *message << "\"\n";
     }
   }
 }
@@ -102,7 +122,8 @@ void MosquittoPublisher::defaultOnConnect(struct mosquitto *clientPtr, void *cal
                              int reasonCode) {
   auto mosquittoPublisher = convertCallbackObject(callbackObj);
   std::cout << "% Mosquitto publisher connected: "
-            << mosquitto_connack_string(reasonCode);
+            << mosquitto_connack_string(reasonCode)
+            << '\n';
   if (reasonCode != 0) {
     std::cout << "% Client connection failed\n";
     mosquittoPublisher->stop();
@@ -112,7 +133,7 @@ void MosquittoPublisher::defaultOnConnect(struct mosquitto *clientPtr, void *cal
 
 void MosquittoPublisher::defaultOnPublish(struct mosquitto *clientPtr, void *callbackObj,
                              int messageId) {
-  std::cout << "Message with mid " << messageId << " has been published.\n";
+  //std::cout << "Message with mid " << messageId << " has been published.\n";
 }
 
 }

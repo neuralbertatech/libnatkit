@@ -37,6 +37,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libnatkit-mosquitto-kafka-b
 		{B4775E86-25A6-4E8F-A4F0-1BD8425F0D32} = {B4775E86-25A6-4E8F-A4F0-1BD8425F0D32}
 	EndProjectSection
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Win64-Imu-Application", "Win64-Imu-Application\Win64-Imu-Application.vcxproj", "{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -94,7 +96,6 @@ Global
 		{53C93E57-5BDF-44F3-B1D2-48C6090CC622}.Release|x86.ActiveCfg = Release|Win32
 		{53C93E57-5BDF-44F3-B1D2-48C6090CC622}.Release|x86.Build.0 = Release|Win32
 		{B47B142A-A1E4-467B-AD1D-E2402B9EB355}.Debug|x64.ActiveCfg = Debug|x64
-		{B47B142A-A1E4-467B-AD1D-E2402B9EB355}.Debug|x64.Build.0 = Debug|x64
 		{B47B142A-A1E4-467B-AD1D-E2402B9EB355}.Debug|x86.ActiveCfg = Debug|Win32
 		{B47B142A-A1E4-467B-AD1D-E2402B9EB355}.Debug|x86.Build.0 = Debug|Win32
 		{B47B142A-A1E4-467B-AD1D-E2402B9EB355}.Release|x64.ActiveCfg = Release|x64
@@ -125,6 +126,14 @@ Global
 		{445D7C1C-6F8E-437B-8430-915089BEC6FB}.Release|x64.Build.0 = Release|x64
 		{445D7C1C-6F8E-437B-8430-915089BEC6FB}.Release|x86.ActiveCfg = Release|Win32
 		{445D7C1C-6F8E-437B-8430-915089BEC6FB}.Release|x86.Build.0 = Release|Win32
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Debug|x64.ActiveCfg = Debug|x64
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Debug|x64.Build.0 = Debug|x64
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Debug|x86.ActiveCfg = Debug|Win32
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Debug|x86.Build.0 = Debug|Win32
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Release|x64.ActiveCfg = Release|x64
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Release|x64.Build.0 = Release|x64
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Release|x86.ActiveCfg = Release|Win32
+		{9EF64D4C-6FFB-4CCA-BFA8-A277E3C07689}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

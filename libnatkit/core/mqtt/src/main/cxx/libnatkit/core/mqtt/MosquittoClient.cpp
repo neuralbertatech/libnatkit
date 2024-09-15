@@ -129,7 +129,7 @@ void MosquittoClient::onMessageHandler(struct mosquitto *clientPtr, void *callba
   const auto mosquittoClient = convertCallbackObject(callbackObj);
   const std::string topic{message->topic};
   const std::string msg{(char *)message->payload};
-  std::cout << "% Mosquitto Client " << topic << " receivied a message: " << msg << '\n';
+  //std::cout << "% Mosquitto Client " << topic << " receivied a message: " << msg << '\n';
   mosquittoClient->onMessageCallback(mosquittoClient, topic, msg,
                                      message->qos);
 }
@@ -137,8 +137,8 @@ void MosquittoClient::onMessageHandler(struct mosquitto *clientPtr, void *callba
 void MosquittoClient::defaultOnMessageCallback(MosquittoClient *client,
                                      const std::string &topic,
                                      const std::string &message, int qos) {
-  std::cout << "% Mosquitto client recieved the following message: " << topic
-            << " " << qos << " " << message << '\n';
+  /*std::cout << "% Mosquitto client recieved the following message: " << topic
+            << " " << qos << " " << message << '\n';*/
   client->addMessageToQueue(topic, message);
 }
 

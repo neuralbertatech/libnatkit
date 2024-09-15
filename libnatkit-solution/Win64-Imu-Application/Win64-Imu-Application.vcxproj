@@ -21,8 +21,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{6c563497-85c7-4a7c-9205-6a49484b4898}</ProjectGuid>
-    <RootNamespace>libnatkitcoremqtt</RootNamespace>
+    <ProjectGuid>{9ef64d4c-6ffb-4cca-bfa8-a277e3c07689}</ProjectGuid>
+    <RootNamespace>Win64ImuApplication</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -40,13 +40,13 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
@@ -120,7 +120,6 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\Users\zach\sync\code\libnatkit\libnatkit\core\mqtt\src\main\cxx;C:\Program Files\mosquitto\devel;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -130,20 +129,21 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\src\main\cxx\libnatkit\core\mqtt\MosquittoBrokerImpl.cpp" />
-    <ClCompile Include="..\src\main\cxx\libnatkit\core\mqtt\MosquittoClient.cpp" />
-    <ClCompile Include="..\src\main\cxx\libnatkit\core\mqtt\MosquittoPublisher.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\..\..\include\libnatkit-public\libnatkit-public.vcxproj">
+    <ProjectReference Include="..\..\libnatkit\core\kafka\libnatkit-core-kafka\libnatkit-core-kafka.vcxproj">
+      <Project>{88f22f2d-e275-4af4-a6ff-3b9ebfdeba6c}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\..\libnatkit\include\libnatkit-public\libnatkit-public.vcxproj">
       <Project>{0547ba69-3f70-4b5d-84bd-eecd06d7d207}</Project>
     </ProjectReference>
-    <ProjectReference Include="..\..\..\libnatkit-core\libnatkit-core.vcxproj">
+    <ProjectReference Include="..\..\libnatkit\libnatkit-core\libnatkit-core.vcxproj">
       <Project>{7e5b0cec-69d8-4b2d-85d7-3f8ccf409a32}</Project>
     </ProjectReference>
-    <ProjectReference Include="..\..\..\util\libnatkit-util\libnatkit-util.vcxproj">
+    <ProjectReference Include="..\..\libnatkit\util\libnatkit-util\libnatkit-util.vcxproj">
       <Project>{a79a33db-5194-47d8-a681-2fe4fc09a774}</Project>
     </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\libnatkit\tools\src\main\cxx\libnatkit\tools\Win64Imu.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -27,4 +27,8 @@ std::string toLowercase(const std::string& string) {
     return lowercaseString;
 }
 
+char toLowercase(char character) {
+    return (char)std::tolower(character);
+}
+
 }
