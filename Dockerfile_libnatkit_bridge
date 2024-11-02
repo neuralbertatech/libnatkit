@@ -1,0 +1,10 @@
+FROM gcc:14.2-bookworm
+WORKDIR /libnakit
+COPY . .
+
+RUN apt update
+RUN apt install cmake -y
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -S .
+RUN cmake --build build
+
+CMD exec /bin/sh -c "trap : TERM INT; sleep infinity & wait"

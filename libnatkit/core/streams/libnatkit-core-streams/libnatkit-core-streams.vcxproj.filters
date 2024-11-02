@@ -31,6 +31,9 @@
     <Filter Include="Header Files\libnatkit\core\streams\registry">
       <UniqueIdentifier>{779accc8-d7b8-4f29-81df-fe50783f30ed}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Header Files\nlohmann">
+      <UniqueIdentifier>{d7e303f0-dba5-4c14-a226-165d412c96b1}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\src\main\cxx\libnatkit\core\streams\registry\Decoder.hpp">
@@ -92,6 +95,9 @@
     </ClInclude>
     <ClInclude Include="..\src\main\cxx\libnatkit\core\streams\stream\StreamType.hpp">
       <Filter>Header Files\libnatkit\core\streams\stream</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\..\third-party\nlohmann\single_include\nlohmann\json.hpp">
+      <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
