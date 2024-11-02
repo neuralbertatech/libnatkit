@@ -12,4 +12,8 @@ std::string toLowercase(const std::string& string);
 
 char toLowercase(char character);
 
+std::string toUppercase(const std::string& string);
+
+char toUppercase(char character);
+
 }

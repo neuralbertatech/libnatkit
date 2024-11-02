@@ -2,6 +2,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -19,11 +20,99 @@
 
 using namespace std::chrono_literals;
 
+void get_window_size(int& lines, int& columns, int defaultLines = 40, int defaultColumns = 80) {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        lines = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+        columns = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+    }
+    else {
+        lines = defaultLines;
+        columns = defaultColumns;
+    }
+}
+
+void set_window_size(int lines, int columns)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(
+        GetStdHandle(STD_OUTPUT_HANDLE),
+        &csbi
+    ))
+    {
+        // Make sure the new size isn't too big
+        if (lines > csbi.dwSize.Y) lines = csbi.dwSize.Y;
+        if (columns > csbi.dwSize.X) columns = csbi.dwSize.X;
+
+        // Adjust window origin if necessary
+        if ((csbi.srWindow.Top + lines) > csbi.dwSize.Y) csbi.srWindow.Top = csbi.dwSize.Y - lines - 1;
+        if ((csbi.srWindow.Left + columns) > csbi.dwSize.Y) csbi.srWindow.Left = csbi.dwSize.X - columns - 1;
+
+        // Calculate new size
+        csbi.srWindow.Bottom = csbi.srWindow.Top + lines - 1;
+        csbi.srWindow.Right = csbi.srWindow.Left + columns - 1;
+
+        SetConsoleWindowInfo(
+            GetStdHandle(STD_OUTPUT_HANDLE),
+            true,
+            &csbi.srWindow
+        );
+    }
+}
+
 class KeyListener {
     std::queue<char> keysPressed{};
     bool newKeysPressedAvailable = false;
     std::thread keyPollingThread;
     std::mutex queueLock;
+    std::function<bool(char)> filter;
+    std::function<char(char)> map;
+    HWND windowHandle;
+    std::mutex lock{};
+
+    static char getShiftedKey(char keycode, bool isShiftDown) {
+        if (!isShiftDown) {
+            return nat::util::Strings::toLowercase(keycode);
+        } else {
+            if ((keycode >= 'a' && keycode <= 'z') || (keycode >= 'A' && keycode <= 'Z')) {
+                return nat::util::Strings::toUppercase(keycode);
+            }
+            else {
+                switch (keycode) {
+                case '1': return '!';
+                case '2': return '@';
+                case '3': return '#';
+                case '4': return '$';
+                case '5': return '%';
+                case '6': return '^';
+                case '7': return '&';
+                case '8': return '*';
+                case '9': return '(';
+                case '0': return ')';
+                default: return keycode;
+                }
+            }
+        }
+    }
+
+    static int asciiToVirtualKey(char c) {
+        switch (c) {
+        case 8:
+            return VK_BACK;
+
+        case 27:
+            return VK_ESCAPE;
+
+        case 32:
+            return VK_SPACE;
+
+        case 46:
+            return VK_DECIMAL;
+
+        default:
+            return (int)c;
+        }
+    }
 
     void pollKeys() {
         std::array<bool, 256> lastKeyStates{};
@@ -36,25 +125,38 @@ class KeyListener {
             bool stateChanged = false;
             int keyUpIndex = 0;
             int keyDownIndex = 0;
-            for (int keyCode = 0; keyCode < 256; ++keyCode) {
-                // Check if the key with keyCode is currently
-                // pressed
-                currentKeyStates[keyCode] = GetAsyncKeyState(keyCode) & 0x8000;
-                if (currentKeyStates[keyCode] != lastKeyStates[keyCode]) {
-                    stateChanged = true;
-                    lastKeyStates[keyCode] = currentKeyStates[keyCode];
-                    if (currentKeyStates[keyCode])
-                        keyDown[keyDownIndex++] = static_cast<char>(keyCode);
-                    else
-                        keyUp[keyUpIndex++] = static_cast<char>(keyCode);
-                }
-            }
+            {
+                std::lock_guard<std::mutex> guard(lock);
+                if (windowHandle == NULL || windowHandle == GetForegroundWindow()) {
+                    for (int keyCode = 0; keyCode < 128; ++keyCode) {
+                        // Check if the key with keyCode is currently
+                        // pressed
+                        currentKeyStates[keyCode] = GetAsyncKeyState(asciiToVirtualKey(keyCode));// & 0x8000;
+                        if (currentKeyStates[keyCode] != lastKeyStates[keyCode]) {
+                            stateChanged = true;
+                            lastKeyStates[keyCode] = currentKeyStates[keyCode];
+                            if (currentKeyStates[keyCode])
+                                keyDown[keyDownIndex++] = static_cast<char>(keyCode);
+                            else
+                                keyUp[keyUpIndex++] = static_cast<char>(keyCode);
+                        }
+                    }
 
-            if (stateChanged) {
-                std::lock_guard<std::mutex> guard(queueLock);
-                for (int index = 0; index < keyUpIndex; ++index) {
-                    newKeysPressedAvailable = true;
-                    keysPressed.emplace(keyUp[index]);
+                    if (stateChanged) {
+                        bool shiftDown = GetAsyncKeyState(VK_SHIFT);
+                        std::lock_guard<std::mutex> guard(queueLock);
+                        for (int index = 0; index < keyUpIndex; ++index) {
+                            if (filter(keyUp[index])) {
+                                newKeysPressedAvailable = true;
+                                keysPressed.emplace(map(getShiftedKey(keyUp[index], shiftDown)));
+                            }
+                            else {
+                                char c = keyUp[index];
+                                int i = keyUp[index];
+                                ;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -63,11 +165,71 @@ class KeyListener {
         }
     }
 
+
 public:
-    KeyListener() : keyPollingThread(&KeyListener::pollKeys, this) { }
+    static bool defaultFilter(char c) { return true; }
+
+    static char defaultMap(char c) { return c; }
+
+    static bool isAlphaNumeric(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+    }
+
+    static bool isWhitespace(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    }
+
+    static bool isSpecialCharacter(char c) {
+        return (c >= '!' && c <= '/') || (c >= ':' && c <= '@') || (c >= ']' && c <= '`') || (c >= '{' && c <= '~');
+    }
+
+    static bool isBackspace(char c) {
+        return c == (char)8;
+    }
+
+    KeyListener() : keyPollingThread(&KeyListener::pollKeys, this), filter(defaultFilter), map(defaultMap) {
+        wchar_t buffer[1024];
+        wchar_t newTitleBuffer[1024];
+        int size = GetConsoleTitle(buffer, 1024);
+        if (size > 0) {
+            wchar_t format[6] = { '%', 'd', '/', '%', 'd', 0 };
+            wsprintf(newTitleBuffer, format, GetTickCount(), GetCurrentProcessId());
+            SetConsoleTitle(newTitleBuffer);
+            std::this_thread::sleep_for(40ms);
+            windowHandle = FindWindow(NULL, newTitleBuffer);
+            SetConsoleTitle(buffer);
+        }
+        else {
+            windowHandle = NULL;
+        }
+    }
+
+    void setFilter(std::function<bool(char)> func) {
+        std::lock_guard<std::mutex> guard(lock);
+        filter = func;
+    }
+
+    void resetFilter() {
+        std::lock_guard<std::mutex> guard(lock);
+        filter = defaultFilter;
+    }
+
+    std::function<bool(char)> getFilter() const { return filter; }
+
+    void setMap(std::function<char(char)> func) {
+        std::lock_guard<std::mutex> guard(lock);
+        map = func;
+    }
+
+    void resetMap() {
+        map = defaultMap;
+    }
+
+    std::function<char(char)> getMap() const { return map; }
 
     std::vector<char> getKeysPressed() {
         std::vector<char> keys;
+        std::lock_guard<std::mutex> guard(lock);
         if (newKeysPressedAvailable) {
             std::lock_guard<std::mutex> guard(queueLock);
             do {
@@ -80,9 +242,10 @@ public:
         return keys;
     }
 
-    bool haveAnyKeysBeenPressed() { return newKeysPressedAvailable; }
+    bool haveAnyKeysBeenPressed() const { return newKeysPressedAvailable; }
 
     void clearBuffer() {
+        std::lock_guard<std::mutex> guard(lock);
         if (newKeysPressedAvailable) {
             std::queue<char> emptyQueue{};
             {
@@ -95,32 +258,239 @@ public:
     }
 };
 
-KeyListener globalKeyListener{};
+std::shared_ptr<KeyListener> globalKeyListener = std::make_shared<KeyListener>();
 
 class TerminalScreen {
     static const std::string clearBufferCommand;
-
+    int terminalWidth{};
+    int terminalHeight{};
+    int defaultWidth{};
+    int defaultHeight{};
+    std::mutex lock{};
 
 public:
-    TerminalScreen() {}
+    TerminalScreen(int defaultWidth = 80, int defaultHeight = 60) : defaultWidth(defaultWidth), defaultHeight(defaultHeight) {
+        get_window_size(terminalHeight, terminalWidth, defaultHeight, defaultWidth);
+    }
 
     static void clearWindow() {
-        //std::cout << clearBufferCommand;
-        std::cout << "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
+        std::cout << clearBufferCommand;
     }
 
     static void drawToScreen(const std::string& msg) {
         clearWindow();
         std::cout << msg;
     }
+
+    void update() {
+        std::lock_guard<std::mutex> gaurd(lock);
+        get_window_size(terminalHeight, terminalWidth, defaultHeight, defaultWidth);
+    }
+
+    int getWidth() const { return terminalWidth; }
+
+    int getHeight() const { return terminalHeight; }
 };
 
-const std::string TerminalScreen::clearBufferCommand = (char)27 + "[3J";
+const std::string TerminalScreen::clearBufferCommand = (char)27 + "[2J";
+
+struct Command {
+    const std::string command;
+    const std::string discription;
+
+    Command(const std::string& command, const std::string& discription)
+        : command(command), discription(discription) {}
+
+    Command(std::pair<std::string, std::string> pair)
+        : command(pair.first), discription(pair.second) {}
+
+    Command(const Command& other)
+        : command(other.command), discription(other.discription) {}
+
+    Command operator=(const Command& other) {
+        return Command(other);
+    }
+};
+
+class ImuTuiWindow {
+    TerminalScreen screen;
+    std::vector<Command> commands;
+    std::deque<std::string> outputPallet;
+    std::mutex lock{};
+
+public:
+    ImuTuiWindow() = default;
+
+    void setCommands(const std::vector<Command>& c) {
+        std::lock_guard<std::mutex> guard(lock);
+        this->commands = std::vector<Command>{ c };
+    }
+
+    void addOutput(const std::string& output) {
+        std::lock_guard<std::mutex> guard(lock);
+        for (const auto& line : nat::util::Strings::split(output, '\n'))
+            outputPallet.emplace_front(line);
+        while (outputPallet.size() > 2 * screen.getHeight())
+            outputPallet.pop_back();
+    }
+
+    void addNewLineToOutput() {
+        std::lock_guard<std::mutex> guard(lock);
+        outputPallet.emplace_front("");
+    }
+
+    void draw() {
+        std::lock_guard<std::mutex> guard(lock);
+        screen.update();
+        int width = screen.getWidth();
+        int height = screen.getHeight();
+        int currentHeight = 0;
+        std::string commandsPallet = "";
+        for (int i = 0; i < width; ++i)
+            commandsPallet.append("-");
+        commandsPallet.append("\n");
+        ++currentHeight;
+        for (const auto& command : commands) {
+            std::string padding = " ";
+            commandsPallet.append(command.command + ":" + padding + command.discription + "\n");
+            ++currentHeight;
+        }
+
+        std::string outputPalletString = "";
+        int spaceAvailable = height - currentHeight;
+        int numberOfOutputLines = spaceAvailable < outputPallet.size() ? spaceAvailable : outputPallet.size();
+        for (int i = numberOfOutputLines; i > 0; --i, ++currentHeight)
+            outputPalletString += outputPallet[i-1] + "\n";
+
+        std::string topPadding = "";
+        for (int i = currentHeight; i < height; ++i)
+            topPadding.append("\n");
+
+        screen.drawToScreen(topPadding + outputPalletString + commandsPallet);
+    }
+
+    std::string interactiveInput(const std::string& msg, KeyListener& keyListener, char terminationCharacter = '\n') {
+        const auto existingFilter = keyListener.getFilter();
+        const auto existingMap = keyListener.getMap();
+        keyListener.setMap([](char c) {
+            if (c == '\r')
+                return '\n';
+            return c;
+            });
+        keyListener.setFilter([](char c) {
+            return KeyListener::isAlphaNumeric(c) || KeyListener::isWhitespace(c) || KeyListener::isSpecialCharacter(c) || KeyListener::isBackspace(c);
+            });
+        keyListener.clearBuffer();
+        const auto existingCommands = commands;
+        std::string currentInput = "";
+        bool continueReadingInput = true;
+        bool refreashWindow = true;
+        while (continueReadingInput) {
+            setCommands({ Command{msg, currentInput} });
+            const auto keysPressed = keyListener.getKeysPressed();
+            if (refreashWindow) {
+                draw();
+                refreashWindow = false;
+            }
+            for (char key : keysPressed) {
+                if (key == terminationCharacter) {
+                    continueReadingInput = false;
+                    break;
+                }
+                else if (KeyListener::isBackspace(key) && currentInput.size() > 0) {
+                    currentInput.substr(0, currentInput.size() - 1);
+                }
+                else {
+                    refreashWindow = true;
+                    currentInput += key;
+                }
+            }
+        }
+        setCommands(existingCommands);
+        keyListener.setMap(existingMap);
+        keyListener.setFilter(existingFilter);
+        return currentInput;
+    }
+};
+
+std::vector<std::unique_ptr<nat::core::RawStream>> promptUserToChooseStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener) {
+    while (true) {
+        auto streams = manager->getAllStreams();
+        for (int i = 0; i < streams.size(); ++i) {
+            window->addOutput("(" + std::to_string(i) + ") " + streams[i]->toPrettyString());
+        }
+        int maxIndex = (std::max)(static_cast<int>(streams.size() - 1), 0);
+        std::string selectedStreamIndex = window->interactiveInput("Select one or multiple streams seperated by ',' [0-" + std::to_string(maxIndex) + "] or 'r' to refreash: ", *keyListener);
+        if (selectedStreamIndex == "r")
+            continue;
+
+        std::vector<int> indexes = {};
+        for (const auto str : nat::util::Strings::split(selectedStreamIndex, ',')) {
+            int index = std::stoi(str);
+            indexes.emplace_back(index);
+            if (index < 0 || index > streams.size()) {
+                window->addOutput(std::to_string(index) + " is not in the range [0-" + std::to_string(maxIndex) + "]");
+            }
+        }
+        if (indexes.size() == 0) {
+            window->addOutput("No valid indexes selected, try again");
+            continue;
+        }
+
+        std::vector<std::unique_ptr<nat::core::RawStream>> selectedStreams{};
+        for (auto index : indexes) {
+            selectedStreams.emplace_back(std::move(streams[index]));
+        }
+        return selectedStreams;
+    }
+}
+
+class ImuApplication {
+    enum class ImuApplicationStage {
+        SelectImus = 1,
+        Calibration,
+    };
+
+    std::unique_ptr<nat::kafka::BrokerManager> manager;
+    std::shared_ptr<ImuTuiWindow> window;
+    std::shared_ptr<KeyListener> keyListener;
+    ImuApplicationStage currentStage;
+    std::optional<std::vector<std::unique_ptr<nat::core::TopicMessenger>>> imuStreams;
+
+    static std::vector<std::unique_ptr<nat::core::TopicMessenger>> getImuStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener) {
+        const std::vector<std::unique_ptr<nat::core::RawStream>> streams = promptUserToChooseStreams(manager, window, keyListener);
+        std::vector<std::unique_ptr<nat::core::TopicMessenger>> messengers{};
+        for (const auto& stream : streams) {
+            std::shared_ptr<nat::core::BasicTopicInformation> dataTopic = std::move(stream->getTopicsByType(nat::core::StreamType::DATA)[0]);
+            messengers.emplace_back(manager->createMessenger(dataTopic));
+        }
+
+        return messengers;
+    }
+
+
+public:
+    ImuApplication(std::unique_ptr<nat::kafka::BrokerManager> manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener)
+        : manager(std::move(manager)), window(window), keyListener(keyListener), currentStage(ImuApplicationStage::SelectImus) {}
+
+    void start() {
+        while (true) {
+            window->draw();
+            switch (currentStage) {
+            case ImuApplicationStage::SelectImus:
+                if (!imuStreams.has_value()) {
+                    imuStreams = getImuStreams(manager, window, keyListener);
+                }
+            }
+        }
+    }
+};
 
 enum class MenuOptions {
     DeleteTopic,
     DeleteAllTopics,
     StreamToFile,
+    ImuExperiment,
     ListStreams,
     ListTopics,
     Quit,
@@ -128,47 +498,59 @@ enum class MenuOptions {
     SimulateNatImu
 };
 
-static std::vector<std::string> MenuOptionStrings = {
-  "d:  Delete Topic",
-  "da: Delete All Topics",
-  "f:  Stream to File\n"
-  "ls: List Streams",
-  "lt:  List Topics",
-  "q:  Quit",
-  "r:  Read Topic",
-  "s:  Simulate natIMU"
+static std::vector<Command> MenuOptionCommands = {
+    {"d",  "Delete Topic"},
+    {"da", "Delete All Topics"},
+    {"f",  "Stream to File"},
+    {"i",  "Run IMU Experiment"},
+    {"ls", "List Streams"},
+    {"lt", "List Topics"},
+    {"q",  "Quit"},
+    {"r",  "Read Topic"},
+    {"s",  "Simulate natIMU"}
 };
 
-MenuOptions getMenuOption() {
+MenuOptions getMenuOption(ImuTuiWindow& window) {
     std::string command = "";
+    globalKeyListener->setFilter([](char c) {
+        char lowerC = nat::util::Strings::toLowercase(c);
+        return (lowerC <= 'z' && lowerC >= 'a') || (c >= '0' && c <= '9') || c == (char)13 || c == '\n'; }
+    );
+    globalKeyListener->setMap([](char c) {
+        if (c == (char)13)
+            return '\n';
+        else
+            return c;
+        });
+    globalKeyListener->clearBuffer();
     while (true) {
-        std::string menuOptions = "\n";
-        for (const auto& optionString : MenuOptionStrings) {
+        std::vector<Command> menuOptions{};
+        for (const auto& option : MenuOptionCommands) {
             bool showCommand = true;
-            for (int i = 0; i < command.size(); ++i)
-                if (command[i] != optionString[i]) {
+            for (int i = 0; i < command.size() && i < option.command.size(); ++i)
+                if (command[i] != option.command[i]) {
                     showCommand = false;
                     break;
                 }
             if (showCommand)
-                menuOptions.append(optionString + '\n');
+                menuOptions.emplace_back(option);
         }
-        globalKeyListener.clearBuffer();
+        /*globalKeyListener.clearBuffer();
         menuOptions.append("Enter an option: ");
-        TerminalScreen::drawToScreen(menuOptions);
-        while (!globalKeyListener.haveAnyKeysBeenPressed()) std::this_thread::sleep_for(10ms);
-        const auto keysPressed = globalKeyListener.getKeysPressed();
+        TerminalScreen::drawToScreen(menuOptions);*/
+        window.setCommands(menuOptions);
+        window.draw();
+        while (!globalKeyListener->haveAnyKeysBeenPressed()) std::this_thread::sleep_for(10ms);
+        const auto keysPressed = globalKeyListener->getKeysPressed();
         std::vector<int> keyCodesPressed = {};
         for (auto character : keysPressed) keyCodesPressed.push_back((int)character);
-        menuOptions.append("\n Keys Pressed: " + nat::util::Vectors::toString(keyCodesPressed));
-        TerminalScreen::drawToScreen(menuOptions);
+        //menuOptions.append("\n Keys Pressed: " + nat::util::Vectors::toString(keyCodesPressed));
+        //TerminalScreen::drawToScreen(menuOptions);
                 
         for (int i = 0; i < keysPressed.size(); ++i) {
             char characterPressed = nat::util::Strings::toLowercase(keysPressed[i]);
-            if (!(characterPressed <= 'z' && characterPressed >= 'a') && !(characterPressed >= '0' && characterPressed <= '9') && characterPressed != (char)13)
-                continue;
-            if (characterPressed == 13)
-                characterPressed = '\n';
+            //if (characterPressed == 13)
+            //    characterPressed = '\n';
             command += characterPressed;
             if (command == "d") {
                 continue;
@@ -181,6 +563,9 @@ MenuOptions getMenuOption() {
             }
             else if (command == "f") {
                 return MenuOptions::StreamToFile;
+            }
+            else if (command == "i") {
+                return MenuOptions::ImuExperiment;
             }
             else if (command == "l") {
                 continue;
@@ -215,7 +600,7 @@ void printTopics(const std::vector<std::unique_ptr<nat::core::BasicTopicInformat
         std::cout << "(" << i << ") - " << topics[i]->toTopicString() << '\n';
 }
 
-std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager, bool chooseMultiple = false) {
     auto topics = manager->getAllTopics();
     printTopics(topics);
     int maxIndex = (std::max)(static_cast<int>(topics.size() - 1), 0);
@@ -261,18 +646,18 @@ std::pair<std::string, std::string> getBroker() {
     }
 }
 
-void deleteTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+void deleteTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
     const auto topic = promptUserToChooseTopic(manager);
     manager->deleteTopic(topic->toTopicString());
 }
 
-void deleteAllTopics(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+void deleteAllTopics(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
     const auto topics = manager->getAllTopicStrings();
     for (const auto& topic : topics)
         manager->deleteTopic(topic);
 }
 
-void listCurrentStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+void listCurrentStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
     auto topics = manager->getAllTopics();
     std::sort(topics.begin(), topics.end(), [](const auto& a, const auto& b) {
         return a->id > b->id;
@@ -293,7 +678,7 @@ void listCurrentStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manage
             streams.push_back(std::move(streamMaybe.value()));
         }
     }
-    std::cout << streamTopics.size() << '\n';
+    window.addOutput(std::to_string(streamTopics.size()));
 
     for (const auto& stream : streams) {
         auto metaTopics = stream->getTopicsByType(nat::core::StreamType::META);
@@ -316,19 +701,24 @@ void listCurrentStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manage
                 firstMessageRecieved = true;
                 name = messageMaybe.value()->getName();
             }
-            std::cout << stream->getId() << " (" << name << ")\n";
+            window.addOutput(std::to_string(stream->getId()) + " (" + name + ")");
         }
     }
 }
 
-void listCurrentTopics(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+void listCurrentTopics(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
     const auto topics = manager->getAllTopicStrings();
-    std::cout << "There are currently " << topics.size() << " topics:\n";
-    for (const auto& topic : topics)
-        std::cout << "    " << topic << '\n';
+    if (topics.size() == 0) {
+        window.addOutput("There are currently no topics available");
+    }
+    else {
+        window.addOutput("There are currently " + std::to_string(topics.size()) + " topics:");
+        for (const auto& topic : topics)
+            window.addOutput("    " + topic);
+    }
 }
 
-void readTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+void readTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
     const std::shared_ptr<nat::core::BasicTopicInformation> topic = promptUserToChooseTopic(manager);
     const auto registry = manager->getRegistry();
     const auto messenger = manager->createMessenger(topic);
@@ -347,14 +737,15 @@ void readTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
         }
         firstMessageRecieved = true;
         std::string messageString = messageMaybe.value()->toString();
-        std::cout << messageString << '\n';
+        window.addOutput(messageString);
     }
 }
 
-void streamToFile(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
-    std::cout << "Enter a name for the file: ";
+void streamToFile(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
+    /*window.addOutput("Enter a name for the file: ");
     std::string filename;
-    std::getline(std::cin, filename);
+    std::getline(std::cin, filename);*/
+    std::string filename = window.interactiveInput("Enter a name for the file", *globalKeyListener);
     const std::shared_ptr<nat::core::BasicTopicInformation> topic = promptUserToChooseTopic(manager);
     std::ofstream file;
     file.open(filename);
@@ -379,15 +770,15 @@ void streamToFile(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
     file.close();
 }
 
-void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
-    std::cout << "Enter a name for the simulated IMU device: ";
+void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
+    window.addOutput("Enter a name for the simulated IMU device: ");
     std::string name;
     std::getline(std::cin, name);
     std::vector<std::string> encodingTypes = { "Json" };
-    std::cout << "Enter an encoding type, one of " << nat::util::Vectors::toString(encodingTypes) << ": ";
+    window.addOutput("Enter an encoding type, one of " + nat::util::Vectors::toString(encodingTypes) + ": ");
     std::string serializationTypeString;
     std::getline(std::cin, serializationTypeString);
-    std::cout << "Enter an id: ";
+    window.addOutput("Enter an id: ");
     std::string idString;
     std::getline(std::cin, idString);
     uint64_t id = std::stoll(idString);
@@ -433,6 +824,8 @@ int main(int argc, char** argv) {
     mtx.unlock();
 
     const auto [brokerHost, brokerPort] = getBroker();
+    std::shared_ptr<ImuTuiWindow> window = std::make_shared<ImuTuiWindow>();
+    window->setCommands(MenuOptionCommands);
 
     //const auto topicInfoMaybe = nat::core::BasicTopicInformation::create(topic);
     //if (!topicInfoMaybe.has_value()) {
@@ -443,28 +836,35 @@ int main(int argc, char** argv) {
     //const auto topicInfo = std::make_shared<nat::core::BasicTopicInformation>(
     //    *topicInfoMaybe.value());
 
-    const auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
+    auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
     bool continueRunning = true;
     while (continueRunning) {
-        switch (getMenuOption()) {
+        switch (getMenuOption(*window)) {
         case MenuOptions::DeleteTopic:
-            deleteTopic(manager);
+            deleteTopic(manager, *window);
             break;
 
         case MenuOptions::DeleteAllTopics:
-            deleteAllTopics(manager);
+            deleteAllTopics(manager, *window);
             break;
 
         case MenuOptions::StreamToFile:
-            streamToFile(manager);
+            streamToFile(manager, *window);
+            break;
+
+        case MenuOptions::ImuExperiment:
+        {
+            ImuApplication application(std::move(manager), window, globalKeyListener);
+            application.start();
+        }
             break;
 
         case MenuOptions::ListStreams:
-            listCurrentStreams(manager);
+            listCurrentStreams(manager, *window);
             break;
 
         case MenuOptions::ListTopics:
-            listCurrentTopics(manager);
+            listCurrentTopics(manager, *window);
             break;
 
         case MenuOptions::Quit:
@@ -472,11 +872,11 @@ int main(int argc, char** argv) {
             break;
 
         case MenuOptions::ReadTopic:
-            readTopic(manager);
+            readTopic(manager, *window);
             break;
 
         case MenuOptions::SimulateNatImu:
-            simulateNatImu(manager);
+            simulateNatImu(manager, *window);
             break;
         }
     }

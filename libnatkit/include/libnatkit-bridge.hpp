@@ -90,13 +90,13 @@ private:
   void onMosquittoMessageReceived(mosquitto::MosquittoClient *,
                                   const std::string &topic,
                                   const std::string &message, int qos);
-  void moveKafkaMessages();
-  void moveMosquittoMessages();
-  void sendMosquittoMessages();
-  void sendKafkaMessages();
-  void messageMoverDaemon();
-  void mosquittoMessageSendingDaemon();
-  void kafkaMessageSendingDaemon();
+  void moveKafkaMessagesThreadSafe();
+  void moveMosquittoMessagesThreadSafe();
+  void sendMosquittoMessagesThreadSafe();
+  void sendKafkaMessagesThreadSafe();
+  void messageMoverDaemonThreadSafe();
+  void mosquittoMessageSendingDaemonThreadSafe();
+  void kafkaMessageSendingDaemonThreadSafe();
 };
 
 
