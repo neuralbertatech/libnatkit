@@ -27,4 +27,18 @@ std::string toLowercase(const std::string& string) {
     return lowercaseString;
 }
 
+char toLowercase(char character) {
+    return (char)std::tolower(character);
+}
+
+std::string toUppercase(const std::string& string) {
+    std::string lowercaseString{ string };
+    std::transform(lowercaseString.begin(), lowercaseString.end(), lowercaseString.begin(), [](const auto& character) { return std::toupper(character); });
+    return lowercaseString;
+}
+
+char toUppercase(char character) {
+    return (char)std::toupper(character);
+}
+
 }

@@ -13,6 +13,7 @@ KafkaMosquittoBridge::KafkaMosquittoBridge(
     std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker)
     : kafkaBroker(kafkaBroker), mosquittoBroker(mosquittoBroker) {}
 
+// Sets up the MQTT client to write messages recieved to the recieving queue.
 bool KafkaMosquittoBridge::initMosquittoClient() {
   auto clientMaybe = mosquittoBroker->createClient(
       "natKit/sending/#",
@@ -28,17 +29,18 @@ bool KafkaMosquittoBridge::initMosquittoClient() {
   }
 }
 
+// Start all threads from sending and recieving data.
 void KafkaMosquittoBridge::start() {
   kafkaMessengerPool = std::make_unique<KafkaMessengerPool>(
       kafkaBroker, [this](const auto &topicName, auto &&msg) {
         onKafkaMessageReceived(topicName, std::move(msg));
       });
   messageMover =
-      std::jthread(&KafkaMosquittoBridge::messageMoverDaemon, this);
+      std::jthread(&KafkaMosquittoBridge::messageMoverDaemonThreadSafe, this);
   kafkaMessageSender = std::jthread(
-      &KafkaMosquittoBridge::kafkaMessageSendingDaemon, this);
+      &KafkaMosquittoBridge::kafkaMessageSendingDaemonThreadSafe, this);
   mosquittoMessageSender = std::jthread(
-      &KafkaMosquittoBridge::mosquittoMessageSendingDaemon, this);
+      &KafkaMosquittoBridge::mosquittoMessageSendingDaemonThreadSafe, this);
 }
 
 KafkaMosquittoBridge::~KafkaMosquittoBridge() { running = false; }
@@ -71,6 +73,7 @@ void KafkaMosquittoBridge::tryCreateMosquittoPublisher(const std::string &topicN
   }
 }
 
+// Kafka message received default callback
 void KafkaMosquittoBridge::onKafkaMessageReceived(const std::string &topicName,
                             std::unique_ptr<core::message_t> &&msg) {
   {
@@ -79,9 +82,11 @@ void KafkaMosquittoBridge::onKafkaMessageReceived(const std::string &topicName,
   }
 }
 
+// MQTT message received default callback
 void KafkaMosquittoBridge::onMosquittoMessageReceived(mosquitto::MosquittoClient *,
                                 const std::string &topic,
                                 const std::string &message, int qos) {
+    std::cout << "Recieved an MQTT message!\n";
   auto encodedMessage =
       std::make_unique<core::message_t>(message.begin(), message.end());
   const auto splitTopic = util::Strings::split(topic, '/');
@@ -99,7 +104,8 @@ void KafkaMosquittoBridge::onMosquittoMessageReceived(mosquitto::MosquittoClient
   }
 }
 
-void KafkaMosquittoBridge::moveKafkaMessages() {
+// Moves messages from the Kafka recieving queue to the sending queue.
+void KafkaMosquittoBridge::moveKafkaMessagesThreadSafe() {
   {
     std::lock_guard<std::mutex> kafkaQueueLock(
         kafkaBrokerRecievingQueueLock);
@@ -113,11 +119,16 @@ void KafkaMosquittoBridge::moveKafkaMessages() {
   }
 }
 
-void KafkaMosquittoBridge::moveMosquittoMessages() {
+// Moves messages from the MQTT recieving queue to the sending queue.
+void KafkaMosquittoBridge::moveMosquittoMessagesThreadSafe() {
   {
-    std::lock_guard<std::mutex> kafkaQueueLock(kafkaBrokerSendingQueueLock);
     std::lock_guard<std::mutex> mosquittoQueueLock(
         mosquittoBrokerRecievingQueueLock);
+    if (mosquittoBrokerReceivingQueue.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> kafkaQueueLock(kafkaBrokerSendingQueueLock);
     while (!mosquittoBrokerReceivingQueue.empty()) {
       kafkaBrokerSendingQueue.push(
           std::move(mosquittoBrokerReceivingQueue.front()));
@@ -126,7 +137,8 @@ void KafkaMosquittoBridge::moveMosquittoMessages() {
   }
 }
 
-void KafkaMosquittoBridge::sendMosquittoMessages() {
+// Sends all available messages to the MQTT broker.
+void KafkaMosquittoBridge::sendMosquittoMessagesThreadSafe() {
   {
     std::lock_guard<std::mutex> lock(mosquittoBrokerSendingQueueLock);
     while (!mosquittoBrokerSendingQueue.empty()) {
@@ -151,7 +163,8 @@ void KafkaMosquittoBridge::sendMosquittoMessages() {
   }
 }
 
-void KafkaMosquittoBridge::sendKafkaMessages() {
+// Sends all available messages to the Kafka broker.
+void KafkaMosquittoBridge::sendKafkaMessagesThreadSafe() {
   {
     std::lock_guard<std::mutex> lock(kafkaBrokerSendingQueueLock);
     while (!kafkaBrokerSendingQueue.empty()) {
@@ -162,33 +175,32 @@ void KafkaMosquittoBridge::sendKafkaMessages() {
   }
 }
 
-void KafkaMosquittoBridge::messageMoverDaemon() {
+// Continuously move messages from the reciving MQTT and Kafka recieiving queues
+// to their corrisponding sending queues so that they may be sent out.
+//
+// Note: The rational for moving messages for both MQTT and Kafka here is because this
+//       is a simple in memory move and does not reach out at all to the networking
+//       stack. As such it should be substancially faster than any of the other daemons
+void KafkaMosquittoBridge::messageMoverDaemonThreadSafe() {
   while (running) {
-    if (!kafkaBrokerReceivingQueue.empty()) {
-      moveKafkaMessages();
-    }
-    if (!mosquittoBrokerReceivingQueue.empty()) {
-      moveMosquittoMessages();
-    }
-
+    moveKafkaMessagesThreadSafe();
+    moveMosquittoMessagesThreadSafe();
     std::this_thread::sleep_for(1ms);
   }
 }
 
-void KafkaMosquittoBridge::mosquittoMessageSendingDaemon() {
+// Continuously send any messages recieved from the Kafka broker to the MQTT broker.
+void KafkaMosquittoBridge::mosquittoMessageSendingDaemonThreadSafe() {
   while (running) {
-    if (!mosquittoBrokerSendingQueue.empty()) {
-      sendMosquittoMessages();
-    }
+    sendMosquittoMessagesThreadSafe();
     std::this_thread::sleep_for(1ms);
   }
 }
 
-void KafkaMosquittoBridge::kafkaMessageSendingDaemon() {
+// Continuously send any messages recieved from the MQTT broker to the Kafka broker.
+void KafkaMosquittoBridge::kafkaMessageSendingDaemonThreadSafe() {
   while (running) {
-    if (!kafkaBrokerSendingQueue.empty()) {
-      sendKafkaMessages();
-    }
+    sendKafkaMessagesThreadSafe();
     std::this_thread::sleep_for(1ms);
   }
 }

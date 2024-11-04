@@ -18,10 +18,11 @@ class MosquittoPublisher {
   struct mosquitto *producer;
   std::string topic;
   std::queue<std::unique_ptr<std::string>> messages;
+  mutable std::mutex messageLock;
   std::jthread thread;
   bool running{false};
 
-  MosquittoPublisher() = default;
+  MosquittoPublisher() : messageLock() {}
 
   void init(struct mosquitto *producer, const std::string &topic);
   void start();

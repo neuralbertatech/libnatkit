@@ -1,8 +1,16 @@
+#include <algorithm>
 #include <chrono>
-#include <iostream>
+#include <cstdlib>
 #include <cmath>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <stdlib.h>
 #include <thread>
 
+#include <librdkafka/rdkafka.h>
+#include <librdkafka/rdkafkacpp.h>
 #include <libnatkit-kafka.hpp>
 #include <libnatkit-core.hpp>
 #include <libnatkit/util/Strings.hpp>
@@ -10,9 +18,32 @@
 
 using namespace std::chrono_literals;
 
+std::optional<std::string> get_env(const char* env) {
+    auto t = std::getenv(env);
+    if (t) return t;
+    return {};
+}
+
+class ExampleDeliveryReportCbOther : public RdKafka::DeliveryReportCb {
+public:
+    void dr_cb(RdKafka::Message& message) {
+        /* If message.err() is non-zero the message delivery failed permanently
+         * for the message. */
+        if (message.err()) {
+            std::cerr << "% Message delivery failed: " << message.errstr()
+                << std::endl;
+        } else {
+            std::cerr << "% Message delivered to topic " << message.topic_name()
+                << " [" << message.partition() << "] at offset "
+                << message.offset() << std::endl;
+        }
+    }
+};
+
 enum class MenuOptions {
   DeleteTopic,
   DeleteAllTopics,
+  StreamToFile,
   ListStreams,
   ListTopics,
   Quit,
@@ -23,6 +54,7 @@ enum class MenuOptions {
 static std::vector<std::string> MenuOptionStrings = {
   "d:  Delete Topic",
   "da: Delete All Topics",
+  "f:  Stream to File"
   "ls: List Streams",
   "lt:  List Topics",
   "q:  Quit",
@@ -43,6 +75,8 @@ MenuOptions getMenuOption() {
       return MenuOptions::DeleteTopic;
     } else if (line == "da") {
       return MenuOptions::DeleteAllTopics;
+    } else if (line == "f") {
+      return MenuOptions::StreamToFile;
     } else if (line == "ls") {
       return MenuOptions::ListStreams;
     } else if (line == "lt") {
@@ -66,7 +100,7 @@ void printTopics(const std::vector<std::unique_ptr<nat::core::BasicTopicInformat
 std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
   auto topics = manager->getAllTopics();
   printTopics(topics);
-  int maxIndex = std::max(static_cast<int>(topics.size()-1), 0);
+  int maxIndex = (std::max)(static_cast<int>(topics.size()-1), 0);
   std::cout << "Select a topic [0-" << maxIndex << "]: ";
   std::string selectedTopicIndex;
   std::getline(std::cin, selectedTopicIndex);
@@ -79,13 +113,16 @@ std::unique_ptr<nat::core::BasicTopicInformation> promptUserToChooseTopic(const 
 }
 
 std::pair<std::string, std::string> getBroker() {
-  const auto hostCStr = std::getenv("NATKIT_SERVER_HOST");
-  const auto portCStr = std::getenv("NATKIT_SERVER_PORT");
+  char envHostBuffer[256];
+  char envPortBuffer[256];
+  size_t bufferSize;
+  auto hostEnvMaybe = get_env("NATKIT_SERVER_HOST");
+  auto portEnvMaybe = get_env("NATKIT_SERVER_PORT");
   std::string host = "localhost";
   std::string port = "9092";
-  if (hostCStr != nullptr && portCStr != nullptr) {
-    host = hostCStr;
-    port = portCStr;
+  if (hostEnvMaybe.has_value() && portEnvMaybe.has_value()) {
+      host = hostEnvMaybe.value();
+      port = portEnvMaybe.value();
   }
   std::cout << "Enter broker in the format <hostname>:<port> [" << host << ":" << port << "]: ";
   std::string broker;
@@ -159,14 +196,45 @@ void readTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
   while (true) {
     const auto messageMaybe = messenger->tryGetNexMessage();
     if (!messageMaybe.has_value()) {
-      if (firstMessageRecieved || std::chrono::system_clock::now() > initailWaitUntil)
-        break;
-      else
-        continue;
+        if (firstMessageRecieved || std::chrono::system_clock::now() > initailWaitUntil) {
+            break;
+        } else {
+          std::this_thread::sleep_for(1ms);
+          continue;
+      }
     }
     firstMessageRecieved = true;
-    std::cout << messageMaybe.value()->toString() << '\n';
+    std::string messageString = messageMaybe.value()->toString();
+    std::cout << messageString << '\n';
   }
+}
+
+void streamToFile(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
+    std::cout << "Enter a name for the file: ";
+    std::string filename;
+    std::getline(std::cin, filename);
+    const std::shared_ptr<nat::core::BasicTopicInformation> topic = promptUserToChooseTopic(manager);
+    std::ofstream file;
+    file.open(filename);
+    const auto registry = manager->getRegistry();
+    const auto messenger = manager->createMessenger(topic);
+    const auto initailWaitUntil = std::chrono::system_clock::now() + 1s;
+    bool firstMessageRecieved = false;
+    while (true) {
+        const auto messageMaybe = messenger->tryGetNexMessage();
+        if (!messageMaybe.has_value()) {
+            if (std::chrono::system_clock::now() > initailWaitUntil) {
+                break;
+            }
+            else {
+                std::this_thread::sleep_for(1ms);
+                continue;
+            }
+        }
+        firstMessageRecieved = true;
+        file << nat::core::toString(*(messageMaybe.value()->encodeToBytes(nat::core::SerializationType::Csv))) << '\n';
+    }
+    file.close();
 }
 
 void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
@@ -209,7 +277,7 @@ void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
   for (int i = 0; i < 100; ++i) {
     for (int j = 0; j < 9; ++j)
       imuData[j] = (rand() % 100000) / 1000.0;
-    dataMessenger->sendMessage(nat::core::NatImuDataSchema(rand(), imuData, 9));
+    dataMessenger->sendMessage(nat::core::NatImuDataSchema(rand(), nat::core::NatImuDataSchema::convertIntToSensorAccuracy(rand() % 4), imuData, 13));
   }
 }
 
@@ -218,6 +286,9 @@ int main(int argc, char **argv) {
   //  std::cerr << "Usage: " << argv[0] << " takes no arguments\n";
   //  exit(1);
   //}
+    std::mutex mtx;
+    mtx.lock();
+    mtx.unlock();
 
   const auto [brokerHost, brokerPort] = getBroker();
 
@@ -241,6 +312,10 @@ int main(int argc, char **argv) {
       case MenuOptions::DeleteAllTopics:
         deleteAllTopics(manager);
         break;
+
+      case MenuOptions::StreamToFile:
+          streamToFile(manager);
+          break;
 
       case MenuOptions::ListStreams:
         listCurrentStreams(manager);

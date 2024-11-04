@@ -1,0 +1,14 @@
+FROM gcc:14.2-bookworm
+WORKDIR /libnatkit
+
+RUN apt update
+RUN apt install cmake -y
+#RUN apt install dos2unix -y
+
+COPY . ./
+#RUN find . -type f -print0 | xargs -0 dos2unix
+RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+RUN cmake --build build
+
+#CMD exec /bin/sh -c "trap : TERM INT; sleep infinity & wait"
+CMD /libnatkit/build/libnatkit/tools/src/libnatkit-kafka-mosquitto-bridge

@@ -19,28 +19,28 @@ void BrokerMessagingQueue::ConsumerCallback::consume_cb(RdKafka::Message &msg, v
 
   case RdKafka::ERR_NO_ERROR:
     /* Real message */
-    std::cout << "Read msg at offset " << msg.offset() << std::endl;
-    if (msg.key()) {
+    //std::cout << "Read msg at offset " << msg.offset() << std::endl;
+    /*if (msg.key()) {
       std::cout << "Key: " << *msg.key() << std::endl;
-    }
+    }*/
     headers = msg.headers();
     if (headers) {
       std::vector<RdKafka::Headers::Header> hdrs = headers->get_all();
       for (size_t i = 0; i < hdrs.size(); i++) {
         const RdKafka::Headers::Header hdr = hdrs[i];
 
-        if (hdr.value() != NULL)
+        /*if (hdr.value() != NULL)
           printf(" Header: %s = \"%.*s\"\n", hdr.key().c_str(),
                  (int)hdr.value_size(), (const char *)hdr.value());
         else
-          printf(" Header:  %s = NULL\n", hdr.key().c_str());
+          printf(" Header:  %s = NULL\n", hdr.key().c_str());*/
       }
     }
     messagingQueue.onMessageRecieved(
         std::make_unique<core::message_t>(stringToMessageType(
             std::string{static_cast<const char *>(msg.payload())})));
-    printf("%.*s\n", static_cast<int>(msg.len()),
-           static_cast<const char *>(msg.payload()));
+    /*printf("%.*s\n", static_cast<int>(msg.len()),
+           static_cast<const char *>(msg.payload()));*/
 
     break;
 
@@ -97,9 +97,11 @@ void BrokerMessagingQueue::enqueueMessageToReceive(const std::shared_ptr<core::m
 
 nat::core::Optional<std::shared_ptr<core::message_t>> BrokerMessagingQueue::tryGetNextMessage() {
   const std::lock_guard<std::mutex> lock(receivingQueueLock);
+  //std::cout << "reading got a lock\n";
   if (receivingQueue.empty()) {
     return {};
   } else {
+    //std::cout << "Got Message!\n";
     auto message = std::move(receivingQueue.front());
     receivingQueue.pop();
     return {std::move(message)};
@@ -126,17 +128,24 @@ void BrokerMessagingQueue::pollResources() {
 }
 
 void BrokerMessagingQueue::sendMessages() {
-  while (!sendingQueue.empty()) {
-    auto message = std::move(sendingQueue.front());
-    sendingQueue.pop();
-    sendMessage(std::move(message));
-  }
+    std::queue<std::unique_ptr<core::message_t>> messagesToSend{};
+    {
+        std::lock_guard<std::mutex> guard(sendingQueueLock);
+        while (!sendingQueue.empty()) {
+            messagesToSend.push(std::move(sendingQueue.front()));
+            sendingQueue.pop();
+        }
+    }
+    while (!messagesToSend.empty()) {
+        sendMessage(std::move(messagesToSend.front()));
+        messagesToSend.pop();
+    }
 }
 
 void BrokerMessagingQueue::sendMessage(std::unique_ptr<core::message_t> message) {
   const auto stringMessage = byteArrayToString(*message);
-  std::cout << "Attempting to send the following message to broker: "
-            << stringMessage << '\n';
+  /*std::cout << "Attempting to send the following message to broker: "
+            << stringMessage << '\n';*/
   const auto err = producer->produce(
       topicName, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
       const_cast<char *>(stringMessage.c_str()), stringMessage.size(), NULL,
@@ -144,11 +153,11 @@ void BrokerMessagingQueue::sendMessage(std::unique_ptr<core::message_t> message)
   if (err != RdKafka::ERR_NO_ERROR) {
     std::cout << "Error: " << RdKafka::err2str(err) << '\n';
   } else {
-    std::cerr << "% Enqueued message (" << stringMessage.size() << " bytes) "
-              << "for topic " << stringMessage << std::endl;
+    /*std::cerr << "% Enqueued message (" << stringMessage.size() << " bytes) "
+              << "for topic " << stringMessage << std::endl;*/
   }
   pollResources();
-  std::cerr << "% Flushing final messages..." << std::endl;
+  //std::cerr << "% Flushing final messages..." << std::endl;
   producer->flush(10 * 1000 /* wait for max 10 seconds */);
   if (producer->outq_len() > 0)
     std::cerr << "% " << producer->outq_len()
@@ -180,7 +189,9 @@ void BrokerMessagingQueue::stopConsumer() { consumer->stop(topicHandle.get(), pa
 
 void BrokerMessagingQueue::defaultOnMessageRecieved(std::unique_ptr<core::message_t> &&msg) {
   {
+   //     std::cout << "defaultOnMessageRecieved() got message " << core::toString(*msg) << " \n";
     const std::lock_guard<std::mutex> lock(receivingQueueLock);
+    //std::cout << "Got lock \n";
     receivingQueue.push(std::move(msg));
   }
 }

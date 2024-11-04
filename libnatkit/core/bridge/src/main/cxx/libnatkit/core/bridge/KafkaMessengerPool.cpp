@@ -1,3 +1,4 @@
+#include <libnatkit-core.hpp>
 #include <libnatkit-bridge.hpp>
 
 #include <libnatkit/util/Casting.hpp>
@@ -21,7 +22,7 @@ KafkaMessengerPool::~KafkaMessengerPool() { running = false; }
 
 void KafkaMessengerPool::sendMessage(const std::string &topicName,
                  std::unique_ptr<core::message_t> &&msg) {
-  std::cout << "% Kafka attempting to send message to: " << topicName << '\n';
+  //std::cout << "% Kafka attempting to send message to: " << topicName << '\n';
   if (auto it = messengers.find(topicName); it != messengers.end()) {
     it->second->enqueueMessageToSend(std::move(msg));
   } else {
@@ -38,7 +39,7 @@ void KafkaMessengerPool::sendMessage(const std::string &topicName,
 
 void KafkaMessengerPool::monitorTopics() {
   while (running) {
-    std::cout << "% Checking for new topics...\n";
+    //std::cout << "% Checking for new topics...\n";
     searchForNewKafakTopics();
     std::this_thread::sleep_for(1s);
   }

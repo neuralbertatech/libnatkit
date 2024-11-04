@@ -70,45 +70,45 @@ jobs:
       # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
       run: ctest --build-config ${{ matrix.build_type }} --output-on-failure
 
-  windows:
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        submodules: 'true'
-    - name: Set reusable strings
-      # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
-      id: strings
-      shell: bash
-      run: |
-        echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
+  # windows:
+  #   runs-on: windows-latest
+  #   steps:
+  #   - uses: actions/checkout@v3
+  #     with:
+  #       submodules: 'true'
+  #   - name: Set reusable strings
+  #     # Turn repeated input strings (such as the build output directory) into step outputs. These step outputs can be used throughout the workflow file.
+  #     id: strings
+  #     shell: bash
+  #     run: |
+  #       echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
-    - name: Add lib to Path
-      run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+  #   - name: Add lib to Path
+  #     run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    - name: Add bin to Path
-      run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+  #   - name: Add bin to Path
+  #     run: echo "${{ steps.strings.outputs.build-output-dir }}/build/lib/Debug" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    - name: Echo Context (DEBUG)
-      run: echo "$GITHUB_CONTEXT"
+  #   - name: Echo Context (DEBUG)
+  #     run: echo "$GITHUB_CONTEXT"
 
-    - name: Init Submodules Recursively
-      run: git submodule update --init --recursive
+  #   - name: Init Submodules Recursively
+  #     run: git submodule update --init --recursive
 
-    - name: Configure CMake
-      run: >
-        cmake -B ${{ steps.strings.outputs.build-output-dir }}
-        -DCMAKE_CXX_COMPILER=cl
-        -DCMAKE_C_COMPILER=cl
-        -DCMAKE_BUILD_TYPE=Debug
-        -S ${{ github.workspace }}
+  #   - name: Configure CMake
+  #     run: >
+  #       cmake -B ${{ steps.strings.outputs.build-output-dir }}
+  #       -DCMAKE_CXX_COMPILER=cl
+  #       -DCMAKE_C_COMPILER=cl
+  #       -DCMAKE_BUILD_TYPE=Debug
+  #       -S ${{ github.workspace }}
 
-    - name: Build
-      run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config Debug
+  #   - name: Build
+  #     run: cmake --build ${{ steps.strings.outputs.build-output-dir }} --config Debug
 
-    - name: Copy DLL's to bin folder
-      run: cp ${{ steps.strings.outputs.build-output-dir }}/lib/Debug/* ${{ steps.strings.outputs.build-output-dir }}/bin/Debug/
+  #   - name: Copy DLL's to bin folder
+  #     run: cp ${{ steps.strings.outputs.build-output-dir }}/lib/Debug/* ${{ steps.strings.outputs.build-output-dir }}/bin/Debug/
 
-    - name: Test
-      working-directory: ${{ steps.strings.outputs.build-output-dir }}
-      run: ctest --build-config Debug --output-on-failure
+  #   - name: Test
+  #     working-directory: ${{ steps.strings.outputs.build-output-dir }}
+  #     run: ctest --build-config Debug --output-on-failure
