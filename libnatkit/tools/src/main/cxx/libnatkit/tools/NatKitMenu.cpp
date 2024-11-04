@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <stdlib.h>
 #include <thread>
 
@@ -15,6 +17,12 @@
 #include <libnatkit/util/Vectors.hpp>
 
 using namespace std::chrono_literals;
+
+std::optional<std::string> get_env(const char* env) {
+    auto t = std::getenv(env);
+    if (t) return t;
+    return {};
+}
 
 class ExampleDeliveryReportCbOther : public RdKafka::DeliveryReportCb {
 public:
@@ -108,13 +116,13 @@ std::pair<std::string, std::string> getBroker() {
   char envHostBuffer[256];
   char envPortBuffer[256];
   size_t bufferSize;
-  auto hostEnvError = getenv_s(&bufferSize, envHostBuffer, sizeof(envHostBuffer), "NATKIT_SERVER_HOST");
-  auto portEnvError = getenv_s(&bufferSize, envPortBuffer, sizeof(envPortBuffer), "NATKIT_SERVER_PORT");
+  auto hostEnvMaybe = get_env("NATKIT_SERVER_HOST");
+  auto portEnvMaybe = get_env("NATKIT_SERVER_PORT");
   std::string host = "localhost";
   std::string port = "9092";
-  if (hostEnvError != 0 && portEnvError != 0) {
-      host = std::string(envHostBuffer);
-      port = std::string(envPortBuffer);
+  if (hostEnvMaybe.has_value() && portEnvMaybe.has_value()) {
+      host = hostEnvMaybe.value();
+      port = portEnvMaybe.value();
   }
   std::cout << "Enter broker in the format <hostname>:<port> [" << host << ":" << port << "]: ";
   std::string broker;
