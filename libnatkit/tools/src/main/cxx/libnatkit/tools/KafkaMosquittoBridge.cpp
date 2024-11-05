@@ -58,12 +58,6 @@ int main(int argc, char **argv) {
       mqttBrokerPort = splitMosquittoBroker[1];
   }
 
-  if (argc != 3) {
-    std::cerr << "Usage: " << argv[0] << " <kafka-broker> <mosquitto-broker>\n";
-    exit(1);
-  }
-
-
   auto kafkaBroker =
       nat::kafka::createBrokerManager(kafkaBrokerAddress.value(), kafkaBrokerPort.value());
   auto mosquittoBroker =
