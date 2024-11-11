@@ -5,7 +5,9 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <set>
 #include <stdlib.h>
 #include <thread>
 
@@ -15,6 +17,8 @@
 #include <libnatkit-core.hpp>
 #include <libnatkit/util/Strings.hpp>
 #include <libnatkit/util/Vectors.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <windows.h>
 
@@ -314,12 +318,40 @@ struct Command {
 
 class ImuTuiWindow {
     TerminalScreen screen;
+    std::vector<std::string> sidePannelContent;
     std::vector<Command> commands;
     std::deque<std::string> outputPallet;
     std::mutex lock{};
 
+    int getSidePannelWidth() {
+        int width = screen.getWidth();
+        int sidePannelWidth = 80;
+        if (width < 160) {
+            sidePannelWidth = 30;
+        }
+        return sidePannelWidth;
+    }
+
 public:
     ImuTuiWindow() = default;
+
+    void setSidePannelContent(const std::vector<std::string>& sidePannel) {
+        std::lock_guard<std::mutex> guard(lock);
+        this->sidePannelContent = std::vector<std::string>{};
+        this->sidePannelContent.reserve(sidePannel.size());
+        int sidePannelWidth = getSidePannelWidth();
+        for (const auto& str : sidePannel) {
+            std::string tmpStr{ str };
+            int strLen = str.length();
+            int index = 0;
+            while (strLen >= sidePannelWidth) {
+                this->sidePannelContent.push_back(str.substr(index, sidePannelWidth - 1));
+                strLen -= (sidePannelWidth - 1);
+                index += (sidePannelWidth - 1);
+            }
+            this->sidePannelContent.push_back(str.substr(index));
+        }
+    }
 
     void setCommands(const std::vector<Command>& c) {
         std::lock_guard<std::mutex> guard(lock);
@@ -344,27 +376,75 @@ public:
         screen.update();
         int width = screen.getWidth();
         int height = screen.getHeight();
+        int sidePannelWidth = getSidePannelWidth();
         int currentHeight = 0;
+        std::string emptyLine = "";
+        for (int i = 0; i < width; ++i) {
+            if (i == width - sidePannelWidth) {
+                emptyLine.append("|");
+            }
+            else {
+                emptyLine.append(" ");
+            }
+        }
+        emptyLine.append("\n");
+
         std::string commandsPallet = "";
-        for (int i = 0; i < width; ++i)
-            commandsPallet.append("-");
+        for (int i = 0; i < width; ++i) {
+            if (i < width - sidePannelWidth) {
+                commandsPallet.append("-");
+            }
+            else if (i == width - sidePannelWidth) {
+                commandsPallet.append("|");
+            }
+            else {
+                commandsPallet.append(" ");
+            }
+        }
         commandsPallet.append("\n");
         ++currentHeight;
         for (const auto& command : commands) {
             std::string padding = " ";
-            commandsPallet.append(command.command + ":" + padding + command.discription + "\n");
+            std::string commandString = command.command + ":" + padding + command.discription;
+            for (int i = commandString.length(); i < width; ++i) {
+                if (i == width - sidePannelWidth) {
+                    commandString.append("|");
+                }
+                else if (currentHeight <= sidePannelContent.size() && i > width - sidePannelWidth) {
+                    commandString.append(sidePannelContent[currentHeight - 1]);
+                    break;
+                }
+                else {
+                    commandString.append(" ");
+                }
+            }
+            commandsPallet.append(commandString + "\n");
             ++currentHeight;
         }
 
         std::string outputPalletString = "";
         int spaceAvailable = height - currentHeight;
         int numberOfOutputLines = spaceAvailable < outputPallet.size() ? spaceAvailable : outputPallet.size();
-        for (int i = numberOfOutputLines; i > 0; --i, ++currentHeight)
-            outputPalletString += outputPallet[i-1] + "\n";
+        for (int i = numberOfOutputLines; i > 0; --i, ++currentHeight) {
+            std::string endOfLine = "";
+            for (int j = outputPallet[i - 1].length(); j < width; ++j) {
+                if (j == width - sidePannelWidth) {
+                    endOfLine.append("|");
+                }
+                else if (currentHeight <= sidePannelContent.size() && i > width - sidePannelWidth) {
+                    endOfLine.append(sidePannelContent[currentHeight - 1]);
+                    break;
+                }
+                else {
+                    endOfLine.append(" ");
+                }
+            }
+            outputPalletString += outputPallet[i - 1] + endOfLine + "\n";
+        }
 
         std::string topPadding = "";
         for (int i = currentHeight; i < height; ++i)
-            topPadding.append("\n");
+            topPadding.append(emptyLine);
 
         screen.drawToScreen(topPadding + outputPalletString + commandsPallet);
     }
@@ -413,6 +493,70 @@ public:
     }
 };
 
+struct ImuConfig {
+    std::string id;
+    std::string name;
+};
+
+void to_json(nlohmann::json& json, const std::vector<ImuConfig>& value)
+{
+    for (auto& imu : value)
+    {
+        json[imu.id]["name"] = imu.name;
+    }
+}
+
+void from_json(const nlohmann::json& json, std::vector<ImuConfig>& value)
+{
+    for (auto& entry : json.items())
+    {
+        ImuConfig imu;
+        imu.id = entry.key();
+        std::map<std::string, std::string> kvp = entry.value().get<std::map<std::string, std::string>>();
+        imu.name = kvp["name"];
+        value.push_back(imu);
+    }
+}
+
+class Config {
+    std::vector<std::string> ids{};
+    std::map<std::string, std::string> idNames{};
+
+    void populateDataFromJsonFile() {
+        std::ifstream jsonFile("config.json");
+        nlohmann::json json = nlohmann::json::parse(jsonFile);
+        for (auto& [index, listEntry] : json["imu"].items()) {
+            for (auto& [imuId, imuFields] : listEntry.items()) {
+                ids.push_back(imuId);
+                for (auto& [imuFieldName, imuFieldValue] : imuFields.items()) {
+                    if (imuFieldName == "name") {
+                        idNames.insert({ imuId, imuFieldValue.get<std::string>() });
+                    }
+                }
+            }
+        }
+        /*std::vector<ImuConfig> imus = json["imu"].template get<std::vector<ImuConfig>>();
+        for (const auto& imu : imus) {
+            ids.insert(imu.id);
+            idNames.insert({ imu.id, imu.name });
+        }*/
+    }
+
+public:
+    Config() {
+        populateDataFromJsonFile();
+    }
+
+    std::optional<std::string> tryGetName(std::string id) {
+        if (auto it = idNames.find(id); it != idNames.end()) {
+            return it->second;
+        }
+        else {
+            return {};
+        }
+    }
+};
+
 std::vector<std::unique_ptr<nat::core::RawStream>> promptUserToChooseStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener) {
     while (true) {
         auto streams = manager->getAllStreams();
@@ -451,6 +595,7 @@ class ImuApplication {
         Calibration,
     };
 
+    Config config;
     std::unique_ptr<nat::kafka::BrokerManager> manager;
     std::shared_ptr<ImuTuiWindow> window;
     std::shared_ptr<KeyListener> keyListener;
@@ -461,17 +606,27 @@ class ImuApplication {
         const std::vector<std::unique_ptr<nat::core::RawStream>> streams = promptUserToChooseStreams(manager, window, keyListener);
         std::vector<std::unique_ptr<nat::core::TopicMessenger>> messengers{};
         for (const auto& stream : streams) {
-            std::shared_ptr<nat::core::BasicTopicInformation> dataTopic = std::move(stream->getTopicsByType(nat::core::StreamType::DATA)[0]);
-            messengers.emplace_back(manager->createMessenger(dataTopic));
+            auto dataTopics = stream->getTopicsByType(nat::core::StreamType::DATA);
+            if (dataTopics.size() > 0) {
+                std::shared_ptr<nat::core::BasicTopicInformation> dataTopic = std::move(stream->getTopicsByType(nat::core::StreamType::DATA)[0]);
+                messengers.emplace_back(manager->createMessenger(dataTopic));
+            }
         }
 
         return messengers;
     }
 
+    std::string getNameForImu(std::string id) {
+        std::optional<std::string> nameMaybe = config.tryGetName(id);
+        if (nameMaybe.has_value())
+            return nameMaybe.value();
+        else
+            return "?";
+    }
 
 public:
-    ImuApplication(std::unique_ptr<nat::kafka::BrokerManager> manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener)
-        : manager(std::move(manager)), window(window), keyListener(keyListener), currentStage(ImuApplicationStage::SelectImus) {}
+    ImuApplication(std::unique_ptr<nat::kafka::BrokerManager> manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener, Config config)
+        : manager(std::move(manager)), window(window), keyListener(keyListener), currentStage(ImuApplicationStage::SelectImus), config(config) {}
 
     void start() {
         while (true) {
@@ -481,6 +636,46 @@ public:
                 if (!imuStreams.has_value()) {
                     imuStreams = getImuStreams(manager, window, keyListener);
                 }
+                else {
+                    currentStage = ImuApplicationStage::Calibration;
+                }
+                break;
+
+            case ImuApplicationStage::Calibration:
+                std::vector<std::string> imuAccuracies{};
+                for (auto& stream : imuStreams.value()) {
+                    stream->clearAllMessages();
+                    std::shared_ptr<nat::core::Schema> message{ nullptr };
+                    const auto initailWaitUntil = std::chrono::system_clock::now() + 1s;
+                    while (std::chrono::system_clock::now() < initailWaitUntil) {
+                        auto messageMaybe = stream->tryGetNexMessage();
+                        if (messageMaybe.has_value()) {
+                            message = std::move(messageMaybe.value());
+                            break;
+                        }
+                    }
+                    if (message == nullptr) {
+                        window->addOutput("No messages recieved from " + std::to_string(stream->getId()) + ". Is it connected?");
+                        continue;
+                    }
+                    else {
+                        std::optional<std::shared_ptr<nat::core::NatImuDataSchema>> convertedMessageMaybe = nat::core::NatImuDataSchema::tryCreateFromSchema(message);
+                        if (!convertedMessageMaybe.has_value()) {
+                            window->addOutput(std::to_string(stream->getId()) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
+                            continue;
+                        }
+                        else {
+                            std::string id = std::to_string(stream->getId());
+                            std::string name = getNameForImu(id);
+                            imuAccuracies.push_back(name + ":");
+                            imuAccuracies.push_back("    Id = " + id);
+                            imuAccuracies.push_back("    Accuracy = " + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy())));
+                            imuAccuracies.push_back("");
+                        }
+                    }
+                }
+                window->setSidePannelContent(imuAccuracies);
+                break;
             }
         }
     }
@@ -854,7 +1049,7 @@ int main(int argc, char** argv) {
 
         case MenuOptions::ImuExperiment:
         {
-            ImuApplication application(std::move(manager), window, globalKeyListener);
+            ImuApplication application(std::move(manager), window, globalKeyListener, Config{});
             application.start();
         }
             break;

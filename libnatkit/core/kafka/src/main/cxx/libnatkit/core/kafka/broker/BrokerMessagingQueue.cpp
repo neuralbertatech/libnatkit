@@ -92,7 +92,7 @@ void BrokerMessagingQueue::enqueueMessageToSend(std::unique_ptr<core::message_t>
 
 void BrokerMessagingQueue::enqueueMessageToReceive(const std::shared_ptr<core::message_t> message) {
   const std::lock_guard<std::mutex> lock(receivingQueueLock);
-  receivingQueue.push(std::move(message));
+  receivingQueue.push(message);
 }
 
 nat::core::Optional<std::shared_ptr<core::message_t>> BrokerMessagingQueue::tryGetNextMessage() {
@@ -106,6 +106,12 @@ nat::core::Optional<std::shared_ptr<core::message_t>> BrokerMessagingQueue::tryG
     receivingQueue.pop();
     return {std::move(message)};
   }
+}
+
+void BrokerMessagingQueue::clearAllMessages() {
+    std::queue<std::shared_ptr<core::message_t>> empty{};
+    const std::lock_guard<std::mutex> lock(receivingQueueLock);
+    std::swap(receivingQueue, empty);
 }
 
 std::string BrokerMessagingQueue::byteArrayToString(const std::vector<uint8_t> &byteArray) {

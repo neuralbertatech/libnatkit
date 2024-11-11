@@ -1,0 +1,39 @@
+{
+  "imu": [
+    {
+      "13793649553528": {
+        "name": "Left Hand"
+      }
+    },
+    {
+      "###": {
+        "name": "Left Elbow"
+      }
+    },
+    {
+      "###": {
+        "name": "Left Shoulder"
+      }
+    },
+    {
+      "###": {
+        "name": "Trunk"
+      }
+    },
+    {
+      "###": {
+        "name": "Right Shoulder"
+      }
+    },
+    {
+      "###": {
+        "name": "Right Elbow"
+      }
+    },
+    {
+      "###": {
+        "name": "Right Hand"
+      }
+    }
+  ]
+}

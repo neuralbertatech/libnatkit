@@ -8,6 +8,7 @@
 
 using namespace std::chrono_literals;
 
+#pragma warning(disable : 4996)
 static std::optional<std::string> get_env(const char* env) {
     auto t = std::getenv(env);
     if (t) return t;
