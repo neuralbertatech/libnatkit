@@ -498,26 +498,6 @@ struct ImuConfig {
     std::string name;
 };
 
-void to_json(nlohmann::json& json, const std::vector<ImuConfig>& value)
-{
-    for (auto& imu : value)
-    {
-        json[imu.id]["name"] = imu.name;
-    }
-}
-
-void from_json(const nlohmann::json& json, std::vector<ImuConfig>& value)
-{
-    for (auto& entry : json.items())
-    {
-        ImuConfig imu;
-        imu.id = entry.key();
-        std::map<std::string, std::string> kvp = entry.value().get<std::map<std::string, std::string>>();
-        imu.name = kvp["name"];
-        value.push_back(imu);
-    }
-}
-
 class Config {
     std::vector<std::string> ids{};
     std::map<std::string, std::string> idNames{};
@@ -535,11 +515,6 @@ class Config {
                 }
             }
         }
-        /*std::vector<ImuConfig> imus = json["imu"].template get<std::vector<ImuConfig>>();
-        for (const auto& imu : imus) {
-            ids.insert(imu.id);
-            idNames.insert({ imu.id, imu.name });
-        }*/
     }
 
 public:
@@ -642,38 +617,46 @@ public:
                 break;
 
             case ImuApplicationStage::Calibration:
+                window->setCommands({ {"n", "Next"} });
                 std::vector<std::string> imuAccuracies{};
-                for (auto& stream : imuStreams.value()) {
-                    stream->clearAllMessages();
+                auto pollStreamFunc = [this](std::shared_ptr<nat::core::TopicMessenger> s) -> std::vector<std::string> {
+                    std::vector<std::string> accuracies{};
+                    s->clearAllMessages();
                     std::shared_ptr<nat::core::Schema> message{ nullptr };
                     const auto initailWaitUntil = std::chrono::system_clock::now() + 1s;
                     while (std::chrono::system_clock::now() < initailWaitUntil) {
-                        auto messageMaybe = stream->tryGetNexMessage();
+                        auto messageMaybe = s->tryGetNexMessage();
                         if (messageMaybe.has_value()) {
                             message = std::move(messageMaybe.value());
                             break;
                         }
                     }
                     if (message == nullptr) {
-                        window->addOutput("No messages recieved from " + std::to_string(stream->getId()) + ". Is it connected?");
-                        continue;
+                        window->addOutput("No messages recieved from " + std::to_string(s->getId()) + ". Is it connected?");
                     }
                     else {
                         std::optional<std::shared_ptr<nat::core::NatImuDataSchema>> convertedMessageMaybe = nat::core::NatImuDataSchema::tryCreateFromSchema(message);
                         if (!convertedMessageMaybe.has_value()) {
-                            window->addOutput(std::to_string(stream->getId()) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
-                            continue;
+                            window->addOutput(std::to_string(s->getId()) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
                         }
                         else {
-                            std::string id = std::to_string(stream->getId());
+                            std::string id = std::to_string(s->getId());
                             std::string name = getNameForImu(id);
-                            imuAccuracies.push_back(name + ":");
-                            imuAccuracies.push_back("    Id = " + id);
-                            imuAccuracies.push_back("    Accuracy = " + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy())));
-                            imuAccuracies.push_back("");
+                            accuracies.push_back(name + ":");
+                            accuracies.push_back("    Id = " + id);
+                            accuracies.push_back("    Accuracy = " + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy())));
+                            accuracies.push_back("");
                         }
                     }
+                    return accuracies;
+                    };
+                std::vector<std::thread> threads{};
+                for (auto& stream : imuStreams.value()) {
+                    std::shared_ptr<nat::core::TopicMessenger> sharedStream = std::move(stream);
+                    threads.emplace_back(pollStreamFunc, sharedStream);                    
                 }
+                
+
                 window->setSidePannelContent(imuAccuracies);
                 break;
             }
