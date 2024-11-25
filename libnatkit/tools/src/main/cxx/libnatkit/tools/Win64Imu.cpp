@@ -568,6 +568,7 @@ class ImuApplication {
     enum class ImuApplicationStage {
         SelectImus = 1,
         Calibration,
+        Application,
     };
 
     Config config;
@@ -617,47 +618,110 @@ public:
                 break;
 
             case ImuApplicationStage::Calibration:
-                window->setCommands({ {"n", "Next"} });
-                std::vector<std::string> imuAccuracies{};
-                auto pollStreamFunc = [this](std::shared_ptr<nat::core::TopicMessenger> s) -> std::vector<std::string> {
-                    std::vector<std::string> accuracies{};
-                    s->clearAllMessages();
+            {
+                std::vector<std::pair<uint64_t, std::optional<int>>> imuAccuracies(imuStreams.value().size(), std::make_pair(0, std::make_optional<int>()));
+                auto pollStreamFunc = [this](int index) {
+                    auto imuStream = this->imuStreams.value()[index].get();
+                    imuStream->clearAllMessages();
+                    uint64_t id = imuStream->getId();
                     std::shared_ptr<nat::core::Schema> message{ nullptr };
                     const auto initailWaitUntil = std::chrono::system_clock::now() + 1s;
                     while (std::chrono::system_clock::now() < initailWaitUntil) {
-                        auto messageMaybe = s->tryGetNexMessage();
+                        auto messageMaybe = imuStream->tryGetNexMessage();
                         if (messageMaybe.has_value()) {
                             message = std::move(messageMaybe.value());
                             break;
                         }
                     }
                     if (message == nullptr) {
-                        window->addOutput("No messages recieved from " + std::to_string(s->getId()) + ". Is it connected?");
+                        window->addOutput("No messages recieved from " + std::to_string(id) + ". Is it connected?");
                     }
                     else {
                         std::optional<std::shared_ptr<nat::core::NatImuDataSchema>> convertedMessageMaybe = nat::core::NatImuDataSchema::tryCreateFromSchema(message);
                         if (!convertedMessageMaybe.has_value()) {
-                            window->addOutput(std::to_string(s->getId()) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
+                            window->addOutput(std::to_string(id) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
                         }
                         else {
-                            std::string id = std::to_string(s->getId());
-                            std::string name = getNameForImu(id);
+                            int sensorAccuracy = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy());
+                        }
+                    }
+                    };
+
+                bool continueLooping = true;
+                std::mutex loopLock{};
+
+                window->setCommands({ {"n", "Next"} });
+                std::string command = "";
+                auto getUserInputFunc = [this, &continueLooping, &command, &loopLock]() {
+                    while (true) {
+                        {
+                            std::lock_guard<std::mutex> loopGaurd{ loopLock };
+                            if (!continueLooping) {
+                                break;
+                            }
+                        }
+                        window->draw();
+                        while (!this->keyListener->haveAnyKeysBeenPressed()) std::this_thread::sleep_for(10ms);
+                        const auto keysPressed = this->keyListener->getKeysPressed();
+                        std::vector<int> keyCodesPressed = {};
+                        for (auto character : keysPressed) keyCodesPressed.push_back((int)character);
+
+                        for (int i = 0; i < keysPressed.size(); ++i) {
+                            char characterPressed = nat::util::Strings::toLowercase(keysPressed[i]);
+                            command += characterPressed;
+                            if (command == "n") {
+                                std::lock_guard<std::mutex> loopGaurd{ loopLock };
+                                continueLooping = false;
+                                break;
+                            }
+                            else {
+                                std::vector<int> keyCodesInCommand = {};
+                                for (auto character : command) keyCodesInCommand.push_back((int)character);
+                                window->addOutput(" Invalid Option: \"" + command + "\" (" + nat::util::Vectors::toString(keyCodesInCommand) + ")");
+                                command = "";
+                            }
+                        }
+                    }
+                    };
+
+                std::thread uiThread{ getUserInputFunc };
+                //getUserInputFunc();
+                while (true) {
+                    {
+                        std::lock_guard<std::mutex> loopGaurd{ loopLock };
+                        if (!continueLooping) {
+                            break;
+                        }
+                    }
+                    std::vector<std::thread> threads{};
+                    for (int i = 0; i < imuStreams.value().size(); ++i) {
+                        threads.emplace_back(pollStreamFunc, i);
+                    }
+
+                    for (auto& thread : threads) {
+                        thread.join();
+                    }
+
+                    std::vector<std::string> accuracies{};
+                    for (const auto& [id, accuracyMaybe] : imuAccuracies) {
+                        if (accuracyMaybe.has_value()) {
+                            std::string name = getNameForImu(std::to_string(id));
                             accuracies.push_back(name + ":");
-                            accuracies.push_back("    Id = " + id);
-                            accuracies.push_back("    Accuracy = " + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy())));
+                            accuracies.push_back("    Id = " + std::to_string(id));
+                            accuracies.push_back("    Accuracy = " + std::to_string(accuracyMaybe.value()));
                             accuracies.push_back("");
                         }
                     }
-                    return accuracies;
-                    };
-                std::vector<std::thread> threads{};
-                for (auto& stream : imuStreams.value()) {
-                    std::shared_ptr<nat::core::TopicMessenger> sharedStream = std::move(stream);
-                    threads.emplace_back(pollStreamFunc, sharedStream);                    
-                }
-                
 
-                window->setSidePannelContent(imuAccuracies);
+                    window->setSidePannelContent(accuracies);
+                }
+                uiThread.join();
+                currentStage = ImuApplicationStage::Application;
+                break;
+            }
+
+            case ImuApplicationStage::Application:
+                window->addOutput("Application Time");
                 break;
             }
         }
