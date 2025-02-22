@@ -97,7 +97,7 @@
       <Filter>Header Files\libnatkit\core\streams\stream</Filter>
     </ClInclude>
     <ClInclude Include="..\..\..\..\third-party\nlohmann\single_include\nlohmann\json.hpp">
-      <Filter>Header Files</Filter>
+      <Filter>Header Files\nlohmann</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
