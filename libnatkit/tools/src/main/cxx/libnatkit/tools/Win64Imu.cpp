@@ -659,7 +659,7 @@ public:
                         continue;
                     }
                     else {
-                        std::optional<std::shared_ptr<nat::core::NatImuDataSchema>> convertedMessageMaybe = nat::core::NatImuDataSchema::tryCreateFromSchema(message);
+                        nat::core::Optional<std::shared_ptr<nat::core::NatImuDataSchema>> convertedMessageMaybe = nat::core::NatImuDataSchema::tryCreateFromSchema(nat::core::Optional<const std::shared_ptr<nat::core::Schema>>(message));
                         if (!convertedMessageMaybe.has_value()) {
                             window->addOutput(std::to_string(stream->getId()) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
                             continue;
@@ -669,7 +669,9 @@ public:
                             std::string name = getNameForImu(id);
                             imuAccuracies.push_back(name + ":");
                             imuAccuracies.push_back("    Id = " + id);
-                            imuAccuracies.push_back("    Accuracy = " + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy())));
+                            imuAccuracies.push_back("    Accuracy = " + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccelerationAccuracy())) + ", "
+                                                    + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getGyroscopeAccuracy())) + ", "
+                                                    + std::to_string(nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getRotationAccuracy())));
                             imuAccuracies.push_back("");
                         }
                     }
@@ -1005,7 +1007,8 @@ void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager, I
     for (int i = 0; i < 100; ++i) {
         for (int j = 0; j < 9; ++j)
             imuData[j] = (rand() % 100000) / 1000.0;
-        dataMessenger->sendMessage(nat::core::NatImuDataSchema(rand(), nat::core::NatImuDataSchema::convertIntToSensorAccuracy(rand() % 4), imuData, 13));
+        const nat::core::NatImuDataSchema message(rand(), rand() % 64, rand() % 8, imuData, 9);
+        dataMessenger->sendMessage(message);
     }
 }
 
