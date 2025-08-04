@@ -35,5 +35,21 @@
         "name": "Right Hand"
       }
     }
-  ]
+  ],
+  "assets": {
+    "one.wav": "../../../libnatkit/assets/1.wav",
+    "two.wav": "../../../libnatkit/assets/2.wav",
+    "three.wav": "../../../libnatkit/assets/3.wav",
+    "four.wav": "../../../libnatkit/assets/4.wav",
+    "five.wav": "../../../libnatkit/assets/5.wav",
+    "six.wav": "../../../libnatkit/assets/6.wav",
+    "seven.wav": "../../../libnatkit/assets/7.wav",
+    "eight.wav": "../../../libnatkit/assets/8.wav"
+  },
+  "settings": {
+    "numberOfBlocks": 5,
+    "numberOfTrialsPerBlock": 10,
+    "secondsBetweenTrials": 3,
+    "secondsBetweenBlocks": 10
+  }
 }

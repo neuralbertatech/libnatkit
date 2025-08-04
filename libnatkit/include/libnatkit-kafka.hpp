@@ -55,7 +55,7 @@ class BrokerMessagingQueue : public core::MessagingQueue {
         &messagingQueue; // NOTE: This is a reference because we need to access
                          // the outter parent;
                          //
-    static core::message_t stringToMessageType(const std::string &string);
+    static core::message_t payloadToMessageType(const uint8_t* payload, const size_t len);
 
   public:
     ConsumerCallback(BrokerMessagingQueue &messagingQueue);
@@ -93,7 +93,7 @@ public:
   virtual void clearAllMessages() override;
 
 private:
-  static std::string byteArrayToString(const std::vector<uint8_t> &byteArray);
+  static std::string byteArrayToString(const core::message_t &byteArray);
   void handleMessages();
   void pollResources();
   void sendMessages();

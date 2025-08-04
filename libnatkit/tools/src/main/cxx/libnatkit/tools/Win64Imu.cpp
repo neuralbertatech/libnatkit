@@ -1,15 +1,20 @@
+#define _WIN32_WINNT 0x0500
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <set>
 #include <stdlib.h>
 #include <thread>
+#include <unordered_set>
 
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
@@ -21,6 +26,42 @@
 #include <nlohmann/json.hpp>
 
 #include <windows.h>
+#include <mmsystem.h>
+
+#include <winsock2.h>
+
+/*
+ * Byte order conversion functions for 64-bit integers and 32 + 64 bit
+ * floating-point numbers.  IEEE big-endian format is used for the
+ * network floating point format.
+ */
+#ifndef _WS2_32_WINSOCK_SWAP_LONG
+#define _WS2_32_WINSOCK_SWAP_LONG(l)                \
+            ( ( ((l) >> 24) & 0x000000FFL ) |       \
+              ( ((l) >>  8) & 0x0000FF00L ) |       \
+              ( ((l) <<  8) & 0x00FF0000L ) |       \
+              ( ((l) << 24) & 0xFF000000L ) )
+#endif
+#ifndef _WS2_32_WINSOCK_SWAP_LONGLONG
+#define _WS2_32_WINSOCK_SWAP_LONGLONG(l)            \
+            ( ( ((l) >> 56) & 0x00000000000000FFLL ) |       \
+              ( ((l) >> 40) & 0x000000000000FF00LL ) |       \
+              ( ((l) >> 24) & 0x0000000000FF0000LL ) |       \
+              ( ((l) >>  8) & 0x00000000FF000000LL ) |       \
+              ( ((l) <<  8) & 0x000000FF00000000LL ) |       \
+              ( ((l) << 24) & 0x0000FF0000000000LL ) |       \
+              ( ((l) << 40) & 0x00FF000000000000LL ) |       \
+              ( ((l) << 56) & 0xFF00000000000000LL ) )
+#endif
+#ifndef htonll
+__inline unsigned __int64 htonll(unsigned __int64 Value)
+{
+    const unsigned __int64 Retval = _WS2_32_WINSOCK_SWAP_LONGLONG(Value);
+    return Retval;
+}
+#endif /* htonll */
+
+#include <drogon/drogon.h>
 
 using namespace std::chrono_literals;
 
@@ -63,6 +104,69 @@ void set_window_size(int lines, int columns)
         );
     }
 }
+
+std::wstring get_executable_path() {
+    TCHAR buffer[MAX_PATH] = { 0 };
+    GetModuleFileName(NULL, buffer, MAX_PATH);
+    std::wstring::size_type pos = std::wstring(buffer).find_last_of(L"\\/");
+    return std::wstring(buffer).substr(0, pos);
+}
+
+class Wav {
+    char* buffer;
+    bool ok;
+    HINSTANCE HInstance;
+
+public:
+    Wav(const char* filename) {
+        auto foo = get_executable_path();
+        ok = false;
+        buffer = 0;
+        HInstance = GetModuleHandle(0);
+
+        std::filesystem::path filepath(filename);
+        /*std::filesystem::path parentPath = filepath.parent_path();
+        for (const auto& file : std::filesystem::directory_iterator(parentPath)) {
+            std::cout << file;
+        }*/
+        std::ifstream infile(filepath, std::ios::binary);
+
+        if (!infile)
+        {
+            std::cout << "Wave::file error: " << filename << std::endl;
+            return;
+        }
+
+        infile.seekg(0, std::ios::end);   // get length of file
+        int length = infile.tellg();
+        buffer = new char[length];    // allocate memory
+        infile.seekg(0, std::ios::beg);   // position to start of file
+        infile.read(buffer, length);  // read entire file
+
+        infile.close();
+        ok = true;
+    }
+
+    ~Wav() {
+        PlaySound((LPCWSTR)NULL, 0, 0); // STOP ANY PLAYING SOUND
+        delete[] buffer;      // before deleting buffer.
+    }
+
+    void play(bool async = true) {
+        if (!ok)
+            return;
+
+        if (async)
+            PlaySound((LPCWSTR)buffer, HInstance, SND_MEMORY | SND_ASYNC);
+        else
+            PlaySound((LPCWSTR)buffer, HInstance, SND_MEMORY);
+    }
+
+    bool isok() {
+        return ok;
+    }
+};
+
 
 class KeyListener {
     std::queue<char> keysPressed{};
@@ -501,6 +605,11 @@ struct ImuConfig {
 class Config {
     std::vector<std::string> ids{};
     std::map<std::string, std::string> idNames{};
+    std::array<std::shared_ptr<Wav>, 8> audioClips{};
+    int numberOfBlocks = 0;
+    int numberOfTrialsPerBlock = 0;
+    int secondsBetweenTrials = 0;
+    int secondsBetweenBlocks = 0;
 
     void populateDataFromJsonFile() {
         std::ifstream jsonFile("config.json");
@@ -513,6 +622,47 @@ class Config {
                         idNames.insert({ imuId, imuFieldValue.get<std::string>() });
                     }
                 }
+            }
+        }
+        for (auto& [assetName, assetPath] : json["assets"].items()) {
+                if (assetName == "one.wav") {
+                    audioClips[0] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "two.wav") {
+                    audioClips[1] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "three.wav") {
+                    audioClips[2] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "four.wav") {
+                    audioClips[3] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "five.wav") {
+                    audioClips[4] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "six.wav") {
+                    audioClips[5] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "seven.wav") {
+                    audioClips[6] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+                else if (assetName == "eight.wav") {
+                    audioClips[7] = std::make_shared<Wav>(std::string(assetPath).c_str());
+                }
+        }
+
+        for (auto& [settingName, settingValue] : json["settings"].items()) {
+            if (settingName == "numberOfBlocks") {
+                numberOfBlocks = settingValue.template get<int>();
+            }
+            else if (settingName == "numberOfTrialsPerBlock") {
+                numberOfTrialsPerBlock = settingValue.template get<int>();
+            }
+            else if (settingName == "secondsBetweenTrials") {
+                secondsBetweenTrials = settingValue.template get<int>();
+            }
+            else if (settingName == "secondsBetweenBlocks") {
+                secondsBetweenBlocks = settingValue.template get<int>();
             }
         }
     }
@@ -530,6 +680,19 @@ public:
             return {};
         }
     }
+
+    std::shared_ptr<Wav> tryGetWavNumber(int number) {
+        if (number < 0 || number >= 9) {
+            std::cout << "Invalid Wav number: " << number << '\n';
+            assert(number > 0 && number < 9);
+        }
+        return audioClips[number];
+    }
+
+    int getNumberOfBlocks() { return numberOfBlocks; }
+    int getNumberOfTrialsPerBlock() { return numberOfTrialsPerBlock; }
+    int getSecondsBetweenTrials() { return secondsBetweenTrials; }
+    int getSecondsBetweenBlocks() { return secondsBetweenBlocks; }
 };
 
 std::vector<std::unique_ptr<nat::core::RawStream>> promptUserToChooseStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener) {
@@ -569,17 +732,38 @@ class ImuApplication {
         SelectImus = 1,
         Calibration,
         Application,
+        ExportData,
     };
 
     Config config;
-    std::unique_ptr<nat::kafka::BrokerManager> manager;
+    std::shared_ptr<nat::kafka::BrokerManager> manager;
+    std::mutex manager_lock{};
     std::shared_ptr<ImuTuiWindow> window;
     std::shared_ptr<KeyListener> keyListener;
+    std::mutex currency_stage_lock{};
     ImuApplicationStage currentStage;
     std::optional<std::vector<std::unique_ptr<nat::core::TopicMessenger>>> imuStreams;
+    std::vector<std::pair<int, uint64_t>> triggers{};
+    std::unordered_set<uint64_t> stream_ids{};
+    std::mutex stream_accuracies_lock{};
+    std::unordered_map<uint64_t, int> stream_accuracies{};
+    std::thread calibration_handle;
+    std::mutex does_calibration_need_cleanup_lock{};
+    bool does_calibration_need_cleanup{ false };
 
-    static std::vector<std::unique_ptr<nat::core::TopicMessenger>> getImuStreams(const std::unique_ptr<nat::kafka::BrokerManager>& manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener) {
-        const std::vector<std::unique_ptr<nat::core::RawStream>> streams = promptUserToChooseStreams(manager, window, keyListener);
+    static std::vector<std::unique_ptr<nat::core::RawStream>> getStreams(const std::shared_ptr<nat::kafka::BrokerManager>& manager, std::unordered_set<uint64_t> stream_ids) {
+        auto streams = manager->getAllStreams();
+        std::vector<std::unique_ptr<nat::core::RawStream>> selectedStreams{};
+        for (auto& stream : streams) {
+            if (stream_ids.contains(stream->getId())) {
+                selectedStreams.emplace_back(std::move(stream));
+            }
+        }
+        return selectedStreams;
+    }
+
+    static std::vector<std::unique_ptr<nat::core::TopicMessenger>> getImuStreams(const std::shared_ptr<nat::kafka::BrokerManager>& manager, std::unordered_set<uint64_t> stream_ids) {
+        const std::vector<std::unique_ptr<nat::core::RawStream>> streams = getStreams(manager, stream_ids);
         std::vector<std::unique_ptr<nat::core::TopicMessenger>> messengers{};
         for (const auto& stream : streams) {
             auto dataTopics = stream->getTopicsByType(nat::core::StreamType::DATA);
@@ -601,8 +785,193 @@ class ImuApplication {
     }
 
 public:
-    ImuApplication(std::unique_ptr<nat::kafka::BrokerManager> manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener, Config config)
+    ImuApplication(std::shared_ptr<nat::kafka::BrokerManager> manager, std::shared_ptr<ImuTuiWindow> window, std::shared_ptr<KeyListener> keyListener, Config config)
         : manager(std::move(manager)), window(window), keyListener(keyListener), currentStage(ImuApplicationStage::SelectImus), config(config) {}
+
+    void set_streams(const std::unordered_set<uint64_t> &stream_ids) {
+        this->stream_ids = stream_ids;
+        {
+            std::lock_guard guard{ manager_lock };
+            imuStreams = getImuStreams(manager, stream_ids);
+        }
+    }
+
+    std::vector<std::unique_ptr<nat::core::RawStream>> list_streams() {
+        std::vector<std::unique_ptr<nat::core::BasicTopicInformation>> topics;
+        {
+            std::lock_guard guard{ manager_lock };
+            topics = manager->getAllTopics();
+        }
+        std::sort(topics.begin(), topics.end(), [](const auto& a, const auto& b) {
+            return a->id > b->id;
+            });
+        std::vector<std::vector<std::unique_ptr<nat::core::BasicTopicInformation>>> streamTopics{};
+        uint64_t lastId = -1;
+        for (auto it = topics.begin(); it != topics.end(); ++it) {
+            if ((*it)->id != lastId)
+                streamTopics.push_back({});
+            lastId = (*it)->id;
+            streamTopics[streamTopics.size() - 1].push_back(std::move(*it));
+        }
+
+        std::vector<std::unique_ptr<nat::core::RawStream>> streams{};
+        for (auto it = streamTopics.begin(); it != streamTopics.end(); ++it) {
+            auto streamMaybe = nat::core::RawStream::create(std::move(*it));
+            if (streamMaybe.has_value()) {
+                streams.push_back(std::move(streamMaybe.value()));
+            }
+        }
+        
+        return streams;
+        //for (const auto& stream : streams) {
+        //    auto metaTopics = stream->getTopicsByType(nat::core::StreamType::META);
+        //    if (metaTopics.size() > 0) {
+        //        const auto messenger = manager->createMessenger(std::move(metaTopics[0]));
+        //        std::string name{};
+        //        const auto initailWaitUntil = std::chrono::system_clock::now() + 50ms;
+        //        bool firstMessageRecieved = false;
+        //        while (true) {
+        //            const auto messageMaybe = messenger->tryGetNexMessage();
+        //            if (!messageMaybe.has_value()) {
+        //                if (firstMessageRecieved || std::chrono::system_clock::now() > initailWaitUntil) {
+        //                    break;
+        //                }
+        //                else {
+        //                    std::this_thread::sleep_for(1ms);
+        //                    continue;
+        //                }
+        //            }
+        //            firstMessageRecieved = true;
+        //            name = messageMaybe.value()->getName();
+        //        }
+        //        window.addOutput(std::to_string(stream->getId()) + " (" + name + ")");
+        //    }
+        //}
+    }
+
+    void start_calibration() {
+        {
+            std::lock_guard<std::mutex> guard{ currency_stage_lock };
+            if (currentStage == ImuApplicationStage::Calibration) {
+                return;
+            }
+            else {
+                currentStage = ImuApplicationStage::Calibration;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> guard{ does_calibration_need_cleanup_lock };
+            if (does_calibration_need_cleanup) {
+                calibration_handle.join();
+                does_calibration_need_cleanup = false;
+            }
+        }
+
+        //if (calibration_handle.joinable()) {
+        //    return;
+        //}
+        //else {
+        std::cout << "Starting new calibration thread\n";
+        calibration_handle = std::thread(&ImuApplication::calibration, this);
+        //}
+    }
+
+    std::vector<std::pair<uint64_t, int>> get_stream_accuracies() {
+        std::vector<std::pair<uint64_t, int>> accuracies{};
+        {
+            std::lock_guard<std::mutex> guard{ stream_accuracies_lock };
+            for (const auto& [id, accuracy] : stream_accuracies) {
+                std::cout << "ID is " << id << '\n';
+                accuracies.emplace_back(id, accuracy);
+            }
+        }
+        return accuracies;
+    }
+
+    void calibration() {
+        std::mutex imu_accuracies_lock{};
+        std::vector<std::pair<uint64_t, std::optional<int>>> imuAccuracies(imuStreams.value().size(), std::make_pair(0, std::make_optional<int>()));
+        auto pollStreamFunc = [this, &imuAccuracies, &imu_accuracies_lock](int index) {
+            auto imuStream = this->imuStreams.value()[index].get();
+            imuStream->clearAllMessages();
+            uint64_t id = imuStream->getId();
+            std::shared_ptr<nat::core::Schema> message{ nullptr };
+            const auto initailWaitUntil = std::chrono::system_clock::now() + 1s;
+            while (std::chrono::system_clock::now() < initailWaitUntil) {
+                auto messageMaybe = imuStream->tryGetNexMessage();
+                if (messageMaybe.has_value()) {
+                    message = std::move(messageMaybe.value());
+                    break;
+                }
+            }
+            if (message == nullptr) {
+                window->addOutput("No messages recieved from " + std::to_string(id) + ". Is it connected?");
+            }
+            else {
+                nat::core::Optional<std::shared_ptr<nat::core::NatImuBulkDataSchema>> convertedMessageMaybe = nat::core::NatImuBulkDataSchema::tryCreateFromSchema(message);
+                if (!convertedMessageMaybe.has_value()) {
+                    window->addOutput(std::to_string(id) + ": Was expecting a NatImuBulkDataSchema object, but found a " + message->getName() + " object instead. Error");
+                }
+                else {
+                    const auto imuRecords = convertedMessageMaybe.value()->createImuRecords();
+                    assert(imuRecords != nullptr);
+                    assert(imuRecords->size() > 0);
+                    int sensorAccuracy = nat::core::NatImuDataSchema::convertSensorAccuracyToInt((*imuRecords)[imuRecords->size() - 1].getAccuracy());
+                    {
+                        std::lock_guard<std::mutex> guard{ imu_accuracies_lock };
+                        imuAccuracies[index] = std::make_pair(id, sensorAccuracy);
+                    }
+                }
+            }
+            };
+
+        bool continueLooping = true;
+        std::mutex loopLock{};
+        while (true) {
+            {
+                std::lock_guard<std::mutex> guard{ currency_stage_lock };
+                if (currentStage != ImuApplicationStage::Calibration) {
+                    break;
+                }
+            }
+            std::vector<std::thread> threads{};
+            {
+                std::lock_guard guard{ manager_lock }; // To lock streams, not the best way to do this
+                if (imuAccuracies.size() != imuStreams.value().size()) {
+                    std::vector<std::pair<uint64_t, std::optional<int>>> tempImuAccuracies(imuStreams.value().size(), std::make_pair(0, std::make_optional<int>()));
+                    size_t min_size = tempImuAccuracies.size() < imuAccuracies.size() ? tempImuAccuracies.size() : imuAccuracies.size();
+                    for (size_t i = 0; i < min_size; ++i) {
+                        tempImuAccuracies[i] = imuAccuracies[i];
+                    }
+                    imuAccuracies = tempImuAccuracies;
+                }
+                for (int i = 0; i < imuStreams.value().size(); ++i) {
+                    threads.emplace_back(pollStreamFunc, i);
+                }
+
+                for (auto& thread : threads) {
+                    thread.join();
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> accuracies_guard{ stream_accuracies_lock };
+                stream_accuracies.clear();
+                for (const auto& [id, accuracyMaybe] : imuAccuracies) {
+                    if (accuracyMaybe.has_value()) {
+                        stream_accuracies[id] = accuracyMaybe.value();
+                    }
+                    else {
+                        stream_accuracies[id] = 0;
+                    }
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> guard{ does_calibration_need_cleanup_lock };
+            does_calibration_need_cleanup = true;
+        }
+    }
 
     void start() {
         while (true) {
@@ -610,7 +979,8 @@ public:
             switch (currentStage) {
             case ImuApplicationStage::SelectImus:
                 if (!imuStreams.has_value()) {
-                    imuStreams = getImuStreams(manager, window, keyListener);
+                    std::lock_guard guard{ manager_lock };
+                    imuStreams = getImuStreams(manager, stream_ids);
                 }
                 else {
                     currentStage = ImuApplicationStage::Calibration;
@@ -637,12 +1007,15 @@ public:
                         window->addOutput("No messages recieved from " + std::to_string(id) + ". Is it connected?");
                     }
                     else {
-                        std::optional<std::shared_ptr<nat::core::NatImuDataSchema>> convertedMessageMaybe = nat::core::NatImuDataSchema::tryCreateFromSchema(message);
+                        nat::core::Optional<std::shared_ptr<nat::core::NatImuBulkDataSchema>> convertedMessageMaybe = nat::core::NatImuBulkDataSchema::tryCreateFromSchema(message);
                         if (!convertedMessageMaybe.has_value()) {
-                            window->addOutput(std::to_string(id) + ": Was expecting a NatImuDataSchema object, but found a " + message->getName() + " object instead. Error");
+                            window->addOutput(std::to_string(id) + ": Was expecting a NatImuBulkDataSchema object, but found a " + message->getName() + " object instead. Error");
                         }
                         else {
-                            int sensorAccuracy = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(convertedMessageMaybe.value()->getAccuracy());
+                            const auto imuRecords = convertedMessageMaybe.value()->createImuRecords();
+                            assert(imuRecords != nullptr);
+                            assert(imuRecords->size() > 0);
+                            int sensorAccuracy = nat::core::NatImuDataSchema::convertSensorAccuracyToInt((*imuRecords)[imuRecords->size() - 1].getAccuracy());
                         }
                     }
                     };
@@ -716,12 +1089,99 @@ public:
                     window->setSidePannelContent(accuracies);
                 }
                 uiThread.join();
+                for (auto& stream : this->imuStreams.value()) {
+                    stream->clearAllMessages();
+                }
                 currentStage = ImuApplicationStage::Application;
                 break;
             }
 
-            case ImuApplicationStage::Application:
-                window->addOutput("Application Time");
+            case ImuApplicationStage::Application: {
+                const int numberOfBlocks = config.getNumberOfBlocks();
+                const int numberOfTrialsPerBlock = config.getNumberOfTrialsPerBlock();
+                const int numberOfActions = 8;
+                const int secondsBetweenTrials = config.getSecondsBetweenTrials();
+                const int secondsBetweenBlocks = config.getSecondsBetweenBlocks();
+                unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+                auto engine = std::default_random_engine(seed);
+                std::vector<std::vector<int>> blocks{};
+                for (int block = 0; block < numberOfBlocks; ++block) {
+                    blocks.emplace_back();
+                    for (int trial = 0; trial < numberOfTrialsPerBlock; ++trial) {
+                        blocks[block].push_back(trial % numberOfActions);
+                    }
+                    std::shuffle(blocks[block].begin(), blocks[block].end(), engine);
+                }
+                std::shuffle(blocks.begin(), blocks.end(), engine);
+
+                for (int block = 0; block < numberOfBlocks; ++block) {
+                    for (int trial = 0; trial < numberOfTrialsPerBlock; ++trial) {
+                        int action = blocks[block][trial];
+                        window->addOutput("Action: " + std::to_string(action));
+                        triggers.push_back(std::make_pair(action + 1000, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count())));
+                        config.tryGetWavNumber(action)->play(false);
+                        triggers.push_back(std::make_pair(action + 2000, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count())));
+                        std::this_thread::sleep_for(std::chrono::seconds(secondsBetweenTrials));
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(secondsBetweenBlocks));
+                }
+
+                currentStage = ImuApplicationStage::ExportData;
+                break;
+            }
+
+            case ImuApplicationStage::ExportData:
+                for (auto& stream : this->imuStreams.value()) {
+                    std::string filename = std::to_string(stream->getId()) + ".csv";
+                    std::ofstream file;
+                    file.open(filename);
+                    const auto initailWaitUntil = std::chrono::system_clock::now() + 1s;
+                    //bool firstMessageRecieved = false;
+                    
+                    std::vector<nat::core::NatImuDataSchema> messages{};
+                    while (true) {
+                        const auto messageMaybe = stream->tryGetNexMessage();
+                        if (!messageMaybe.has_value()) {
+                            break;
+                            //if (std::chrono::system_clock::now() > initailWaitUntil) {
+                            //    break;
+                            //}
+                            //else {
+                            //    std::this_thread::sleep_for(1ms);
+                            //    continue;
+                            //}
+                        }
+                        //firstMessageRecieved = true;
+                        std::shared_ptr<nat::core::Schema> message = std::move(messageMaybe.value());
+                        nat::core::Optional<std::shared_ptr<nat::core::NatImuBulkDataSchema>> convertedMessageMaybe = nat::core::NatImuBulkDataSchema::tryCreateFromSchema(message);
+                        if (!convertedMessageMaybe.has_value()) {
+                            window->addOutput("Error: Could not convert message to a NatImuBulkDataSchema object. This should not happen. Data is: " + nat::core::toString(*(messageMaybe.value()->encodeToBytes(nat::core::SerializationType::Csv))));
+                        } else {
+                            const auto imuRecords = convertedMessageMaybe.value()->createImuRecords();
+                            assert(imuRecords != nullptr);
+                            assert(imuRecords->size() > 0);
+                            for (size_t i = 0; i < imuRecords->size(); ++i)
+                                messages.push_back((*imuRecords)[i]);
+                            
+                        }
+                    }
+                    size_t currentTriggerIndex = 0;
+                    for (size_t i = 0; i < messages.size(); ++i) {
+                        int trigger = 0;
+                        uint64_t time = messages[i].getTime();
+                        if (currentTriggerIndex < triggers.size()) {
+                            if (i < messages.size() - 1) {
+                                uint64_t nextMessageTime = messages[i + 1].getTime();
+                                if (llabs(static_cast<int64_t>(triggers[currentTriggerIndex].second) - static_cast<int64_t>(time)) < llabs(static_cast<int64_t>(triggers[currentTriggerIndex].second) - static_cast<int64_t>(nextMessageTime))) {
+                                    trigger = triggers[currentTriggerIndex].first;
+                                    currentTriggerIndex += 1;
+                                }
+                            }
+                        }
+                        file << trigger << "," << nat::core::toString(*(messages[i].encodeToBytes(nat::core::SerializationType::Csv))) << '\n';
+                    }
+                    file.close();
+                }
                 break;
             }
         }
@@ -1056,29 +1516,9 @@ void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager, I
     }
 }
 
-int main(int argc, char** argv) {
-    //if (argc != 1) {
-    //  std::cerr << "Usage: " << argv[0] << " takes no arguments\n";
-    //  exit(1);
-    //}
-    std::mutex mtx;
-    mtx.lock();
-    mtx.unlock();
-
-    const auto [brokerHost, brokerPort] = getBroker();
+int backend_main(std::unique_ptr<nat::kafka::BrokerManager>& manager) {
     std::shared_ptr<ImuTuiWindow> window = std::make_shared<ImuTuiWindow>();
     window->setCommands(MenuOptionCommands);
-
-    //const auto topicInfoMaybe = nat::core::BasicTopicInformation::create(topic);
-    //if (!topicInfoMaybe.has_value()) {
-    //  std::cerr
-    //      << "<topic> takes the form of <stream-type>-<id>-<encoder>-<schema>\n";
-    //  exit(1);
-    //}
-    //const auto topicInfo = std::make_shared<nat::core::BasicTopicInformation>(
-    //    *topicInfoMaybe.value());
-
-    auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
     bool continueRunning = true;
     while (continueRunning) {
         switch (getMenuOption(*window)) {
@@ -1099,7 +1539,7 @@ int main(int argc, char** argv) {
             ImuApplication application(std::move(manager), window, globalKeyListener, Config{});
             application.start();
         }
-            break;
+        break;
 
         case MenuOptions::ListStreams:
             listCurrentStreams(manager, *window);
@@ -1123,5 +1563,226 @@ int main(int argc, char** argv) {
         }
     }
 
+    return 0;
+}
+
+class ImuController : public drogon::HttpSimpleController<ImuController> {
+    std::shared_ptr<ImuApplication> application;
+public:
+    ImuController(std::shared_ptr<ImuApplication> application)
+        : application(application) {}
+
+    virtual void asyncHandleHttpRequest(const drogon::HttpRequestPtr& req,
+        std::function<void(const drogon::HttpResponsePtr&)>&& callback) override
+    {
+        //write your application logic here
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        //NOTE: The enum constant below is named "k200OK" (as in 200 OK), not "k2000K".
+        resp->setStatusCode(drogon::k200OK);
+        resp->setContentTypeCode(drogon::CT_TEXT_HTML);
+        resp->setBody("Hello World!");
+        callback(resp);
+    }
+
+    PATH_LIST_BEGIN
+    //list path definitions here
+
+    //example
+    //PATH_ADD("/path","filter1","filter2",HttpMethod1,HttpMethod2...);
+
+    PATH_ADD("/", drogon::Get, drogon::Post);
+    PATH_ADD("/test", drogon::Get);
+    PATH_LIST_END
+};
+
+int main(int argc, char** argv) {
+    //if (argc != 1) {
+    //  std::cerr << "Usage: " << argv[0] << " takes no arguments\n";
+    //  exit(1);
+    //}
+    std::mutex mtx;
+    mtx.lock();
+    mtx.unlock();
+
+    const auto [brokerHost, brokerPort] = getBroker();
+
+    //const auto topicInfoMaybe = nat::core::BasicTopicInformation::create(topic);
+    //if (!topicInfoMaybe.has_value()) {
+    //  std::cerr
+    //      << "<topic> takes the form of <stream-type>-<id>-<encoder>-<schema>\n";
+    //  exit(1);
+    //}
+    //const auto topicInfo = std::make_shared<nat::core::BasicTopicInformation>(
+    //    *topicInfoMaybe.value());
+
+    std::shared_ptr<nat::kafka::BrokerManager> manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
+    std::shared_ptr<ImuTuiWindow> window = std::make_shared<ImuTuiWindow>();
+    std::shared_ptr<ImuApplication> application = std::make_shared<ImuApplication>(manager, window, globalKeyListener, Config{});
+
+    //std::thread application_thread(&ImuApplication::start, application);
+
+    drogon::app().setLogPath("./")
+        .setLogLevel(trantor::Logger::kWarn)
+        .addListener("0.0.0.0", 80)
+        .setThreadNum(16)
+        .registerPreRoutingAdvice(
+            [](const drogon::HttpRequestPtr& req, drogon::FilterCallback&& stop,
+                drogon::FilterChainCallback&& pass)
+            {
+                if (!req->path().starts_with("/api") || req->method() != drogon::Options)
+                {
+                    pass();
+                    return;
+                }
+
+                auto resp = drogon::HttpResponse::newHttpResponse();
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                resp->addHeader("Access-Control-Allow-Headers", "*");
+                stop(resp);
+            })
+        //.registerPostHandlingAdvice(
+        //    [](const drogon::HttpRequestPtr& req,
+        //        const drogon::HttpResponsePtr& resp)
+        //    { 
+        //        //resp->addHeader("Access-Control-Allow-Origin", "*");
+        //        resp->addHeader("Access-Control-Allow-Headers", "*");
+        //        resp->addHeader("Access-Control-Allow-Credentials", "true");
+        //        resp->addHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS,POST,PUT");
+        //        resp->addHeader("Access-Control-Allow-Headers", "Access-Control-Allow-Headers, Origin,Accept, X-Requested-With, Content-Type, Access-Control-Request-Method, Access-Control-Request-Headers");
+        //    })
+        .registerHandler("/api/heartbeat",
+            [&application](const drogon::HttpRequestPtr& req,
+                std::function<void(const drogon::HttpResponsePtr&)>&& callback)
+            {
+                auto resp = drogon::HttpResponse::newHttpJsonResponse("Success");
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                resp->setStatusCode(drogon::k200OK);
+                callback(resp);
+            },
+            { drogon::Get,"LoginFilter" })
+        .registerHandler("/api/is_connected_to_broker",
+            [&application](const drogon::HttpRequestPtr& req,
+                std::function<void(const drogon::HttpResponsePtr&)>&& callback)
+            {
+                Json::Value json;
+                if (application != nullptr) {
+                    json["connected"] = true;
+                }
+                else {
+                    json["connected"] = false;
+                }
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(json);
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                resp->setStatusCode(drogon::k200OK);
+                callback(resp);
+            },
+            { drogon::Get,"LoginFilter" })
+        .registerHandler("/api/get_all_streams",
+            [&application](const drogon::HttpRequestPtr& req,
+                std::function<void(const drogon::HttpResponsePtr&)>&& callback)
+            {
+                auto raw_streams = application->list_streams();
+                Json::Value streams_json;
+                int stream_index = 0;
+                for (const auto &stream : raw_streams) {
+                    Json::Value topics_json;
+                    int topic_index = 0;
+                    for (const auto& topic : stream->getTopicsByType(nat::core::StreamType::META)) {
+                        Json::Value topic_json;
+                        topic_json["schema_name"] = topic->schemaName;
+                        topic_json["type"] = "Meta";
+                        topic_json["id"] = std::to_string(stream->getId());
+                        topic_json["serialization_type"] = nat::core::toString(topic->serializationType);
+                        topics_json[topic_index] = topic_json;
+                        ++topic_index;
+                    }
+                    for (const auto& topic : stream->getTopicsByType(nat::core::StreamType::DATA)) {
+                        Json::Value topic_json;
+                        topic_json["schema_name"] = topic->schemaName;
+                        topic_json["type"] = "Data";
+                        topic_json["id"] = std::to_string(stream->getId());
+                        topic_json["serialization_type"] = nat::core::toString(topic->serializationType);
+                        topics_json[topic_index] = topic_json;
+                        ++topic_index;
+                    }
+                    streams_json[std::to_string(stream->getId())]["topics"] = topics_json;
+                    streams_json[std::to_string(stream->getId())]["name"] = "Raw Stream";
+                }
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(streams_json);
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                callback(resp);
+            },
+            { drogon::Get,"LoginFilter" })
+        .registerHandler("/api/set_streams",
+            [&application](const drogon::HttpRequestPtr& req,
+                std::function<void(const drogon::HttpResponsePtr&)>&& callback)
+            {
+                auto json = req->getJsonObject();
+                if (!json) {
+                    auto resp = drogon::HttpResponse::newHttpResponse();
+                    resp->setStatusCode(drogon::k400BadRequest);
+                    resp->setContentTypeCode(drogon::CT_TEXT_PLAIN);
+                    resp->setBody("Invalid JSON");
+                    callback(resp);
+                    return;
+                }
+                Json::Value ids_json = (*json)["stream_ids"];
+                std::unordered_set<uint64_t> ids{};
+                for (const auto& id : ids_json) {
+                    if (id.isUInt64()) {
+                        ids.emplace(id.asUInt64());
+                    }
+                    else {
+                        std::cerr << "Invalid ID passed " << id.asString() << '\n';
+                        auto resp = drogon::HttpResponse::newHttpJsonResponse("Invalid ID passed " + id.asString());
+                        resp->setStatusCode(drogon::k422UnprocessableEntity);
+                        resp->setContentTypeCode(drogon::CT_TEXT_PLAIN);
+                        resp->addHeader("Access-Control-Allow-Origin", "*");
+                        callback(resp);
+                        return;
+                    }
+                }
+                application->set_streams(ids);
+
+                auto resp = drogon::HttpResponse::newHttpJsonResponse("Success");
+                resp->setStatusCode(drogon::k200OK);
+                resp->setContentTypeCode(drogon::CT_TEXT_PLAIN);
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                callback(resp);
+            },
+            { drogon::Post,"LoginFilter" })
+        .registerHandler("/api/get_accuracies",
+            [&application](const drogon::HttpRequestPtr& req,
+            std::function<void(const drogon::HttpResponsePtr&)>&& callback)
+            {
+                auto accuracies = application->get_stream_accuracies();
+                Json::Value accuracies_json;
+                for (size_t i = 0; i < accuracies.size(); ++i) {
+                    accuracies_json[std::to_string(accuracies[i].first)] = std::to_string(accuracies[i].second);
+                }
+                Json::Value json;
+                json["accuracies"] = accuracies_json;
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(json);
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                resp->setStatusCode(drogon::k200OK);
+                callback(resp);
+            },
+            { drogon::Get,"LoginFilter" })
+        .registerHandler("/api/start_calibration",
+            [&application](const drogon::HttpRequestPtr& req,
+            std::function<void(const drogon::HttpResponsePtr&)>&& callback)
+            {
+                application->start_calibration();
+
+                auto resp = drogon::HttpResponse::newHttpJsonResponse("Success");
+                resp->setStatusCode(drogon::k200OK);
+                resp->setContentTypeCode(drogon::CT_TEXT_PLAIN);
+                resp->addHeader("Access-Control-Allow-Origin", "*");
+                callback(resp);
+            },
+            { drogon::Post,"LoginFilter" })
+        .run();
+
+    //application_thread.join();
     return 0;
 }

@@ -51,12 +51,12 @@ class MosquittoClient {
 public:
   using onMessageCallback_t =
       std::function<void(MosquittoClient *, const std::string &topic,
-                         const std::string &message, int qos)>;
+                         const std::vector<uint8_t> &message, int qos)>;
 
 private:
   struct mosquitto *client;
   const std::string topic;
-  std::queue<std::unique_ptr<std::pair<std::string, std::string>>> messages;
+  std::queue<std::unique_ptr<std::pair<std::string, std::vector<uint8_t>>>> messages;
   std::jthread thread;
   bool running{false};
   onMessageCallback_t onMessageCallback{MosquittoClient::defaultOnMessageCallback};
@@ -79,7 +79,7 @@ public:
 
 private:
   void handleMessages();
-  void addMessageToQueue(const std::string &topic, const std::string &msg);
+  void addMessageToQueue(const std::string &topic, const std::vector<uint8_t> &msg);
   static MosquittoClient *convertCallbackObject(void *callbackObj);
   static void *convertCallbackObject(MosquittoClient *client);
   static void defaultOnConnect(struct mosquitto *clientPtr, void *callbackObj,
@@ -91,7 +91,7 @@ private:
                                const struct mosquitto_message *message);
   static void defaultOnMessageCallback(MosquittoClient *client,
                                        const std::string &topic,
-                                       const std::string &message, int qos);
+                                       const std::vector<uint8_t> &message, int qos);
 };
 
 
@@ -105,7 +105,7 @@ public:
   virtual std::optional<std::unique_ptr<MosquittoClient>>
   createClient(const std::string &topic,
                std::function<void(MosquittoClient *, const std::string &,
-                                  const std::string &, int)>
+                                  const std::vector<uint8_t> &, int)>
                    onMessageCallback) = 0;
   virtual std::optional<std::unique_ptr<MosquittoPublisher>>
   createPublisher(const std::string &topic) = 0;

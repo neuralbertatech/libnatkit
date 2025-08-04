@@ -49,7 +49,7 @@ std::optional<std::unique_ptr<KafkaMosquittoBridge>> KafkaMosquittoBridge::creat
     std::shared_ptr<kafka::BrokerManager> kafkaBroker,
     std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker) {
   auto bridge = std::unique_ptr<KafkaMosquittoBridge>(new KafkaMosquittoBridge(kafkaBroker, mosquittoBroker));
-  const auto mosquittoTopicString = "natKit/#";
+  //const auto mosquittoTopicString = "natKit/#";
   bool wasMosquittoClientCreated = bridge->initMosquittoClient();
   if (wasMosquittoClientCreated) {
     bridge->start();
@@ -85,7 +85,7 @@ void KafkaMosquittoBridge::onKafkaMessageReceived(const std::string &topicName,
 // MQTT message received default callback
 void KafkaMosquittoBridge::onMosquittoMessageReceived(mosquitto::MosquittoClient *,
                                 const std::string &topic,
-                                const std::string &message, int qos) {
+                                const std::vector<uint8_t> &message, int qos) {
     std::cout << "Recieved an MQTT message!\n";
   auto encodedMessage =
       std::make_unique<core::message_t>(message.begin(), message.end());

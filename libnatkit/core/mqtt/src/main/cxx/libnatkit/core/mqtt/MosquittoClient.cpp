@@ -1,4 +1,5 @@
 #include <libnatkit-mqtt.hpp>
+#include <libnatkit-core.hpp>
 
 namespace nat::mosquitto {
 
@@ -17,8 +18,7 @@ std::optional<std::unique_ptr<MosquittoClient>>
 MosquittoClient::create(const std::string &brokerHostname, int brokerPort,
        const std::string &topic,
        const std::optional<onMessageCallback_t>& onMessageCallbackMaybe) {
-  std::unique_ptr<MosquittoClient> mosquittoClient{
-      new MosquittoClient(topic)};
+  std::unique_ptr<MosquittoClient> mosquittoClient{ new MosquittoClient(topic) };
   if (onMessageCallbackMaybe.has_value()) {
     mosquittoClient->setOnMessageCallback(onMessageCallbackMaybe.value());
   }
@@ -65,9 +65,9 @@ void MosquittoClient::handleMessages() {
                    1); // Loop until mosquitto_disconnect is called
 }
 
-void MosquittoClient::addMessageToQueue(const std::string &topic, const std::string &msg) {
+void MosquittoClient::addMessageToQueue(const std::string &topic, const core::message_t &msg) {
   messages.push(
-      std::make_unique<std::pair<std::string, std::string>>(topic, msg));
+      std::make_unique<std::pair<std::string, core::message_t>>(topic, msg));
 }
 
 MosquittoClient *MosquittoClient::convertCallbackObject(void *callbackObj) {
@@ -128,15 +128,23 @@ void MosquittoClient::onMessageHandler(struct mosquitto *clientPtr, void *callba
                              const struct mosquitto_message *message) {
   const auto mosquittoClient = convertCallbackObject(callbackObj);
   const std::string topic{message->topic};
-  const std::string msg{(char *)message->payload};
-  //std::cout << "% Mosquitto Client " << topic << " receivied a message: " << msg << '\n';
+  const size_t messageLength = message->payloadlen;
+  const uint8_t* payload = (uint8_t*)message->payload;
+  core::message_t msg{};
+  msg.reserve(messageLength);
+  for (size_t i = 0; i < messageLength; ++i)
+      msg.push_back(payload[i]);
+  std::cout << "% Mosquitto Client " << topic << " receivied a message: [ ";
+  for (const auto byte : msg)
+      printf("%.2X, ", byte);
+  std::cout << "]\n";
   mosquittoClient->onMessageCallback(mosquittoClient, topic, msg,
                                      message->qos);
 }
 
 void MosquittoClient::defaultOnMessageCallback(MosquittoClient *client,
                                      const std::string &topic,
-                                     const std::string &message, int qos) {
+                                     const core::message_t &message, int qos) {
   /*std::cout << "% Mosquitto client recieved the following message: " << topic
             << " " << qos << " " << message << '\n';*/
   client->addMessageToQueue(topic, message);

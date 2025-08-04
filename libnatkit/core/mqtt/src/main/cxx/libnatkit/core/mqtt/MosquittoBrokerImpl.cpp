@@ -23,7 +23,7 @@ public:
   createClient(
       const std::string &topic,
       std::function<void(MosquittoClient *, const std::string &,
-                         const std::string &, int)>
+                         const std::vector<uint8_t> &, int)>
           onMessageCallback) override {
     return MosquittoClient::create(hostname, port, topic, onMessageCallback);
   }

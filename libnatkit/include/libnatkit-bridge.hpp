@@ -89,7 +89,7 @@ private:
                               std::unique_ptr<core::message_t> &&msg);
   void onMosquittoMessageReceived(mosquitto::MosquittoClient *,
                                   const std::string &topic,
-                                  const std::string &message, int qos);
+                                  const core::message_t &message, int qos);
   void moveKafkaMessagesThreadSafe();
   void moveMosquittoMessagesThreadSafe();
   void sendMosquittoMessagesThreadSafe();

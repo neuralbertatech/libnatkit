@@ -4,8 +4,12 @@ using namespace std::chrono_literals;
 
 namespace nat::kafka {
 
-core::message_t BrokerMessagingQueue::ConsumerCallback::stringToMessageType(const std::string &string) {
-  return core::message_t{string.begin(), string.end()};
+core::message_t BrokerMessagingQueue::ConsumerCallback::payloadToMessageType(const uint8_t* payload, const size_t len) {
+    core::message_t message{};
+    message.reserve(len);
+    for (int i = 0; i < len; ++i)
+        message.push_back(payload[i]);
+    return message;
 }
 
 BrokerMessagingQueue::ConsumerCallback::ConsumerCallback(BrokerMessagingQueue &messagingQueue)
@@ -37,8 +41,8 @@ void BrokerMessagingQueue::ConsumerCallback::consume_cb(RdKafka::Message &msg, v
       }
     }
     messagingQueue.onMessageRecieved(
-        std::make_unique<core::message_t>(stringToMessageType(
-            std::string{static_cast<const char *>(msg.payload())})));
+        std::make_unique<core::message_t>(payloadToMessageType(
+            static_cast<const uint8_t *>(msg.payload()), msg.len())));
     /*printf("%.*s\n", static_cast<int>(msg.len()),
            static_cast<const char *>(msg.payload()));*/
 
