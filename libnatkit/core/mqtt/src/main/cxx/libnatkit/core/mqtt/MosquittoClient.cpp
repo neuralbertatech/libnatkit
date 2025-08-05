@@ -1,8 +1,12 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <libnatkit-mqtt.hpp>
+#include <cerrno>
+#include <cstring>
+
 
 namespace nat::mosquitto {
 
-MosquittoClient::MosquittoClient(const std::string &topic) : topic(topic) {}
+MosquittoClient::MosquittoClient(const std::string &topic) : topic(topic) { }
 
 void MosquittoClient::setOnMessageCallback(onMessageCallback_t callback) { onMessageCallback = callback; }
 
@@ -43,7 +47,8 @@ MosquittoClient::create(const std::string &brokerHostname, int brokerPort,
   if (returnCode != MOSQ_ERR_SUCCESS) {
     mosquitto_destroy(client);
     std::cout << "% Mosquitto client error: "
-              << mosquitto_strerror(returnCode) << '\n';
+              << mosquitto_strerror(returnCode) << "; was (" << returnCode << ") but expected (" << MOSQ_ERR_SUCCESS << ") when connecting to " << brokerHostname << ":" << brokerPort << '\n'
+              << "System error: errno=" << returnCode << ", " << strerror(returnCode) << '\n';
     return {};
   }
 

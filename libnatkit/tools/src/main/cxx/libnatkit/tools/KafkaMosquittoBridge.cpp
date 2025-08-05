@@ -10,8 +10,8 @@ using namespace std::chrono_literals;
 
 #pragma warning(disable : 4996)
 static std::optional<std::string> get_env(const char* env) {
-    auto t = std::getenv(env);
-    if (t) return t;
+    const char* t = std::getenv(env);
+    if (t) return std::string(t);
     else return {};
 }
 
@@ -32,10 +32,10 @@ int main(int argc, char **argv) {
               << "\"\nLIBNATKIT_MQTT_BROKER_PORT=\"" << mqttBrokerPort.value() << "\"\n";
       }
       else {
-          std::cerr << "No arguments passed to the CLI, and the environment variables have not been set. The following environment variables are:\nLIBNATKIT_KAFKA_BROKER_ADDRESS=\"" << kafkaBrokerAddress.value()
-              << "\"\nLIBNATKIT_KAFKA_BROKER_PORT=\"" << kafkaBrokerPort.value()
-              << "\"\nLIBNATKIT_MQTT_BROKER_ADDRESS=\"" << mqttBrokerAddress.value()
-              << "\"\nLIBNATKIT_MQTT_BROKER_PORT=\"" << mqttBrokerPort.value() << "\"\n";
+          std::cerr << "No arguments passed to the CLI, and the environment variables have not been set. The following environment variables are:\nLIBNATKIT_KAFKA_BROKER_ADDRESS=\"" << (kafkaBrokerAddress.has_value() ? kafkaBrokerAddress.value() : "")
+              << "\"\nLIBNATKIT_KAFKA_BROKER_PORT=\"" << (kafkaBrokerPort.has_value() ? kafkaBrokerPort.value() : "")
+              << "\"\nLIBNATKIT_MQTT_BROKER_ADDRESS=\"" << (mqttBrokerAddress.has_value() ? mqttBrokerAddress.value() : "")
+              << "\"\nLIBNATKIT_MQTT_BROKER_PORT=\"" << (mqttBrokerPort.has_value() ? mqttBrokerPort.value() : "") << "\"\n";
           exit(1);
       }
   }
@@ -59,34 +59,38 @@ int main(int argc, char **argv) {
       mqttBrokerPort = splitMosquittoBroker[1];
   }
 
-  auto kafkaBroker =
+  /*auto kafkaBroker =
       nat::kafka::createBrokerManager(kafkaBrokerAddress.value(), kafkaBrokerPort.value());
   auto mosquittoBroker =
-      nat::mosquitto::createMosquittoBroker(mqttBrokerAddress.value(), std::stoi(mqttBrokerPort.value()));
+      nat::mosquitto::createMosquittoBroker(mqttBrokerAddress.value(), std::stoi(mqttBrokerPort.value()));*/
+  auto mosquittoBroker =
+      nat::mosquitto::createMosquittoBroker("localhost", 1883);
+  auto kafkaBroker =
+      nat::kafka::createBrokerManager("localhost", "9092");
   auto bridgeMaybe = nat::bridge::KafkaMosquittoBridge::create(
       nat::util::asShared(std::move(kafkaBroker)),
       nat::util::asShared(std::move(mosquittoBroker)));
 
-  if (!bridgeMaybe.has_value()) {
-    std::cout << "Error: could not create a bridge!\n";
-    return 1;
-  }
+  //if (!bridgeMaybe.has_value()) {
+  //  std::cout << "Error: could not create a bridge!\n";
+  //  return 1;
+  //}
 
-  auto bridge = std::move(bridgeMaybe.value());
-  //int max = 6000;
-  //int current = 0;
-  while (true) {
-    auto messageMaybe = bridge->getNextKafkaMessage();
-    if (messageMaybe.has_value()) {
-      std::string message{messageMaybe.value()->begin(),
-                          messageMaybe.value()->end()};
-      std::cout << "Recieved message from kafka broker: " << message << '\n';
-      //current = 0;
-    } else {
-      //++current;
-      std::this_thread::sleep_for(5ms);
-    }
-  }
+  //auto bridge = std::move(bridgeMaybe.value());
+  ////int max = 6000;
+  ////int current = 0;
+  //while (true) {
+  //  auto messageMaybe = bridge->getNextKafkaMessage();
+  //  if (messageMaybe.has_value()) {
+  //    std::string message{messageMaybe.value()->begin(),
+  //                        messageMaybe.value()->end()};
+  //    std::cout << "Recieved message from kafka broker: " << message << '\n';
+  //    //current = 0;
+  //  } else {
+  //    //++current;
+  //    std::this_thread::sleep_for(5ms);
+  //  }
+  //}
 
   return 0;
 }

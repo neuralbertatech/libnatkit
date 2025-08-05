@@ -29,3 +29,16 @@ target_include_directories(libnatkit-core-mqtt-cxx
 set_property(TARGET libnatkit-core-mqtt-cxx PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS true)
 
 
+if(BUILD_TESTING)
+  set(LIBNATKIT_CORE_MQTT_UNITTEST_CXX_FILES
+  ${LIBNATKIT_CORE_MQTT_ROOT}/unittest/cxx/libnatkit/core/mqtt/MosquittoHelloWorld.cpp
+  )
+
+  add_executable(libnatkit-core-mqtt-unittest-cxx ${LIBNATKIT_CORE_MQTT_UNITTEST_CXX_FILES})
+  add_gtest(libnatkit-core-mqtt-unittest-cxx)
+  target_link_libraries(libnatkit-core-mqtt-unittest-cxx PUBLIC
+    libnatkit-core-mqtt-cxx
+  )
+
+  set_target_properties(libnatkit-core-mqtt-unittest-cxx PROPERTIES LINKER_LANGUAGE CXX)
+endif()

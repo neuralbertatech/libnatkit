@@ -24,5 +24,10 @@ target_include_directories(libnatkit-core-kafka-cxx
   $<BUILD_INTERFACE:${LIBNATKIT_PUBLIC_INCLUDE_DIR}>
   $<INSTALL_INTERFACE:include>
 )
+#target_include_directories(libnatkit-core-kafka-cxx
+#  PUBLIC
+#  $<BUILD_INTERFACE:${LIBRDKAFKA_INCLUDE_DIR}>
+#  $<INSTALL_INTERFACE:include>
+#)
 
 set_property(TARGET libnatkit-core-kafka-cxx PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS true)

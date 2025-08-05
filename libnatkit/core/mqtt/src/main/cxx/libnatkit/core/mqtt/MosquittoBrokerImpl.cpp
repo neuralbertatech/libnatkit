@@ -10,6 +10,7 @@ public:
   MosquittoBrokerImpl(const std::string &hostname, int port)
       : hostname(hostname), port(port) {
     mosquitto_lib_init();
+    std::cout << "Mosquitto Host: " << this->hostname << "\nMosquitto Port: " << this->port << "\n";
   }
 
   ~MosquittoBrokerImpl() { mosquitto_lib_cleanup(); }
@@ -25,6 +26,7 @@ public:
       std::function<void(MosquittoClient *, const std::string &,
                          const std::string &, int)>
           onMessageCallback) override {
+      std::cout << "Mosquitto Client Host: " << hostname << "\nMosquitto Client Port: " << port << "\n";
     return MosquittoClient::create(hostname, port, topic, onMessageCallback);
   }
 

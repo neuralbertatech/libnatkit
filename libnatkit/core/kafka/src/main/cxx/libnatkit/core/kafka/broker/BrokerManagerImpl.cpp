@@ -53,11 +53,12 @@ public:
         conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL)),
         topicConfig(RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC)),
         registry(core::Registry::createDefaultInitalizeRegistry()) {
-    if (conf->set("bootstrap.servers", address + ":" + port, errstr) ==
+    const auto host = address + ":" + port;
+    if (conf->set("bootstrap.servers", host, errstr) ==
         RdKafka::Conf::CONF_OK) {
       connectedToBroker = true;
     } else {
-      std::cout << "Error connecting to broker: " << errstr << '\n';
+      std::cout << "Error connecting to broker (" << host << "): " << errstr << '\n';
     }
     if (conf->set("dr_cb", &ex_dr_cb, errstr) != RdKafka::Conf::CONF_OK) {
       std::cerr << errstr << std::endl;

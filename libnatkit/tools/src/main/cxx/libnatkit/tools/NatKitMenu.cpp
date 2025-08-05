@@ -277,7 +277,7 @@ void simulateNatImu(const std::unique_ptr<nat::kafka::BrokerManager>& manager) {
   for (int i = 0; i < 100; ++i) {
     for (int j = 0; j < 9; ++j)
       imuData[j] = (rand() % 100000) / 1000.0;
-    dataMessenger->sendMessage(nat::core::NatImuDataSchema(rand(), nat::core::NatImuDataSchema::convertIntToSensorAccuracy(rand() % 4), imuData, 13));
+      //dataMessenger->sendMessage(nat::core::NatImuDataSchema(rand(), nat::core::NatImuDataSchema::convertIntToSensorAccuracy(rand() % 4), imuData, 13));
   }
 }
 
