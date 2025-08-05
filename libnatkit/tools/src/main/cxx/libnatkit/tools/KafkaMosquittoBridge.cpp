@@ -59,14 +59,10 @@ int main(int argc, char **argv) {
       mqttBrokerPort = splitMosquittoBroker[1];
   }
 
-  /*auto kafkaBroker =
+  auto kafkaBroker =
       nat::kafka::createBrokerManager(kafkaBrokerAddress.value(), kafkaBrokerPort.value());
   auto mosquittoBroker =
-      nat::mosquitto::createMosquittoBroker(mqttBrokerAddress.value(), std::stoi(mqttBrokerPort.value()));*/
-  auto mosquittoBroker =
-      nat::mosquitto::createMosquittoBroker("localhost", 1883);
-  auto kafkaBroker =
-      nat::kafka::createBrokerManager("localhost", "9092");
+      nat::mosquitto::createMosquittoBroker(mqttBrokerAddress.value(), std::stoi(mqttBrokerPort.value()));
   auto bridgeMaybe = nat::bridge::KafkaMosquittoBridge::create(
       nat::util::asShared(std::move(kafkaBroker)),
       nat::util::asShared(std::move(mosquittoBroker)));
