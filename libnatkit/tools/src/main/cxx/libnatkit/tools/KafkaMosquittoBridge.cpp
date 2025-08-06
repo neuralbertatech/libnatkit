@@ -67,26 +67,26 @@ int main(int argc, char **argv) {
       nat::util::asShared(std::move(kafkaBroker)),
       nat::util::asShared(std::move(mosquittoBroker)));
 
-  //if (!bridgeMaybe.has_value()) {
-  //  std::cout << "Error: could not create a bridge!\n";
-  //  return 1;
-  //}
+  if (!bridgeMaybe.has_value()) {
+    std::cout << "Error: could not create a bridge!\n";
+    return 1;
+  }
 
-  //auto bridge = std::move(bridgeMaybe.value());
-  ////int max = 6000;
-  ////int current = 0;
-  //while (true) {
-  //  auto messageMaybe = bridge->getNextKafkaMessage();
-  //  if (messageMaybe.has_value()) {
-  //    std::string message{messageMaybe.value()->begin(),
-  //                        messageMaybe.value()->end()};
-  //    std::cout << "Recieved message from kafka broker: " << message << '\n';
-  //    //current = 0;
-  //  } else {
-  //    //++current;
-  //    std::this_thread::sleep_for(5ms);
-  //  }
-  //}
+  auto bridge = std::move(bridgeMaybe.value());
+  //int max = 6000;
+  //int current = 0;
+  while (true) {
+    auto messageMaybe = bridge->getNextKafkaMessage();
+    if (messageMaybe.has_value()) {
+      std::string message{messageMaybe.value()->begin(),
+                          messageMaybe.value()->end()};
+      std::cout << "Recieved message from kafka broker: " << message << '\n';
+      //current = 0;
+    } else {
+      //++current;
+      std::this_thread::sleep_for(5ms);
+    }
+  }
 
   return 0;
 }
