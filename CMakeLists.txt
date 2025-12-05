@@ -6,6 +6,10 @@ if (NOT DEFINED LIBNATKIT_ESP_BUILD)
   set(LIBNATKIT_ESP_BUILD OFF CACHE BOOL "Build a subsection of libnatkit for ESP32 devices")
 endif()
 
+if (NOT DEFINED BUILD_NATKIT_BACKEND)
+  set(BUILD_NATKIT_BACKEND OFF CACHE BOOL "Build the backend for natKit")
+endif()
+
 set(CMAKE_VERBOSE_MAKEFILE ON)
 set(LIBNATKIT_PROJECT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(LIBNATKIT_THIRD_PARTY_DIR ${LIBNATKIT_PROJECT_ROOT}/third-party)
@@ -164,7 +168,7 @@ endif()
 set(LIBNATKITCORE_INCLUDE ${LIBNATKITCORE_SRC_DIR}/include)
 
 message("Configuring libnatkit-core with: ${CMAKE_COMMAND} -S ${LIBNATKITCORE_SRC_DIR} -B ${LIBNATKITCORE_BUILD_DIR} -DSTANDARD_BUILD=ON -DCMAKE_INSTALL_PREFIX=${LIBNATKIT_BUILD_ROOT}")
-message("Building libnakit-core with: ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR}")
+message("Building libnakit-core with: ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel ${CMAKE_BUILD_PARALLEL_LEVEL}")
 ExternalProject_Add(libnatkit-core-project
   #GIT_REPOSITORY    https://github.com/neuralbertatech/libnatkit-core
   #GIT_TAG           trunk
@@ -173,7 +177,7 @@ ExternalProject_Add(libnatkit-core-project
   BINARY_DIR        ${LIBNATKITCORE_BUILD_DIR}
   DOWNLOAD_COMMAND  ""
   CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${LIBNATKITCORE_SRC_DIR} -B ${LIBNATKITCORE_BUILD_DIR} -DSTANDARD_BUILD=ON -DCMAKE_INSTALL_PREFIX=${LIBNATKIT_BUILD_ROOT}
-  BUILD_COMMAND     ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR}
+  BUILD_COMMAND     ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel 16
   #INSTALL_COMMAND   ""
   TEST_COMMAND      ""
   BYPRODUCTS        ${LIBNATKITCORE_INCLUDE}/libnatkit-core.hpp 

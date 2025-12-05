@@ -45,14 +45,15 @@ class BrokerManagerImpl : public BrokerManager {
   bool connectedToBroker{false};
   std::shared_ptr<core::Registry> registry;
   mutable std::string errstr;
-  ExampleDeliveryReportCb ex_dr_cb{};
+  std::shared_ptr<ExampleDeliveryReportCb> ex_dr_cb;
 
 public:
   BrokerManagerImpl(const std::string &address, const std::string &port)
       : address(address), port(port),
         conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL)),
         topicConfig(RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC)),
-        registry(core::Registry::createDefaultInitalizeRegistry()) {
+        registry(core::Registry::createDefaultInitalizeRegistry()),
+        ex_dr_cb(std::make_shared<ExampleDeliveryReportCb>()) {
     std::cout << "  [Kafka] Initializing Kafka Broker Manager...\n";
     std::cout << "  [Kafka] Target: " << address << ":" << port << "\n";
     
@@ -69,7 +70,7 @@ public:
     }
     
     std::cout << "  [Kafka] Setting delivery report callback...\n";
-    if (conf->set("dr_cb", &ex_dr_cb, errstr) != RdKafka::Conf::CONF_OK) {
+    if (conf->set("dr_cb", ex_dr_cb.get(), errstr) != RdKafka::Conf::CONF_OK) {
       std::cerr << "  [Kafka] ✗ FATAL: Failed to set delivery callback: " << errstr << std::endl;
       exit(1);
     }

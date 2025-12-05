@@ -41,6 +41,10 @@ void KafkaMosquittoBridge::start() {
       });
   std::cout << "  [Bridge] ✓ Kafka messenger pool created\n";
   
+  // Ensure pool is fully initialized before starting threads
+  std::cout << "  [Bridge] Waiting for pool initialization...\n";
+  std::this_thread::sleep_for(100ms);
+  
   std::cout << "  [Bridge] Starting worker threads:\n";
   std::cout << "  [Bridge]   - Message mover thread...\n";
   messageMover =
@@ -191,7 +195,11 @@ void KafkaMosquittoBridge::sendKafkaMessagesThreadSafe() {
     while (!kafkaBrokerSendingQueue.empty()) {
       auto [topicName, msg] = std::move(kafkaBrokerSendingQueue.front());
       kafkaBrokerSendingQueue.pop();
-      kafkaMessengerPool->sendMessage(topicName, std::move(msg));
+      if (kafkaMessengerPool) {
+        kafkaMessengerPool->sendMessage(topicName, std::move(msg));
+      } else {
+        std::cerr << "Error: Kafka messenger pool is null!\n";
+      }
     }
   }
 }

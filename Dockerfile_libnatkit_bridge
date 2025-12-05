@@ -2,15 +2,23 @@ FROM gcc:14.2-bookworm
 WORKDIR /libnatkit
 
 RUN apt update
-RUN apt install cmake -y
-#RUN apt install dos2unix -y
+RUN apt install cmake gdb -y
 
 COPY . ./
-#RUN find . -type f -print0 | xargs -0 dos2unix
-RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug
 RUN cmake --build build --parallel 16
-#RUN mkdir /cores
-#RUN ulimit -c unlimited
 
-#CMD exec /bin/sh -c "trap : TERM INT; sleep infinity & wait"
-CMD /libnatkit/build/libnatkit/tools/src/libnatkit-kafka-mosquitto-bridge natkit-v0-kafka:9092 mosquitto:1883
+# Enable core dumps for debugging
+RUN mkdir -p /cores
+RUN echo "/cores/core.%e.%p" > /proc/sys/kernel/core_pattern || true
+
+# Install wait-for-it or similar tool to wait for services
+RUN apt install -y netcat-openbsd
+
+CMD sh -c 'echo "Waiting for Kafka..."; \
+    while ! nc -z natkit-v0-kafka 9092; do sleep 1; done; \
+    echo "Waiting for Mosquitto..."; \
+    while ! nc -z mosquitto 1883; do sleep 1; done; \
+    echo "Starting bridge..."; \
+    ulimit -c unlimited; \
+    /libnatkit/build/libnatkit/tools/src/libnatkit-kafka-mosquitto-bridge natkit-v0-kafka:9092 mosquitto:1883'
