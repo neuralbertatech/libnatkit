@@ -16,14 +16,19 @@ static std::optional<std::string> get_env(const char* env) {
 }
 
 int main(int argc, char **argv) {
-    std::cout << "========================================\n";
-    std::cout << "Kafka-Mosquitto Bridge Starting...\n";
-    std::cout << "========================================\n";
-    std::cout << "Argument count: " << argc << "\n";
+    std::cout << std::flush;
+    std::cerr << std::flush;
+    std::cout.sync_with_stdio(true);
+    std::cerr.sync_with_stdio(true);
+    
+    std::cout << "========================================\n" << std::flush;
+    std::cout << "Kafka-Mosquitto Bridge Starting...\n" << std::flush;
+    std::cout << "========================================\n" << std::flush;
+    std::cout << "Argument count: " << argc << "\n" << std::flush;
     for (int i = 0; i < argc; ++i) {
-        std::cout << "  argv[" << i << "]: " << argv[i] << "\n";
+        std::cout << "  argv[" << i << "]: " << argv[i] << "\n" << std::flush;
     }
-    std::cout << "----------------------------------------\n";
+    std::cout << "----------------------------------------\n" << std::flush;
     
     std::optional<std::string> kafkaBrokerAddress{};
     std::optional<std::string> kafkaBrokerPort{};
