@@ -16,6 +16,15 @@ static std::optional<std::string> get_env(const char* env) {
 }
 
 int main(int argc, char **argv) {
+    std::cout << "========================================\n";
+    std::cout << "Kafka-Mosquitto Bridge Starting...\n";
+    std::cout << "========================================\n";
+    std::cout << "Argument count: " << argc << "\n";
+    for (int i = 0; i < argc; ++i) {
+        std::cout << "  argv[" << i << "]: " << argv[i] << "\n";
+    }
+    std::cout << "----------------------------------------\n";
+    
     std::optional<std::string> kafkaBrokerAddress{};
     std::optional<std::string> kafkaBrokerPort{};
     std::optional<std::string> mqttBrokerAddress{};
@@ -59,28 +68,71 @@ int main(int argc, char **argv) {
       mqttBrokerPort = splitMosquittoBroker[1];
   }
 
+  std::cout << "\n========================================\n";
+  std::cout << "Broker Configuration:\n";
+  std::cout << "========================================\n";
+  std::cout << "Kafka Broker: " << kafkaBrokerAddress.value() << ":" << kafkaBrokerPort.value() << "\n";
+  std::cout << "MQTT Broker:  " << mqttBrokerAddress.value() << ":" << mqttBrokerPort.value() << "\n";
+  std::cout << "----------------------------------------\n\n";
+
+  std::cout << "[1/4] Creating Kafka Broker Manager...\n";
   auto kafkaBroker =
       nat::kafka::createBrokerManager(kafkaBrokerAddress.value(), kafkaBrokerPort.value());
+  if (!kafkaBroker) {
+    std::cerr << "FATAL: Failed to create Kafka Broker Manager!\n";
+    return 1;
+  }
+  std::cout << "✓ Kafka Broker Manager created\n";
+  std::cout << "  Connection status: " << (kafkaBroker->isConnected() ? "CONNECTED" : "NOT CONNECTED") << "\n\n";
+
+  std::cout << "[2/4] Creating Mosquitto Broker...\n";
   auto mosquittoBroker =
       nat::mosquitto::createMosquittoBroker(mqttBrokerAddress.value(), std::stoi(mqttBrokerPort.value()));
+  if (!mosquittoBroker) {
+    std::cerr << "FATAL: Failed to create Mosquitto Broker!\n";
+    return 1;
+  }
+  std::cout << "✓ Mosquitto Broker created\n\n";
+
+  std::cout << "[3/4] Creating Kafka-Mosquitto Bridge...\n";
+  std::cout << "  This will attempt to connect to both brokers...\n";
   auto bridgeMaybe = nat::bridge::KafkaMosquittoBridge::create(
       nat::util::asShared(std::move(kafkaBroker)),
       nat::util::asShared(std::move(mosquittoBroker)));
 
   if (!bridgeMaybe.has_value()) {
-    std::cout << "Error: could not create a bridge!\n";
+    std::cerr << "\n========================================\n";
+    std::cerr << "FATAL ERROR: Bridge Creation Failed\n";
+    std::cerr << "========================================\n";
+    std::cerr << "The bridge could not be created. Common causes:\n";
+    std::cerr << "  1. Mosquitto broker is not reachable\n";
+    std::cerr << "  2. Mosquitto broker refused the connection\n";
+    std::cerr << "  3. Network connectivity issues\n";
+    std::cerr << "  4. Broker services not yet ready\n";
+    std::cerr << "\nPlease check the error messages above for details.\n";
+    std::cerr << "========================================\n";
     return 1;
   }
+  std::cout << "✓ Bridge created successfully!\n\n";
 
   auto bridge = std::move(bridgeMaybe.value());
+  
+  std::cout << "[4/4] Starting message loop...\n";
+  std::cout << "========================================\n";
+  std::cout << "Bridge is now running!\n";
+  std::cout << "Listening for messages on both brokers...\n";
+  std::cout << "========================================\n\n";
+  
   //int max = 6000;
   //int current = 0;
+  int messageCount = 0;
   while (true) {
     auto messageMaybe = bridge->getNextKafkaMessage();
     if (messageMaybe.has_value()) {
+      messageCount++;
       std::string message{messageMaybe.value()->begin(),
                           messageMaybe.value()->end()};
-      std::cout << "Recieved message from kafka broker: " << message << '\n';
+      std::cout << "[Message #" << messageCount << "] Received from Kafka broker: " << message << '\n';
       //current = 0;
     } else {
       //++current;
@@ -88,5 +140,6 @@ int main(int argc, char **argv) {
     }
   }
 
+  std::cout << "\nBridge shutting down...\n";
   return 0;
 }

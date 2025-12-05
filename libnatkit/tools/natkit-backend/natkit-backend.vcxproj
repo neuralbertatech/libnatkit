@@ -18,11 +18,28 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\src\main\cxx\libnatkit\tools\NatKitBackend.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\core\kafka\libnatkit-core-kafka\libnatkit-core-kafka.vcxproj">
+      <Project>{88f22f2d-e275-4af4-a6ff-3b9ebfdeba6c}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\..\include\libnatkit-public\libnatkit-public.vcxproj">
+      <Project>{0547ba69-3f70-4b5d-84bd-eecd06d7d207}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\..\libnatkit-core\libnatkit-core.vcxproj">
+      <Project>{7e5b0cec-69d8-4b2d-85d7-3f8ccf409a32}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\..\util\libnatkit-util\libnatkit-util.vcxproj">
+      <Project>{a79a33db-5194-47d8-a681-2fe4fc09a774}</Project>
+    </ProjectReference>
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{0547ba69-3f70-4b5d-84bd-eecd06d7d207}</ProjectGuid>
-    <RootNamespace>libnatkitpublic</RootNamespace>
+    <ProjectGuid>{d58696b0-db7c-453b-b233-1fb3c790a8f4}</ProjectGuid>
+    <RootNamespace>natkitbackend</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -70,12 +87,6 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <PublicIncludeDirectories>C:\Users\zach\sync\code\libnatkit\libnatkit\include;$(PublicIncludeDirectories)</PublicIncludeDirectories>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <AllProjectIncludesArePublic>true</AllProjectIncludesArePublic>
-  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -111,6 +122,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)..\third-party\nlohmann\include;$(SolutionDir)..\libnatkit\include;$(SolutionDir)..\lib\libnatkit-core\include;$(SolutionDir)..\libnatkit\util\src\main\cxx;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -125,21 +137,16 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)..\third-party\nlohmann\include;$(SolutionDir)..\libnatkit\include;$(SolutionDir)..\lib\libnatkit-core\include;$(SolutionDir)..\libnatkit\util\src\main\cxx;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <ClInclude Include="..\libnatkit-bridge.hpp" />
-    <ClInclude Include="..\libnatkit-kafka.hpp" />
-    <ClInclude Include="..\libnatkit-mqtt.hpp" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <ImportGroup Label="ExtensionTargets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
 </Project>

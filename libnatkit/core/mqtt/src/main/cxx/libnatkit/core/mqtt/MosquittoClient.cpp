@@ -21,39 +21,66 @@ std::optional<std::unique_ptr<MosquittoClient>>
 MosquittoClient::create(const std::string &brokerHostname, int brokerPort,
        const std::string &topic,
        const std::optional<onMessageCallback_t>& onMessageCallbackMaybe) {
+  std::cout << "    [MQTT Client] Creating new client instance...\n";
+  std::cout << "    [MQTT Client] Topic: " << topic << "\n";
+  
   std::unique_ptr<MosquittoClient> mosquittoClient{
       new MosquittoClient(topic)};
   if (onMessageCallbackMaybe.has_value()) {
+    std::cout << "    [MQTT Client] Setting custom message callback\n";
     mosquittoClient->setOnMessageCallback(onMessageCallbackMaybe.value());
+  } else {
+    std::cout << "    [MQTT Client] Using default message callback\n";
   }
+  
   char *id{nullptr};
   bool cleanSession{true};
   void *callbackObj{convertCallbackObject(mosquittoClient.get())};
 
+  std::cout << "    [MQTT Client] Creating mosquitto instance...\n";
   struct mosquitto *client = mosquitto_new(id, cleanSession, callbackObj);
   if (client == nullptr) {
     // Out of memory
-    std::cout << "% Mosquitto client error: out of memory" << '\n';
+    std::cout << "    [MQTT Client] ✗ FATAL: Out of memory!\n";
     return {};
   }
+  std::cout << "    [MQTT Client] ✓ Mosquitto instance created\n";
 
+  std::cout << "    [MQTT Client] Setting callbacks...\n";
   mosquitto_connect_callback_set(client, defaultOnConnect);
   mosquitto_subscribe_callback_set(client, defaultOnSubscribe);
   mosquitto_message_callback_set(client, onMessageHandler);
+  std::cout << "    [MQTT Client] ✓ Callbacks set\n";
 
   int keepAlive = 60;
+  std::cout << "    [MQTT Client] Attempting to connect to " << brokerHostname << ":" << brokerPort << "...\n";
+  std::cout << "    [MQTT Client] Keep-alive: " << keepAlive << " seconds\n";
+  std::cout << "    [MQTT Client] Mosquitto version: " << LIBMOSQUITTO_MAJOR << "." << LIBMOSQUITTO_MINOR << "." << LIBMOSQUITTO_REVISION << "\n";
+  
   int returnCode = mosquitto_connect(client, brokerHostname.c_str(),
                                      brokerPort, keepAlive);
+  
   if (returnCode != MOSQ_ERR_SUCCESS) {
     mosquitto_destroy(client);
-    std::cout << "% Mosquitto client error: "
-              << mosquitto_strerror(returnCode) << "; was (" << returnCode << ") but expected (" << MOSQ_ERR_SUCCESS << ") when connecting to " << brokerHostname << ":" << brokerPort << '\n'
-              << "System error: errno=" << returnCode << ", " << strerror(returnCode) << '\n';
+    std::cout << "    [MQTT Client] ✗ CONNECTION FAILED!\n";
+    std::cout << "    [MQTT Client] Error code: " << returnCode << " (expected " << MOSQ_ERR_SUCCESS << ")\n";
+    std::cout << "    [MQTT Client] Error message: " << mosquitto_strerror(returnCode) << "\n";
+    std::cout << "    [MQTT Client] Target: " << brokerHostname << ":" << brokerPort << "\n";
+    std::cout << "    [MQTT Client] System errno: " << errno << " (" << strerror(errno) << ")\n";
+    std::cout << "    [MQTT Client] \n";
+    std::cout << "    [MQTT Client] Possible causes:\n";
+    std::cout << "    [MQTT Client]   - Broker is not running\n";
+    std::cout << "    [MQTT Client]   - Hostname cannot be resolved\n";
+    std::cout << "    [MQTT Client]   - Port is blocked or incorrect\n";
+    std::cout << "    [MQTT Client]   - Network connectivity issues\n";
     return {};
   }
 
+  std::cout << "    [MQTT Client] ✓ Successfully connected to broker!\n";
   mosquittoClient->init(client);
+  std::cout << "    [MQTT Client] Starting message handler thread...\n";
   mosquittoClient->start();
+  std::cout << "    [MQTT Client] ✓ Client ready\n";
   return mosquittoClient;
 }
 

@@ -9,8 +9,14 @@ class MosquittoBrokerImpl : public MosquittoBroker {
 public:
   MosquittoBrokerImpl(const std::string &hostname, int port)
       : hostname(hostname), port(port) {
-    mosquitto_lib_init();
-    std::cout << "Mosquitto Host: " << this->hostname << "\nMosquitto Port: " << this->port << "\n";
+    std::cout << "  [MQTT] Initializing Mosquitto library...\n";
+    int init_result = mosquitto_lib_init();
+    if (init_result == MOSQ_ERR_SUCCESS) {
+      std::cout << "  [MQTT] ✓ Mosquitto library initialized\n";
+    } else {
+      std::cout << "  [MQTT] ✗ Mosquitto library init failed: " << init_result << "\n";
+    }
+    std::cout << "  [MQTT] Target: " << this->hostname << ":" << this->port << "\n";
   }
 
   ~MosquittoBrokerImpl() { mosquitto_lib_cleanup(); }
@@ -26,7 +32,8 @@ public:
       std::function<void(MosquittoClient *, const std::string &,
                          const std::string &, int)>
           onMessageCallback) override {
-      std::cout << "Mosquitto Client Host: " << hostname << "\nMosquitto Client Port: " << port << "\n";
+      std::cout << "  [MQTT] Creating client for topic: " << topic << "\n";
+      std::cout << "  [MQTT] Connecting to: " << hostname << ":" << port << "\n";
     return MosquittoClient::create(hostname, port, topic, onMessageCallback);
   }
 

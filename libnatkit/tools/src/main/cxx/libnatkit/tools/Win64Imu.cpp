@@ -1,3 +1,4 @@
+/*
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -535,11 +536,11 @@ class Config {
                 }
             }
         }
-        /*std::vector<ImuConfig> imus = json["imu"].template get<std::vector<ImuConfig>>();
-        for (const auto& imu : imus) {
-            ids.insert(imu.id);
-            idNames.insert({ imu.id, imu.name });
-        }*/
+        // std::vector<ImuConfig> imus = json["imu"].template get<std::vector<ImuConfig>>();
+        // for (const auto& imu : imus) {
+        //     ids.insert(imu.id);
+        //     idNames.insert({ imu.id, imu.name });
+        // }
     }
 
 public:
@@ -732,9 +733,9 @@ MenuOptions getMenuOption(ImuTuiWindow& window) {
             if (showCommand)
                 menuOptions.emplace_back(option);
         }
-        /*globalKeyListener.clearBuffer();
-        menuOptions.append("Enter an option: ");
-        TerminalScreen::drawToScreen(menuOptions);*/
+        // globalKeyListener.clearBuffer();
+        // menuOptions.append("Enter an option: ");
+        // TerminalScreen::drawToScreen(menuOptions);
         window.setCommands(menuOptions);
         window.draw();
         while (!globalKeyListener->haveAnyKeysBeenPressed()) std::this_thread::sleep_for(10ms);
@@ -939,9 +940,9 @@ void readTopic(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTui
 }
 
 void streamToFile(const std::unique_ptr<nat::kafka::BrokerManager>& manager, ImuTuiWindow& window) {
-    /*window.addOutput("Enter a name for the file: ");
-    std::string filename;
-    std::getline(std::cin, filename);*/
+    // window.addOutput("Enter a name for the file: ");
+    // std::string filename;
+    // std::getline(std::cin, filename);
     std::string filename = window.interactiveInput("Enter a name for the file", *globalKeyListener);
     const std::shared_ptr<nat::core::BasicTopicInformation> topic = promptUserToChooseTopic(manager);
     std::ofstream file;
@@ -1081,3 +1082,9 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+//*/
+
+int main(int argc, char** argv) {
+    return 0;
+}
+

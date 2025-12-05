@@ -56,5 +56,8 @@
     <ClCompile Include="..\..\lib\libnatkit-core\src\NatImuDataSchema.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\lib\libnatkit-core\src\NatImuBulkDataSchema.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

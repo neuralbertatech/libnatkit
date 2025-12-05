@@ -53,24 +53,33 @@ public:
         conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL)),
         topicConfig(RdKafka::Conf::create(RdKafka::Conf::CONF_TOPIC)),
         registry(core::Registry::createDefaultInitalizeRegistry()) {
+    std::cout << "  [Kafka] Initializing Kafka Broker Manager...\n";
+    std::cout << "  [Kafka] Target: " << address << ":" << port << "\n";
+    
     const auto host = address + ":" + port;
+    std::cout << "  [Kafka] Setting bootstrap.servers to: " << host << "\n";
+    
     if (conf->set("bootstrap.servers", host, errstr) ==
         RdKafka::Conf::CONF_OK) {
       connectedToBroker = true;
+      std::cout << "  [Kafka] ✓ Configuration accepted\n";
+      std::cout << "  [Kafka] Note: Actual connection happens lazily on first use\n";
     } else {
-      std::cout << "Error connecting to broker (" << host << "): " << errstr << '\n';
+      std::cout << "  [Kafka] ✗ Error setting broker configuration: " << errstr << '\n';
     }
+    
+    std::cout << "  [Kafka] Setting delivery report callback...\n";
     if (conf->set("dr_cb", &ex_dr_cb, errstr) != RdKafka::Conf::CONF_OK) {
-      std::cerr << errstr << std::endl;
+      std::cerr << "  [Kafka] ✗ FATAL: Failed to set delivery callback: " << errstr << std::endl;
       exit(1);
     }
-
+    std::cout << "  [Kafka] ✓ Delivery report callback set\n";
   }
 
   virtual bool isConnected() const override { return connectedToBroker; }
 
   virtual std::shared_ptr<RdKafka::Producer> createProducer() const override {
-    const std::shared_ptr<RdKafka::Producer> producer(
+    std::shared_ptr<RdKafka::Producer> producer(
         RdKafka::Producer::create(conf.get(), errstr));
     if (!producer) {
       std::cout << "Error creating producer: " << errstr << '\n';
@@ -79,7 +88,7 @@ public:
   }
 
   virtual std::shared_ptr<RdKafka::Consumer> createConsumer() const override {
-    const std::shared_ptr<RdKafka::Consumer> consumer(
+    std::shared_ptr<RdKafka::Consumer> consumer(
         RdKafka::Consumer::create(conf.get(), errstr));
     if (!consumer) {
       std::cout << "Error creating consumer: " << errstr << '\n';

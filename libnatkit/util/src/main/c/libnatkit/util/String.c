@@ -1,7 +1,7 @@
 #include <libnatkit/util/String.h>
 
 char* cloneCharPtr(const char* string) {
-    int stringLen = strlen(string);
+    size_t stringLen = strlen(string);
     char* clonedString = (char*)malloc(sizeof(char) * (stringLen + 1));
     strcpy(clonedString, string);
     clonedString[stringLen] = '\0';

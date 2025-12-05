@@ -143,6 +143,7 @@
     <ClCompile Include="..\..\lib\libnatkit-core\src\BasicTopicInformation.cpp" />
     <ClCompile Include="..\..\lib\libnatkit-core\src\JsonDecoder.cpp" />
     <ClCompile Include="..\..\lib\libnatkit-core\src\JsonEncoder.cpp" />
+    <ClCompile Include="..\..\lib\libnatkit-core\src\NatImuBulkDataSchema.cpp" />
     <ClCompile Include="..\..\lib\libnatkit-core\src\NatImuDataSchema.cpp" />
     <ClCompile Include="..\..\lib\libnatkit-core\src\RawStream.cpp" />
     <ClCompile Include="..\..\lib\libnatkit-core\src\Registry.cpp" />

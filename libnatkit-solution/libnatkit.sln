@@ -1,4 +1,3 @@
-
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.10.34928.147
@@ -41,13 +40,19 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Win64-Imu-Application", "Wi
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libnatkit-util-c", "..\libnatkit\util\libnatkit-util-c\libnatkit-util-c.vcxproj", "{7634414E-1482-472F-BD8C-E4F81D3FDDD1}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libnatkit-util-unittest-c", "..\libnatkit\util\libnatkit-util-unittest-c\libnatkit-util-unittest-c.vcxproj", "{B23BEC15-053E-4194-97B8-0D5273BB65A2}"
-EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libnatkit-util-unittest", "..\libnatkit\util\libnatkit-util-unittest\libnatkit-util-unittest.vcxproj", "{01B318E7-6898-4C85-8475-0745F8430871}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libnatkit-core-mqtt-unittest", "..\libnatkit\core\mqtt\libnatkit-core-mqtt-unittest\libnatkit-core-mqtt-unittest.vcxproj", "{ECFDC9DC-A7EE-4003-B20B-CD836D531C60}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libnatkit-core-bridge-unittest", "..\libnatkit\core\bridge\libnatkit-core-bridge-unittest\libnatkit-core-bridge-unittest.vcxproj", "{BA80689A-09B5-469C-9F49-7B17E2E8F556}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "natkit-backend", "..\libnatkit\tools\natkit-backend\natkit-backend.vcxproj", "{D58696B0-DB7C-453B-B233-1FB3C790A8F4}"
+	ProjectSection(ProjectDependencies) = postProject
+		{0547BA69-3F70-4B5D-84BD-EECD06D7D207} = {0547BA69-3F70-4B5D-84BD-EECD06D7D207}
+		{7E5B0CEC-69D8-4B2D-85D7-3F8CCF409A32} = {7E5B0CEC-69D8-4B2D-85D7-3F8CCF409A32}
+		{88F22F2D-E275-4AF4-A6FF-3B9EBFDEBA6C} = {88F22F2D-E275-4AF4-A6FF-3B9EBFDEBA6C}
+		{A79A33DB-5194-47D8-A681-2FE4FC09A774} = {A79A33DB-5194-47D8-A681-2FE4FC09A774}
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -152,14 +157,6 @@ Global
 		{7634414E-1482-472F-BD8C-E4F81D3FDDD1}.Release|x64.Build.0 = Release|x64
 		{7634414E-1482-472F-BD8C-E4F81D3FDDD1}.Release|x86.ActiveCfg = Release|Win32
 		{7634414E-1482-472F-BD8C-E4F81D3FDDD1}.Release|x86.Build.0 = Release|Win32
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Debug|x64.ActiveCfg = Debug|x64
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Debug|x64.Build.0 = Debug|x64
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Debug|x86.ActiveCfg = Debug|Win32
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Debug|x86.Build.0 = Debug|Win32
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Release|x64.ActiveCfg = Release|x64
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Release|x64.Build.0 = Release|x64
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Release|x86.ActiveCfg = Release|Win32
-		{B23BEC15-053E-4194-97B8-0D5273BB65A2}.Release|x86.Build.0 = Release|Win32
 		{01B318E7-6898-4C85-8475-0745F8430871}.Debug|x64.ActiveCfg = Debug|x64
 		{01B318E7-6898-4C85-8475-0745F8430871}.Debug|x64.Build.0 = Debug|x64
 		{01B318E7-6898-4C85-8475-0745F8430871}.Debug|x86.ActiveCfg = Debug|Win32
@@ -184,6 +181,14 @@ Global
 		{BA80689A-09B5-469C-9F49-7B17E2E8F556}.Release|x64.Build.0 = Release|x64
 		{BA80689A-09B5-469C-9F49-7B17E2E8F556}.Release|x86.ActiveCfg = Release|Win32
 		{BA80689A-09B5-469C-9F49-7B17E2E8F556}.Release|x86.Build.0 = Release|Win32
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Debug|x64.ActiveCfg = Debug|x64
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Debug|x64.Build.0 = Debug|x64
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Debug|x86.ActiveCfg = Debug|Win32
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Debug|x86.Build.0 = Debug|Win32
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Release|x64.ActiveCfg = Release|x64
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Release|x64.Build.0 = Release|x64
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Release|x86.ActiveCfg = Release|Win32
+		{D58696B0-DB7C-453B-B233-1FB3C790A8F4}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

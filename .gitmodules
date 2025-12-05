@@ -16,3 +16,6 @@
 [submodule "third-party/libnatkit-core"]
 	path = third-party/libnatkit-core
 	url = https://github.com/neuralbertatech/libnatkit-core
+[submodule "third-party/drogon"]
+	path = third-party/drogon
+	url = https://github.com/drogonframework/drogon.git

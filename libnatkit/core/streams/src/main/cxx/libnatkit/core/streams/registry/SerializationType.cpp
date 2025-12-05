@@ -12,7 +12,7 @@ SerializationType getSerializationType(const std::string& encoderName) {
   }
 
   std::cout << "Fatal Error: Invalid serialization type '" << encoderName << "'" << std::endl;
-  assert(0);
+  exit(1);
 }
 
 std::string toString(const SerializationType& serializationType) {

@@ -15,32 +15,43 @@ KafkaMosquittoBridge::KafkaMosquittoBridge(
 
 // Sets up the MQTT client to write messages recieved to the recieving queue.
 bool KafkaMosquittoBridge::initMosquittoClient() {
+  std::cout << "  [Bridge] Requesting Mosquitto client from broker...\n";
   auto clientMaybe = mosquittoBroker->createClient(
       "natKit/sending/#",
       [this](auto *client, const auto &topic, const auto &message, auto qos) {
         this->onMosquittoMessageReceived(client, topic, message, qos);
       });
   if (clientMaybe.has_value()) {
+    std::cout << "  [Bridge] ✓ Mosquitto client created\n";
     mosquittoClient = std::move(clientMaybe.value());
     return true;
   } else {
-    std::cout << "Failed to create mosquitto client!\n";
+    std::cout << "  [Bridge] ✗ Failed to create Mosquitto client!\n";
+    std::cout << "  [Bridge] This usually indicates the MQTT broker connection failed\n";
     return false;
   }
 }
 
 // Start all threads from sending and recieving data.
 void KafkaMosquittoBridge::start() {
+  std::cout << "  [Bridge] Creating Kafka messenger pool...\n";
   kafkaMessengerPool = std::make_unique<KafkaMessengerPool>(
       kafkaBroker, [this](const auto &topicName, auto &&msg) {
         onKafkaMessageReceived(topicName, std::move(msg));
       });
+  std::cout << "  [Bridge] ✓ Kafka messenger pool created\n";
+  
+  std::cout << "  [Bridge] Starting worker threads:\n";
+  std::cout << "  [Bridge]   - Message mover thread...\n";
   messageMover =
       std::jthread(&KafkaMosquittoBridge::messageMoverDaemonThreadSafe, this);
+  std::cout << "  [Bridge]   - Kafka message sender thread...\n";
   kafkaMessageSender = std::jthread(
       &KafkaMosquittoBridge::kafkaMessageSendingDaemonThreadSafe, this);
+  std::cout << "  [Bridge]   - Mosquitto message sender thread...\n";
   mosquittoMessageSender = std::jthread(
       &KafkaMosquittoBridge::mosquittoMessageSendingDaemonThreadSafe, this);
+  std::cout << "  [Bridge] ✓ All worker threads started\n";
 }
 
 KafkaMosquittoBridge::~KafkaMosquittoBridge() { running = false; }
@@ -48,13 +59,23 @@ KafkaMosquittoBridge::~KafkaMosquittoBridge() { running = false; }
 std::optional<std::unique_ptr<KafkaMosquittoBridge>> KafkaMosquittoBridge::create(
     std::shared_ptr<kafka::BrokerManager> kafkaBroker,
     std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker) {
+  std::cout << "  [Bridge] Creating bridge instance...\n";
   auto bridge = std::unique_ptr<KafkaMosquittoBridge>(new KafkaMosquittoBridge(kafkaBroker, mosquittoBroker));
+  
   const auto mosquittoTopicString = "natKit/#";
+  std::cout << "  [Bridge] Initializing Mosquitto client...\n";
+  std::cout << "  [Bridge] Subscribing to topic: " << mosquittoTopicString << "\n";
+  
   bool wasMosquittoClientCreated = bridge->initMosquittoClient();
   if (wasMosquittoClientCreated) {
+    std::cout << "  [Bridge] ✓ Mosquitto client initialized successfully\n";
+    std::cout << "  [Bridge] Starting bridge threads...\n";
     bridge->start();
+    std::cout << "  [Bridge] ✓ Bridge threads started\n";
     return std::move(bridge);
   } else {
+    std::cout << "  [Bridge] ✗ Failed to initialize Mosquitto client\n";
+    std::cout << "  [Bridge] Bridge creation aborted\n";
     return {};
   }
 }
