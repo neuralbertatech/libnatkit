@@ -160,7 +160,8 @@ void MosquittoClient::onMessageHandler(struct mosquitto *clientPtr, void *callba
                              const struct mosquitto_message *message) {
   const auto mosquittoClient = convertCallbackObject(callbackObj);
   const std::string topic{message->topic};
-  const std::string msg{(char *)message->payload};
+  // Use payloadlen to properly handle binary data with null bytes
+  const std::string msg{static_cast<char*>(message->payload), static_cast<size_t>(message->payloadlen)};
   //std::cout << "% Mosquitto Client " << topic << " receivied a message: " << msg << '\n';
   mosquittoClient->onMessageCallback(mosquittoClient, topic, msg,
                                      message->qos);

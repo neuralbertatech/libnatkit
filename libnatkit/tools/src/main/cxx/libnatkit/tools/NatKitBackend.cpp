@@ -10,6 +10,9 @@
 #include <set>
 #include <stdlib.h>
 #include <thread>
+#include <random>
+#include <sstream>
+#include <iomanip>
 
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
@@ -26,6 +29,60 @@
 
 using namespace drogon;
 using namespace std::chrono_literals;
+
+// Simple UUID generator for session IDs
+std::string generate_uuid() {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+    static const char* hex = "0123456789abcdef";
+
+    std::stringstream ss;
+    for (int i = 0; i < 32; ++i) {
+        if (i == 8 || i == 12 || i == 16 || i == 20) {
+            ss << '-';
+        }
+        ss << hex[dis(gen)];
+    }
+    return ss.str();
+}
+
+// Structure to hold a marker event
+struct Marker {
+    std::string marker_type;  // task_start, task_end, session_start, session_end
+    std::string task_id;      // e.g., "drink_cup"
+    uint64_t timestamp;       // milliseconds since epoch
+    std::string session_id;
+};
+
+// Structure to hold IMU data sample
+struct ImuSample {
+    uint64_t timestamp;
+    uint64_t stream_id;
+    std::string sensor_position;
+    float quat_i, quat_j, quat_k, quat_real;
+    float accel_x, accel_y, accel_z;
+    float gyro_x, gyro_y, gyro_z;
+    float gravity_x, gravity_y, gravity_z;
+};
+
+// Recording session state
+struct RecordingSession {
+    std::string session_id;
+    std::atomic<bool> is_recording{false};
+    uint64_t start_time = 0;
+    std::vector<Marker> markers;
+    std::vector<ImuSample> samples;
+    std::map<uint64_t, std::string> stream_position_mapping;  // stream_id -> sensor_position
+    std::mutex mutex;
+    
+    // Delete copy operations since mutex is not copyable
+    RecordingSession() = default;
+    RecordingSession(const RecordingSession&) = delete;
+    RecordingSession& operator=(const RecordingSession&) = delete;
+    RecordingSession(RecordingSession&&) = delete;
+    RecordingSession& operator=(RecordingSession&&) = delete;
+};
 
 class Config {
     std::vector<std::string> ids{};
@@ -170,7 +227,8 @@ public:
         {
             auto resp = drogon::HttpResponse::newHttpResponse();
             // Add headers to the response to tell the browser it's safe
-            resp->addHeader("Access-Control-Allow-Origin", "http://localhost:5175");
+            // Allow any localhost port for development
+            resp->addHeader("Access-Control-Allow-Origin", req->getHeader("Origin"));
             resp->addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
             resp->addHeader("Access-Control-Allow-Headers", "Content-Type");
             resp->addHeader("Access-Control-Max-Age", "3600");
@@ -191,6 +249,9 @@ class ApiController : public drogon::HttpController<ApiController, false> {
     Config config;
     std::unique_ptr<nat::kafka::BrokerManager> manager;
     std::optional<std::vector<std::unique_ptr<nat::core::TopicMessenger>>> imuStreams;
+    std::unique_ptr<RecordingSession> recording_session;
+    std::thread recording_thread;
+    std::atomic<bool> stop_recording_thread{false};
 
     void set_imu_streams(const std::set<uint64_t>& stream_ids) {
         auto rawStreams = manager->getAllStreams();
@@ -207,7 +268,7 @@ class ApiController : public drogon::HttpController<ApiController, false> {
         }
 
         if (new_imu_streams.size() > 0) {
-            imuStreams = new_imu_streams;
+            imuStreams = std::move(new_imu_streams);
         }
     }
 
@@ -221,10 +282,14 @@ public:
     METHOD_ADD(ApiController::get_all_streams, "/api/get_all_streams", Get);
     METHOD_ADD(ApiController::set_streams, "/api/set_streams", Post);
     METHOD_ADD(ApiController::start_calibration, "/api/start_calibration", Post);
+    METHOD_ADD(ApiController::start_recording, "/api/start_recording", Post);
+    METHOD_ADD(ApiController::stop_recording, "/api/stop_recording", Post);
+    METHOD_ADD(ApiController::insert_marker, "/api/insert_marker", Post);
+    METHOD_ADD(ApiController::get_session_data, "/api/get_session_data", Get);
     METHOD_LIST_END
 
     ApiController(std::unique_ptr<nat::kafka::BrokerManager> manager, Config config)
-        : manager(std::move(manager)), config(config) {}
+        : manager(std::move(manager)), config(config), recording_session(std::make_unique<RecordingSession>()) {}
 
     // Handler for GET /api/heartbeat
     // A simple health check endpoint.
@@ -260,16 +325,64 @@ public:
         }
     }
 
+    // Helper to extract accuracy from a single NatImuDataSchema
+    int getAccuracyFromImuData(nat::core::NatImuDataSchema* imuData) {
+        if (imuData == nullptr) return 0;
+        int accelAcc = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+            imuData->getAccelerationAccuracy());
+        int gyroAcc = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+            imuData->getGyroscopeAccuracy());
+        int rotAcc = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+            imuData->getRotationAccuracy());
+        // Use the minimum accuracy as the overall accuracy
+        int accuracy = accelAcc;
+        if (gyroAcc < accuracy) accuracy = gyroAcc;
+        if (rotAcc < accuracy) accuracy = rotAcc;
+        return accuracy;
+    }
+
     // Handler for GET /api/get_accuracies
-    // Stubs a request to get accuracy metrics.
+    // Returns calibration accuracy for each selected stream.
+    // Values: 0=Unreliable, 1=Low, 2=Medium, 3=High
     void get_accuracies(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
     {
-        
-        // TODO: Implement logic to fetch and calculate accuracies.
         Json::Value resp_json;
-        resp_json["model_a"] = 0.95;
-        resp_json["model_b"] = 0.91;
-        resp_json["overall"] = 0.93;
+        Json::Value accuracies_json;
+        
+        // Read actual accuracy from each IMU stream
+        if (imuStreams.has_value()) {
+            for (auto& stream : imuStreams.value()) {
+                uint64_t id = stream->getId();
+                int accuracy = 0; // Default to Unreliable
+                
+                // Try to get the latest message from the stream
+                nat::core::Optional<std::unique_ptr<nat::core::Schema>> messageMaybe = stream->tryGetNexMessage();
+                if (messageMaybe.has_value()) {
+                    std::unique_ptr<nat::core::Schema> message = std::move(messageMaybe.value());
+                    
+                    // Try to cast to NatImuDataSchema first
+                    nat::core::NatImuDataSchema* imuData = dynamic_cast<nat::core::NatImuDataSchema*>(message.get());
+                    if (imuData != nullptr) {
+                        accuracy = getAccuracyFromImuData(imuData);
+                    } else {
+                        // Try to cast to NatImuBulkDataSchema (bulk data)
+                        nat::core::NatImuBulkDataSchema* bulkData = dynamic_cast<nat::core::NatImuBulkDataSchema*>(message.get());
+                        if (bulkData != nullptr) {
+                            // Get the records and use the last one for accuracy
+                            std::unique_ptr<std::vector<nat::core::NatImuDataSchema>> records = bulkData->createImuRecords();
+                            if (records && !records->empty()) {
+                                // Use the last record's accuracy (most recent)
+                                accuracy = getAccuracyFromImuData(&records->back());
+                            }
+                        }
+                    }
+                }
+                
+                accuracies_json[std::to_string(id)] = accuracy;
+            }
+        }
+        
+        resp_json["accuracies"] = accuracies_json;
         auto resp = HttpResponse::newHttpJsonResponse(resp_json);
         resp->setStatusCode(drogon::HttpStatusCode::k200OK);
         resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
@@ -280,35 +393,56 @@ public:
     // Stubs a request to list all available data streams.
     void get_all_streams(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
     {
-        auto topicStrings = manager->getAllTopicStrings();
-        auto rawStreams = manager->getAllStreams();
-        Json::Value json;
-        for (const auto& stream : rawStreams) {
-            auto id = stream->getId();
-            auto dataTopics = stream->getTopicsByType(nat::core::StreamType::DATA);
-            auto metaTopics = stream->getTopicsByType(nat::core::StreamType::META);
-            Json::Value topics;
-            for (const auto& dataTopic : dataTopics) {
-                Json::Value topic;
-                topic["schema_name"] = dataTopic->schemaName;
-                topic["type"] = toString(dataTopic->type);
-                topic["serialization_type"] = toString(dataTopic->serializationType);
-                topics.append(topic);
-            }
-            for (const auto& metaTopic : metaTopics) {
-                Json::Value topic;
-                topic["schema_name"] = metaTopic->schemaName;
-                topic["type"] = toString(metaTopic->type);
-                topic["serialization_type"] = toString(metaTopic->serializationType);
-                topics.append(topic);
-            }
-            json[std::to_string(id)]["topics"] = topics;
+        // Check if broker is connected before trying to get streams
+        if (!manager || !manager->isConnected()) {
+            Json::Value err_json;
+            err_json["status"] = "error";
+            err_json["message"] = "Broker not connected";
+            auto resp = HttpResponse::newHttpJsonResponse(err_json);
+            resp->setStatusCode(k503ServiceUnavailable);
+            resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+            callback(resp);
+            return;
         }
 
-        auto resp = HttpResponse::newHttpJsonResponse(json);
-        resp->setStatusCode(drogon::HttpStatusCode::k200OK);
-        resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
-        callback(resp);
+        try {
+            auto rawStreams = manager->getAllStreams();
+            Json::Value json;
+            for (const auto& stream : rawStreams) {
+                auto id = stream->getId();
+                auto dataTopics = stream->getTopicsByType(nat::core::StreamType::DATA);
+                auto metaTopics = stream->getTopicsByType(nat::core::StreamType::META);
+                Json::Value topics;
+                for (const auto& dataTopic : dataTopics) {
+                    Json::Value topic;
+                    topic["schema_name"] = dataTopic->schemaName;
+                    topic["type"] = toString(dataTopic->type);
+                    topic["serialization_type"] = toString(dataTopic->serializationType);
+                    topics.append(topic);
+                }
+                for (const auto& metaTopic : metaTopics) {
+                    Json::Value topic;
+                    topic["schema_name"] = metaTopic->schemaName;
+                    topic["type"] = toString(metaTopic->type);
+                    topic["serialization_type"] = toString(metaTopic->serializationType);
+                    topics.append(topic);
+                }
+                json[std::to_string(id)]["topics"] = topics;
+            }
+
+            auto resp = HttpResponse::newHttpJsonResponse(json);
+            resp->setStatusCode(drogon::HttpStatusCode::k200OK);
+            resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+            callback(resp);
+        } catch (const std::exception& e) {
+            Json::Value err_json;
+            err_json["status"] = "error";
+            err_json["message"] = std::string("Failed to get streams: ") + e.what();
+            auto resp = HttpResponse::newHttpJsonResponse(err_json);
+            resp->setStatusCode(k500InternalServerError);
+            resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+            callback(resp);
+        }
     }
 
     // Handler for POST /api/set_streams
@@ -378,6 +512,196 @@ public:
         resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
         callback(resp);
     }
+
+    // Handler for POST /api/start_recording
+    // Begins a new recording session for ADL experiment
+    void start_recording(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
+    {
+        std::lock_guard<std::mutex> lock(recording_session->mutex);
+        
+        if (recording_session->is_recording) {
+            Json::Value err_json;
+            err_json["status"] = "error";
+            err_json["message"] = "Recording is already in progress.";
+            auto resp = HttpResponse::newHttpJsonResponse(err_json);
+            resp->setStatusCode(k400BadRequest);
+            callback(resp);
+            return;
+        }
+
+        // Parse optional stream_position_mapping from request
+        auto json = req->getJsonObject();
+        if (json && json->isMember("stream_position_mapping")) {
+            recording_session->stream_position_mapping.clear();
+            for (const auto& key : (*json)["stream_position_mapping"].getMemberNames()) {
+                uint64_t stream_id = std::stoull(key);
+                std::string position = (*json)["stream_position_mapping"][key].asString();
+                recording_session->stream_position_mapping[stream_id] = position;
+            }
+        }
+
+        // Initialize new session
+        recording_session->session_id = generate_uuid();
+        recording_session->is_recording = true;
+        recording_session->start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        recording_session->markers.clear();
+        recording_session->samples.clear();
+
+        LOG_INFO << "Recording session started: " << recording_session->session_id;
+
+        Json::Value resp_json;
+        resp_json["status"] = "success";
+        resp_json["message"] = "Recording started.";
+        resp_json["session_id"] = recording_session->session_id;
+        resp_json["start_time"] = Json::Value::UInt64(recording_session->start_time);
+        auto resp = HttpResponse::newHttpJsonResponse(resp_json);
+        resp->setStatusCode(drogon::HttpStatusCode::k200OK);
+        resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+        callback(resp);
+    }
+
+    // Handler for POST /api/stop_recording
+    // Ends the current recording session
+    void stop_recording(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
+    {
+        std::lock_guard<std::mutex> lock(recording_session->mutex);
+        
+        if (!recording_session->is_recording) {
+            Json::Value err_json;
+            err_json["status"] = "error";
+            err_json["message"] = "No recording in progress.";
+            auto resp = HttpResponse::newHttpJsonResponse(err_json);
+            resp->setStatusCode(k400BadRequest);
+            callback(resp);
+            return;
+        }
+
+        recording_session->is_recording = false;
+        uint64_t end_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        LOG_INFO << "Recording session stopped: " << recording_session->session_id;
+
+        Json::Value resp_json;
+        resp_json["status"] = "success";
+        resp_json["message"] = "Recording stopped.";
+        resp_json["session_id"] = recording_session->session_id;
+        resp_json["start_time"] = Json::Value::UInt64(recording_session->start_time);
+        resp_json["end_time"] = Json::Value::UInt64(end_time);
+        resp_json["marker_count"] = Json::Value::UInt(recording_session->markers.size());
+        resp_json["sample_count"] = Json::Value::UInt(recording_session->samples.size());
+        auto resp = HttpResponse::newHttpJsonResponse(resp_json);
+        resp->setStatusCode(drogon::HttpStatusCode::k200OK);
+        resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+        callback(resp);
+    }
+
+    // Handler for POST /api/insert_marker
+    // Inserts an event marker into the recording session
+    void insert_marker(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
+    {
+        if (req->getContentType() != drogon::ContentType::CT_APPLICATION_JSON) {
+            Json::Value err_json;
+            err_json["status"] = "error";
+            err_json["message"] = "Expected JSON content.";
+            auto resp = HttpResponse::newHttpJsonResponse(err_json);
+            resp->setStatusCode(k400BadRequest);
+            callback(resp);
+            return;
+        }
+
+        auto json = req->getJsonObject();
+        if (!json || !json->isMember("marker_type")) {
+            Json::Value err_json;
+            err_json["status"] = "error";
+            err_json["message"] = "Missing required field: marker_type";
+            auto resp = HttpResponse::newHttpJsonResponse(err_json);
+            resp->setStatusCode(k400BadRequest);
+            callback(resp);
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(recording_session->mutex);
+
+        Marker marker;
+        marker.marker_type = (*json)["marker_type"].asString();
+        marker.task_id = json->isMember("task_id") ? (*json)["task_id"].asString() : "";
+        marker.timestamp = json->isMember("timestamp") 
+            ? (*json)["timestamp"].asUInt64()
+            : std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        marker.session_id = recording_session->session_id;
+
+        recording_session->markers.push_back(marker);
+
+        LOG_INFO << "Marker inserted: " << marker.marker_type << " " << marker.task_id;
+
+        Json::Value resp_json;
+        resp_json["status"] = "success";
+        resp_json["message"] = "Marker inserted.";
+        resp_json["marker_type"] = marker.marker_type;
+        resp_json["task_id"] = marker.task_id;
+        resp_json["timestamp"] = Json::Value::UInt64(marker.timestamp);
+        auto resp = HttpResponse::newHttpJsonResponse(resp_json);
+        resp->setStatusCode(drogon::HttpStatusCode::k200OK);
+        resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+        callback(resp);
+    }
+
+    // Handler for GET /api/get_session_data
+    // Returns all recorded data (IMU samples + markers) for CSV export
+    void get_session_data(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
+    {
+        std::lock_guard<std::mutex> lock(recording_session->mutex);
+
+        Json::Value resp_json;
+        resp_json["session_id"] = recording_session->session_id;
+        resp_json["start_time"] = Json::Value::UInt64(recording_session->start_time);
+
+        // Add markers
+        Json::Value markers_json(Json::arrayValue);
+        for (const auto& marker : recording_session->markers) {
+            Json::Value m;
+            m["timestamp"] = Json::Value::UInt64(marker.timestamp);
+            m["marker_type"] = marker.marker_type;
+            m["task_id"] = marker.task_id;
+            markers_json.append(m);
+        }
+        resp_json["markers"] = markers_json;
+
+        // Add samples
+        Json::Value samples_json(Json::arrayValue);
+        for (const auto& sample : recording_session->samples) {
+            Json::Value s;
+            s["timestamp"] = Json::Value::UInt64(sample.timestamp);
+            s["stream_id"] = Json::Value::UInt64(sample.stream_id);
+            s["sensor_position"] = sample.sensor_position;
+            s["quat_i"] = sample.quat_i;
+            s["quat_j"] = sample.quat_j;
+            s["quat_k"] = sample.quat_k;
+            s["quat_real"] = sample.quat_real;
+            s["accel_x"] = sample.accel_x;
+            s["accel_y"] = sample.accel_y;
+            s["accel_z"] = sample.accel_z;
+            s["gyro_x"] = sample.gyro_x;
+            s["gyro_y"] = sample.gyro_y;
+            s["gyro_z"] = sample.gyro_z;
+            s["gravity_x"] = sample.gravity_x;
+            s["gravity_y"] = sample.gravity_y;
+            s["gravity_z"] = sample.gravity_z;
+            samples_json.append(s);
+        }
+        resp_json["samples"] = samples_json;
+
+        resp_json["marker_count"] = Json::Value::UInt(recording_session->markers.size());
+        resp_json["sample_count"] = Json::Value::UInt(recording_session->samples.size());
+
+        auto resp = HttpResponse::newHttpJsonResponse(resp_json);
+        resp->setStatusCode(drogon::HttpStatusCode::k200OK);
+        resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+        callback(resp);
+    }
 };
 
 int main()
@@ -396,12 +720,16 @@ int main()
     app().registerFilter(std::make_shared<CorsFilter>());
     app().registerPostHandlingAdvice(
         [](const drogon::HttpRequestPtr& req, const drogon::HttpResponsePtr& resp) {
-            resp->addHeader("Access-Control-Allow-Origin", "http://localhost:5175");
+            // Allow any localhost port for development
+            auto origin = req->getHeader("Origin");
+            if (!origin.empty()) {
+                resp->addHeader("Access-Control-Allow-Origin", origin);
+            }
         });
 
     //auto brokerHost = "natkit-v0-kafka";
-    //auto brokerHost = "localhost";
-    auto brokerHost = "10.26.0.214";
+    auto brokerHost = "localhost";
+    //auto brokerHost = "10.26.0.214";
     auto brokerPort = "29093";
     auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
     
@@ -458,6 +786,46 @@ int main()
                 api_controller->set_streams(req, std::move(callback));
         },
         { Post, Options });
+
+    // Register POST /api/start_calibration
+    app().registerHandler("/api/start_calibration",
+        [api_controller](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                api_controller->start_calibration(req, std::move(callback));
+        },
+        { Post, Options });
+
+    // Register POST /api/start_recording
+    app().registerHandler("/api/start_recording",
+        [api_controller](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                api_controller->start_recording(req, std::move(callback));
+        },
+        { Post, Options });
+
+    // Register POST /api/stop_recording
+    app().registerHandler("/api/stop_recording",
+        [api_controller](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                api_controller->stop_recording(req, std::move(callback));
+        },
+        { Post, Options });
+
+    // Register POST /api/insert_marker
+    app().registerHandler("/api/insert_marker",
+        [api_controller](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                api_controller->insert_marker(req, std::move(callback));
+        },
+        { Post, Options });
+
+    // Register GET /api/get_session_data
+    app().registerHandler("/api/get_session_data",
+        [api_controller](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                api_controller->get_session_data(req, std::move(callback));
+        },
+        { Get });
 
     std::cout << "Server running on http://127.0.0.1:7409\n";
 

@@ -10,13 +10,20 @@ if (NOT DEFINED BUILD_NATKIT_BACKEND)
   set(BUILD_NATKIT_BACKEND OFF CACHE BOOL "Build the backend for natKit")
 endif()
 
+# Set default build type if not specified
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  message(STATUS "Setting build type to 'Debug' as none was specified.")
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build." FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
 set(CMAKE_VERBOSE_MAKEFILE ON)
 set(LIBNATKIT_PROJECT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(LIBNATKIT_THIRD_PARTY_DIR ${LIBNATKIT_PROJECT_ROOT}/third-party)
 set(LIBNATKIT_BUILD_ROOT ${CMAKE_CURRENT_BINARY_DIR})
 set(LIBNATKIT_SCRIPTS_DIR ${LIBNATKIT_PROJECT_ROOT}/scripts)
 set(LIBNATKIT_INSTALL_DIR ${LIBNATKIT_BUILD_ROOT})
-set(LIBNATKIT_LIBRARY_INSTALL_DIR ${LIBNATKIT_INSTALL_DIR}/lib/Debug)
+set(LIBNATKIT_LIBRARY_INSTALL_DIR ${LIBNATKIT_INSTALL_DIR}/lib/${CMAKE_BUILD_TYPE})
 set(LIBNATKIT_INCLUDE_INSTALL_DIR ${LIBNATKIT_INSTALL_DIR}/include)
 set(LIBNATKIT_BINARY_INSTALL_DIR ${LIBNATKIT_INSTALL_DIR}/bin)
 set(LIBNATKIT_PUBLIC_INCLUDE_DIR ${LIBNATKIT_PROJECT_ROOT}/libnatkit/include)
@@ -44,15 +51,24 @@ if(LIBNATKIT_ESP_BUILD)
   message("ESP32 Compiler")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
 elseif(MSVC)
-  message("------------------ Compiler is MSVC ------------------")
+  message(STATUS "Compiler: MSVC")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D__msvc_cplusplus /std:c++20")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /std:c11")
   set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
   set(BUILD_SHARED_LIBS ON)
 else()
-message("------------------ Compiler is Something Else ------------------")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g3 -O0 -std=c++20")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g3 -O0")
+  message(STATUS "Compiler: GCC/Clang")
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+  # Debug-specific flags
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3 -O0")
+  set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3 -O0")
+
+  # Release-specific flags
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3")
+
   if (NOT APPLE)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,--disable-new-dtags")
   endif()
@@ -180,7 +196,7 @@ ExternalProject_Add(libnatkit-core-project
   BUILD_COMMAND     ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel 16
   #INSTALL_COMMAND   ""
   TEST_COMMAND      ""
-  BYPRODUCTS        ${LIBNATKITCORE_INCLUDE}/libnatkit-core.hpp 
+  BYPRODUCTS        ${LIBNATKITCORE_INCLUDE}/libnatkit-core.hpp
   BUILD_BYPRODUCTS  ${LIBNATKITCORE_LIBRARY}
 )
 

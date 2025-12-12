@@ -123,7 +123,13 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
   virtual std::vector<std::string>
   getAllTopicStrings(bool includeHiddenTopics = false) const override {
     const auto consumer = createConsumer();
+    if (!consumer) {
+      return {};
+    }
     const auto metadata = createMetadata(consumer);
+    if (!metadata) {
+      return {};
+    }
 
     std::vector<std::string> topics{};
     for (const auto &topicIt : *metadata->topics()) {
@@ -239,8 +245,11 @@ private:
 
   std::unique_ptr<RdKafka::Metadata>
   createMetadata(const std::shared_ptr<RdKafka::Consumer> &consumer) const {
-    class RdKafka::Metadata *metadata;
-    consumer->metadata(true, 0, &metadata, 5000);
+    class RdKafka::Metadata *metadata = nullptr;
+    RdKafka::ErrorCode err = consumer->metadata(true, nullptr, &metadata, 5000);
+    if (err != RdKafka::ERR_NO_ERROR || metadata == nullptr) {
+      return nullptr;
+    }
     return std::unique_ptr<RdKafka::Metadata>(metadata);
   }
 };

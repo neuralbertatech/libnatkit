@@ -119,7 +119,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;SERVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalIncludeDirectories>$(SolutionDir)..\third-party\nlohmann\include;$(SolutionDir)..\libnatkit\include;$(SolutionDir)..\lib\libnatkit-core\include;$(SolutionDir)..\libnatkit\util\src\main\cxx;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

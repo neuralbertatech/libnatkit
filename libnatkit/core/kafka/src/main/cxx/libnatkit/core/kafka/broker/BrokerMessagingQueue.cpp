@@ -36,9 +36,13 @@ void BrokerMessagingQueue::ConsumerCallback::consume_cb(RdKafka::Message &msg, v
           printf(" Header:  %s = NULL\n", hdr.key().c_str());*/
       }
     }
-    messagingQueue.onMessageRecieved(
-        std::make_unique<core::message_t>(stringToMessageType(
-            std::string{static_cast<const char *>(msg.payload())})));
+    {
+        const uint8_t* payload_start = static_cast<const uint8_t*>(msg.payload());
+        size_t payload_len = msg.len();
+        std::cout << "[Kafka] Received message with " << payload_len << " bytes\n";
+        messagingQueue.onMessageRecieved(
+            std::make_unique<core::message_t>(payload_start, payload_start + payload_len));
+    }
     /*printf("%.*s\n", static_cast<int>(msg.len()),
            static_cast<const char *>(msg.payload()));*/
 
