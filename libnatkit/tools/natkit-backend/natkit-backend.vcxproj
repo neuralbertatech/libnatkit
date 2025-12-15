@@ -20,6 +20,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\src\main\cxx\libnatkit\tools\NatKitBackend.cpp" />
+    <ClCompile Include="..\src\main\cxx\libnatkit\tools\StreamViewerWebSocket.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\src\main\cxx\libnatkit\tools\StreamViewerWebSocket.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\core\kafka\libnatkit-core-kafka\libnatkit-core-kafka.vcxproj">

@@ -39,7 +39,22 @@ void BrokerMessagingQueue::ConsumerCallback::consume_cb(RdKafka::Message &msg, v
     {
         const uint8_t* payload_start = static_cast<const uint8_t*>(msg.payload());
         size_t payload_len = msg.len();
-        std::cout << "[Kafka] Received message with " << payload_len << " bytes\n";
+        
+        // Log sample of first IMU reading (first 50 bytes): time(8) + data[10](40) + accuracies(1) + has_data(1)
+        if (payload_len >= 50) {
+            uint64_t time;
+            std::memcpy(&time, payload_start, sizeof(time));
+            uint8_t accuracies = payload_start[48];
+            uint8_t has_data = payload_start[49];
+            int accel = (accuracies >> 4) & 3;
+            int gyro = (accuracies >> 2) & 3;
+            int rot = accuracies & 3;
+            std::cout << "[Kafka] Sample - time: " << time 
+                      << ", accuracies: " << (int)accuracies 
+                      << " (accel=" << accel << ", gyro=" << gyro << ", rot=" << rot << ")"
+                      << ", has_data: " << (int)has_data << "\n";
+        }
+        
         messagingQueue.onMessageRecieved(
             std::make_unique<core::message_t>(payload_start, payload_start + payload_len));
     }
@@ -185,7 +200,7 @@ void BrokerMessagingQueue::readMessages() {
   pollResources();
 }
 
-void BrokerMessagingQueue::startConsumer(int startOffset) {
+void BrokerMessagingQueue::startConsumer(int64_t startOffset) {
   RdKafka::ErrorCode resp =
       consumer->start(topicHandle.get(), partition, startOffset);
   if (resp != RdKafka::ERR_NO_ERROR) {

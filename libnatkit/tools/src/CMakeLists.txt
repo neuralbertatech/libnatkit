@@ -61,7 +61,10 @@ target_link_libraries(libnatkit-natkit-menu PRIVATE
 )
 
 if(BUILD_NATKIT_BACKEND)
-  add_executable(libnatkit-natkit-backend ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp)
+  add_executable(libnatkit-natkit-backend
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/StreamViewerWebSocket.cpp
+  )
   target_link_libraries(libnatkit-natkit-backend PRIVATE
     libnatkit-core-kafka-cxx
     nlohmann

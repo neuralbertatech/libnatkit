@@ -25,7 +25,10 @@
 
 #include <drogon/drogon.h>
 #include <drogon/HttpFilter.h>
+#include <drogon/WebSocketController.h>
 #include <iostream>
+
+#include "StreamViewerWebSocket.hpp"
 
 using namespace drogon;
 using namespace std::chrono_literals;
@@ -247,7 +250,7 @@ public:
 // Inheriting from HttpController makes it easy to register routes.
 class ApiController : public drogon::HttpController<ApiController, false> {
     Config config;
-    std::unique_ptr<nat::kafka::BrokerManager> manager;
+    std::shared_ptr<nat::kafka::BrokerManager> manager;
     std::optional<std::vector<std::unique_ptr<nat::core::TopicMessenger>>> imuStreams;
     std::unique_ptr<RecordingSession> recording_session;
     std::thread recording_thread;
@@ -288,8 +291,16 @@ public:
     METHOD_ADD(ApiController::get_session_data, "/api/get_session_data", Get);
     METHOD_LIST_END
 
-    ApiController(std::unique_ptr<nat::kafka::BrokerManager> manager, Config config)
+    ApiController(std::shared_ptr<nat::kafka::BrokerManager> manager, Config config)
         : manager(std::move(manager)), config(config), recording_session(std::make_unique<RecordingSession>()) {}
+
+    ~ApiController() {
+        // Stop recording thread if running
+        stop_recording_thread = true;
+        if (recording_thread.joinable()) {
+            recording_thread.join();
+        }
+    }
 
     // Handler for GET /api/heartbeat
     // A simple health check endpoint.
@@ -325,20 +336,24 @@ public:
         }
     }
 
-    // Helper to extract accuracy from a single NatImuDataSchema
-    int getAccuracyFromImuData(nat::core::NatImuDataSchema* imuData) {
-        if (imuData == nullptr) return 0;
-        int accelAcc = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+    // Structure to hold all three accuracy values
+    struct ImuAccuracies {
+        int accelerometer = 0;
+        int gyroscope = 0;
+        int rotation = 0;
+    };
+
+    // Helper to extract all accuracies from a single NatImuDataSchema
+    ImuAccuracies getAccuraciesFromImuData(nat::core::NatImuDataSchema* imuData) {
+        ImuAccuracies result;
+        if (imuData == nullptr) return result;
+        result.accelerometer = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
             imuData->getAccelerationAccuracy());
-        int gyroAcc = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+        result.gyroscope = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
             imuData->getGyroscopeAccuracy());
-        int rotAcc = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+        result.rotation = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
             imuData->getRotationAccuracy());
-        // Use the minimum accuracy as the overall accuracy
-        int accuracy = accelAcc;
-        if (gyroAcc < accuracy) accuracy = gyroAcc;
-        if (rotAcc < accuracy) accuracy = rotAcc;
-        return accuracy;
+        return result;
     }
 
     // Handler for GET /api/get_accuracies
@@ -353,7 +368,7 @@ public:
         if (imuStreams.has_value()) {
             for (auto& stream : imuStreams.value()) {
                 uint64_t id = stream->getId();
-                int accuracy = 0; // Default to Unreliable
+                ImuAccuracies accuracies; // Default to all Unreliable (0)
                 
                 // Try to get the latest message from the stream
                 nat::core::Optional<std::unique_ptr<nat::core::Schema>> messageMaybe = stream->tryGetNexMessage();
@@ -363,7 +378,7 @@ public:
                     // Try to cast to NatImuDataSchema first
                     nat::core::NatImuDataSchema* imuData = dynamic_cast<nat::core::NatImuDataSchema*>(message.get());
                     if (imuData != nullptr) {
-                        accuracy = getAccuracyFromImuData(imuData);
+                        accuracies = getAccuraciesFromImuData(imuData);
                     } else {
                         // Try to cast to NatImuBulkDataSchema (bulk data)
                         nat::core::NatImuBulkDataSchema* bulkData = dynamic_cast<nat::core::NatImuBulkDataSchema*>(message.get());
@@ -372,13 +387,18 @@ public:
                             std::unique_ptr<std::vector<nat::core::NatImuDataSchema>> records = bulkData->createImuRecords();
                             if (records && !records->empty()) {
                                 // Use the last record's accuracy (most recent)
-                                accuracy = getAccuracyFromImuData(&records->back());
+                                accuracies = getAccuraciesFromImuData(&records->back());
                             }
                         }
                     }
                 }
                 
-                accuracies_json[std::to_string(id)] = accuracy;
+                // Return all three accuracy values for each stream
+                Json::Value stream_accuracies;
+                stream_accuracies["accelerometer"] = accuracies.accelerometer;
+                stream_accuracies["gyroscope"] = accuracies.gyroscope;
+                stream_accuracies["rotation"] = accuracies.rotation;
+                accuracies_json[std::to_string(id)] = stream_accuracies;
             }
         }
         
@@ -513,6 +533,103 @@ public:
         callback(resp);
     }
 
+    // Background thread function to collect IMU samples during recording
+    void recording_thread_func() {
+        LOG_INFO << "Recording thread started";
+        while (!stop_recording_thread.load()) {
+            if (!recording_session->is_recording.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            // Read from all IMU streams
+            if (imuStreams.has_value()) {
+                for (auto& stream : imuStreams.value()) {
+                    uint64_t stream_id = stream->getId();
+                    
+                    // Get sensor position for this stream
+                    std::string sensor_position = "Unknown";
+                    {
+                        std::lock_guard<std::mutex> lock(recording_session->mutex);
+                        auto it = recording_session->stream_position_mapping.find(stream_id);
+                        if (it != recording_session->stream_position_mapping.end()) {
+                            sensor_position = it->second;
+                        }
+                    }
+
+                    // Try to get messages from stream
+                    nat::core::Optional<std::unique_ptr<nat::core::Schema>> messageMaybe = stream->tryGetNexMessage();
+                    if (messageMaybe.has_value()) {
+                        std::unique_ptr<nat::core::Schema> message = std::move(messageMaybe.value());
+                        
+                        // Try to cast to NatImuBulkDataSchema (bulk data)
+                        nat::core::NatImuBulkDataSchema* bulkData = dynamic_cast<nat::core::NatImuBulkDataSchema*>(message.get());
+                        if (bulkData != nullptr) {
+                            std::unique_ptr<std::vector<nat::core::NatImuDataSchema>> records = bulkData->createImuRecords();
+                            if (records) {
+                                std::lock_guard<std::mutex> lock(recording_session->mutex);
+                                for (const auto& record : *records) {
+                                    const float* data = record.getData();
+                                    ImuSample sample;
+                                    sample.timestamp = static_cast<uint64_t>(record.getTime());
+                                    sample.stream_id = stream_id;
+                                    sample.sensor_position = sensor_position;
+                                    // data[0-2]: accelerometer x, y, z
+                                    sample.accel_x = data[0];
+                                    sample.accel_y = data[1];
+                                    sample.accel_z = data[2];
+                                    // data[3-5]: gyroscope x, y, z
+                                    sample.gyro_x = data[3];
+                                    sample.gyro_y = data[4];
+                                    sample.gyro_z = data[5];
+                                    // data[6-9]: rotation quaternion (real, i, j, k)
+                                    sample.quat_real = data[6];
+                                    sample.quat_i = data[7];
+                                    sample.quat_j = data[8];
+                                    sample.quat_k = data[9];
+                                    // No gravity data in current format
+                                    sample.gravity_x = 0.0f;
+                                    sample.gravity_y = 0.0f;
+                                    sample.gravity_z = 0.0f;
+                                    recording_session->samples.push_back(sample);
+                                }
+                            }
+                        } else {
+                            // Try single NatImuDataSchema
+                            nat::core::NatImuDataSchema* imuData = dynamic_cast<nat::core::NatImuDataSchema*>(message.get());
+                            if (imuData != nullptr) {
+                                const float* data = imuData->getData();
+                                std::lock_guard<std::mutex> lock(recording_session->mutex);
+                                ImuSample sample;
+                                sample.timestamp = static_cast<uint64_t>(imuData->getTime());
+                                sample.stream_id = stream_id;
+                                sample.sensor_position = sensor_position;
+                                sample.accel_x = data[0];
+                                sample.accel_y = data[1];
+                                sample.accel_z = data[2];
+                                sample.gyro_x = data[3];
+                                sample.gyro_y = data[4];
+                                sample.gyro_z = data[5];
+                                sample.quat_real = data[6];
+                                sample.quat_i = data[7];
+                                sample.quat_j = data[8];
+                                sample.quat_k = data[9];
+                                sample.gravity_x = 0.0f;
+                                sample.gravity_y = 0.0f;
+                                sample.gravity_z = 0.0f;
+                                recording_session->samples.push_back(sample);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Small sleep to avoid busy-waiting
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        LOG_INFO << "Recording thread stopped";
+    }
+
     // Handler for POST /api/start_recording
     // Begins a new recording session for ADL experiment
     void start_recording(const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& callback)
@@ -547,6 +664,12 @@ public:
             std::chrono::system_clock::now().time_since_epoch()).count();
         recording_session->markers.clear();
         recording_session->samples.clear();
+
+        // Start recording thread if not already running
+        if (!recording_thread.joinable()) {
+            stop_recording_thread = false;
+            recording_thread = std::thread(&ApiController::recording_thread_func, this);
+        }
 
         LOG_INFO << "Recording session started: " << recording_session->session_id;
 
@@ -731,18 +854,28 @@ int main()
     auto brokerHost = "localhost";
     //auto brokerHost = "10.26.0.214";
     auto brokerPort = "29093";
-    auto manager = nat::kafka::createBrokerManager(brokerHost, brokerPort);
+    auto manager_unique = nat::kafka::createBrokerManager(brokerHost, brokerPort);
     
-    if (manager == nullptr) {
+    if (manager_unique == nullptr) {
         std::cout << "Unable to create broker! Exiting\n";
         exit(1);
     }
     else {
         std::cout << "Broker created\n";
     }
+    
+    // Convert to shared_ptr so we can share between controllers
+    std::shared_ptr<nat::kafka::BrokerManager> manager = std::move(manager_unique);
+    
     Config config{};
-    auto api_controller = std::make_shared<ApiController>(std::move(manager), config);
-    std::cout << "Controller created\n";
+    auto api_controller = std::make_shared<ApiController>(manager, config);
+    std::cout << "API Controller created\n";
+    
+    // Set broker manager and register WebSocket controller
+    StreamViewerWebSocket::setBrokerManager(manager);
+    auto ws_controller = std::make_shared<StreamViewerWebSocket>();
+    app().registerController(ws_controller);
+    std::cout << "StreamViewer WebSocket controller registered\n";
 
     // Register the controller we defined above.
     // Drogon will automatically handle routing for it.
@@ -827,7 +960,10 @@ int main()
         },
         { Get });
 
+    // WebSocket endpoint at /ws/stream_viewer is registered above via registerController
+
     std::cout << "Server running on http://127.0.0.1:7409\n";
+    std::cout << "WebSocket endpoint available at ws://127.0.0.1:7409/ws/stream_viewer\n";
 
     // Run the application's event loop.
     // This call will block until the application is terminated.

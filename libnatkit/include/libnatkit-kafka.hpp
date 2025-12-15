@@ -99,7 +99,7 @@ private:
   void sendMessages();
   void sendMessage(std::unique_ptr<core::message_t> message);
   void readMessages();
-  void startConsumer(int startOffset = 0);
+  void startConsumer(int64_t startOffset = -1);  // -1 = OFFSET_END (start from latest)
   void stopConsumer();
   void defaultOnMessageRecieved(std::unique_ptr<core::message_t> &&msg);
 };
