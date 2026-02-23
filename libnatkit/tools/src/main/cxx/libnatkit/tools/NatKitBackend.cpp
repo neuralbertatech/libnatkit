@@ -87,6 +87,13 @@ struct RecordingSession {
     RecordingSession& operator=(RecordingSession&&) = delete;
 };
 
+// Structure to hold all three IMU accuracy values
+struct ImuAccuracies {
+    int accelerometer = 0;
+    int gyroscope = 0;
+    int rotation = 0;
+};
+
 class Config {
     std::vector<std::string> ids{};
     std::map<std::string, std::string> idNames{};
@@ -252,6 +259,8 @@ class ApiController : public drogon::HttpController<ApiController, false> {
     Config config;
     std::shared_ptr<nat::kafka::BrokerManager> manager;
     std::optional<std::vector<std::unique_ptr<nat::core::TopicMessenger>>> imuStreams;
+    std::map<uint64_t, ImuAccuracies> lastKnownAccuraciesByStreamId;
+    std::mutex lastKnownAccuraciesLock;
     std::unique_ptr<RecordingSession> recording_session;
     std::thread recording_thread;
     std::atomic<bool> stop_recording_thread{false};
@@ -271,6 +280,17 @@ class ApiController : public drogon::HttpController<ApiController, false> {
         }
 
         if (new_imu_streams.size() > 0) {
+            // Keep cache entries only for selected stream IDs
+            {
+                const std::lock_guard<std::mutex> guard(lastKnownAccuraciesLock);
+                for (auto it = lastKnownAccuraciesByStreamId.begin(); it != lastKnownAccuraciesByStreamId.end();) {
+                    if (stream_ids.find(it->first) == stream_ids.end()) {
+                        it = lastKnownAccuraciesByStreamId.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
             imuStreams = std::move(new_imu_streams);
         }
     }
@@ -336,13 +356,6 @@ public:
         }
     }
 
-    // Structure to hold all three accuracy values
-    struct ImuAccuracies {
-        int accelerometer = 0;
-        int gyroscope = 0;
-        int rotation = 0;
-    };
-
     // Helper to extract all accuracies from a single NatImuDataSchema
     ImuAccuracies getAccuraciesFromImuData(nat::core::NatImuDataSchema* imuData) {
         ImuAccuracies result;
@@ -368,7 +381,14 @@ public:
         if (imuStreams.has_value()) {
             for (auto& stream : imuStreams.value()) {
                 uint64_t id = stream->getId();
-                ImuAccuracies accuracies; // Default to all Unreliable (0)
+                ImuAccuracies accuracies; // Default fallback: all Unreliable (0)
+                {
+                    const std::lock_guard<std::mutex> guard(lastKnownAccuraciesLock);
+                    auto it = lastKnownAccuraciesByStreamId.find(id);
+                    if (it != lastKnownAccuraciesByStreamId.end()) {
+                        accuracies = it->second;
+                    }
+                }
                 
                 // Try to get the latest message from the stream
                 nat::core::Optional<std::unique_ptr<nat::core::Schema>> messageMaybe = stream->tryGetNexMessage();
@@ -390,6 +410,10 @@ public:
                                 accuracies = getAccuraciesFromImuData(&records->back());
                             }
                         }
+                    }
+                    {
+                        const std::lock_guard<std::mutex> guard(lastKnownAccuraciesLock);
+                        lastKnownAccuraciesByStreamId[id] = accuracies;
                     }
                 }
                 
