@@ -874,10 +874,17 @@ int main()
             }
         });
 
-    //auto brokerHost = "natkit-v0-kafka";
-    auto brokerHost = "localhost";
-    //auto brokerHost = "10.26.0.214";
-    auto brokerPort = "29093";
+    const char* brokerHost = std::getenv("LIBNATKIT_KAFKA_BROKER_ADDRESS");
+    if (brokerHost == nullptr || std::string(brokerHost).empty()) {
+        brokerHost = "localhost";
+    }
+
+    const char* brokerPort = std::getenv("LIBNATKIT_KAFKA_BROKER_PORT");
+    if (brokerPort == nullptr || std::string(brokerPort).empty()) {
+        brokerPort = "29093";
+    }
+
+    std::cout << "Using Kafka broker at " << brokerHost << ":" << brokerPort << "\n";
     auto manager_unique = nat::kafka::createBrokerManager(brokerHost, brokerPort);
     
     if (manager_unique == nullptr) {

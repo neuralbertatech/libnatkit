@@ -1,0 +1,6 @@
+build/
+.cache/
+uploads/
+third-party/drogon/build/
+**/CMakeFiles/
+**/CMakeCache.txt
