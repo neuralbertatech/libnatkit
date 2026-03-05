@@ -63,6 +63,12 @@ struct ImuSample {
     uint64_t timestamp;
     uint64_t stream_id;
     std::string sensor_position;
+    int calibration_status_accelerometer;
+    int calibration_status_gyroscope;
+    int calibration_status_rotation;
+    bool has_data_accelerometer;
+    bool has_data_gyroscope;
+    bool has_data_rotation;
     float quat_i, quat_j, quat_k, quat_real;
     float accel_x, accel_y, accel_z;
     float gyro_x, gyro_y, gyro_z;
@@ -598,6 +604,18 @@ public:
                                     sample.timestamp = static_cast<uint64_t>(record.getTime());
                                     sample.stream_id = stream_id;
                                     sample.sensor_position = sensor_position;
+                                    sample.calibration_status_accelerometer =
+                                        nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                            record.getAccelerationAccuracy());
+                                    sample.calibration_status_gyroscope =
+                                        nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                            record.getGyroscopeAccuracy());
+                                    sample.calibration_status_rotation =
+                                        nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                            record.getRotationAccuracy());
+                                    sample.has_data_accelerometer = record.wasDataSetForAcceleration();
+                                    sample.has_data_gyroscope = record.wasDataSetForGryoscope();
+                                    sample.has_data_rotation = record.wasDataSetForRotation();
                                     // data[0-2]: accelerometer x, y, z
                                     sample.accel_x = data[0];
                                     sample.accel_y = data[1];
@@ -628,6 +646,18 @@ public:
                                 sample.timestamp = static_cast<uint64_t>(imuData->getTime());
                                 sample.stream_id = stream_id;
                                 sample.sensor_position = sensor_position;
+                                sample.calibration_status_accelerometer =
+                                    nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                        imuData->getAccelerationAccuracy());
+                                sample.calibration_status_gyroscope =
+                                    nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                        imuData->getGyroscopeAccuracy());
+                                sample.calibration_status_rotation =
+                                    nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                        imuData->getRotationAccuracy());
+                                sample.has_data_accelerometer = imuData->wasDataSetForAcceleration();
+                                sample.has_data_gyroscope = imuData->wasDataSetForGryoscope();
+                                sample.has_data_rotation = imuData->wasDataSetForRotation();
                                 sample.accel_x = data[0];
                                 sample.accel_y = data[1];
                                 sample.accel_z = data[2];
@@ -824,6 +854,12 @@ public:
             s["timestamp"] = Json::Value::UInt64(sample.timestamp);
             s["stream_id"] = Json::Value::UInt64(sample.stream_id);
             s["sensor_position"] = sample.sensor_position;
+            s["calibration_status_accelerometer"] = sample.calibration_status_accelerometer;
+            s["calibration_status_gyroscope"] = sample.calibration_status_gyroscope;
+            s["calibration_status_rotation"] = sample.calibration_status_rotation;
+            s["has_data_accelerometer"] = sample.has_data_accelerometer;
+            s["has_data_gyroscope"] = sample.has_data_gyroscope;
+            s["has_data_rotation"] = sample.has_data_rotation;
             s["quat_i"] = sample.quat_i;
             s["quat_j"] = sample.quat_j;
             s["quat_k"] = sample.quat_k;
