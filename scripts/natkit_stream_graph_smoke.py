@@ -135,6 +135,28 @@ async def run_smoke_test(args: argparse.Namespace) -> None:
         client = StreamGraphSmokeClient(ws, args.response_timeout_s)
         graph = build_smoke_graph(args)
 
+        print("listing node catalog...")
+        catalog = await client.request(
+            {"action": "list_node_catalog", "request_id": next_request_id("catalog")},
+            expect_types={"node_catalog"},
+        )
+        nodes = catalog.get("nodes", [])
+        node_types = {entry.get("node_type") for entry in nodes}
+        catalog_kinds = {entry.get("kind") for entry in nodes}
+        # The palette renders purely from this — assert the structural kinds and
+        # a representative transform are all advertised (Phase 1).
+        missing = {"stream_source", "viewer", "sink", "combine"} - catalog_kinds
+        if missing:
+            raise AssertionError(f"node catalog missing structural kinds {missing}: {node_types}")
+        if "bandpass_iir" not in node_types:
+            raise AssertionError(f"node catalog missing a compiled transform: {sorted(node_types)}")
+        transform_entries = [e for e in nodes if e.get("kind") == "transform"]
+        for entry in transform_entries:
+            for key in ("category", "runner", "config_fields", "input_ports", "output_ports"):
+                if key not in entry:
+                    raise AssertionError(f"transform catalog entry missing '{key}': {entry}")
+        print(f"  catalog advertises {len(nodes)} node types ({len(transform_entries)} transforms)")
+
         print("saving draft graph...")
         saved = await client.request(
             {"action": "save_stream_graph", "request_id": next_request_id("save"), "graph": graph},

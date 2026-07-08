@@ -80,6 +80,10 @@ private:
         const drogon::WebSocketConnectionPtr& conn,
         const nlohmann::json& json);
 
+    void handleListNodeCatalog(
+        const drogon::WebSocketConnectionPtr& conn,
+        const nlohmann::json& json);
+
     // Create a derived EMG transform stream
     void handleCreateTransform(const drogon::WebSocketConnectionPtr& conn,
                                const nlohmann::json& json);
@@ -180,6 +184,10 @@ private:
                            size_t published_marker_events);
 
     void sendTransformCapabilities(
+        const drogon::WebSocketConnectionPtr& conn,
+        const std::string& request_id);
+
+    void sendNodeCatalog(
         const drogon::WebSocketConnectionPtr& conn,
         const std::string& request_id);
 

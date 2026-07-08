@@ -764,7 +764,7 @@ nlohmann::json formatSignalFrameAsJson(
     return json;
 }
 
-struct EmgTransformConfig {
+struct TransformConfig {
     std::string kind;
     double cutoff_hz = 20.0;
     double low_cutoff_hz = 20.0;
@@ -781,9 +781,15 @@ struct EmgTransformConfig {
     double ssc_threshold = 0.0;
     uint32_t ar_order = 4;
     std::string model_path{};
+    std::string select_mode = "label";
+    std::string selection{};
 };
 
-std::string serializeTransformConfigJson(const EmgTransformConfig& config)
+// Backward-compatible alias — the EMG-specific name is being retired (Phase 0
+// of the visual-programming rework); the config is sensor-agnostic.
+using EmgTransformConfig = TransformConfig;
+
+std::string serializeTransformConfigJson(const TransformConfig& config)
 {
     nlohmann::json json;
     if (config.kind == "rectify") {
@@ -827,6 +833,9 @@ std::string serializeTransformConfigJson(const EmgTransformConfig& config)
         json["ar_order"] = config.ar_order;
     } else if (config.kind == "lda_classify") {
         json["model_path"] = config.model_path;
+    } else if (config.kind == "channel_select") {
+        json["select_mode"] = config.select_mode;
+        json["selection"] = config.selection;
     }
     return json.dump();
 }
@@ -1100,7 +1109,133 @@ nlohmann::json buildTransformCapabilitiesJson()
               {"label", "Model path"},
               {"type", "string"},
               {"required", true}}})));
+    transforms.push_back(buildTransformCapabilityJson(
+        "channel_select",
+        "Select / Split channels",
+        "Passes through a subset of a multi-channel frame's channels — e.g. "
+        "destructure a concatenated feature vector into per-family or per-source "
+        "sub-vectors. Keep every channel, channels whose label contains a "
+        "substring, or an explicit index range/list.",
+        nlohmann::json::array(
+            {{{"id", "select_mode"},
+              {"label", "Select by"},
+              {"type", "enum"},
+              {"required", true},
+              {"options", nlohmann::json::array({"label", "index", "all"})},
+              {"default_option", "label"}},
+             {{"id", "selection"},
+              {"label", "Selection (label substring, or indices e.g. 0-8,12)"},
+              {"type", "string"},
+              {"required", false},
+              {"default_value", "mav"}}})));
     return transforms;
+}
+
+// Full node catalog (Phase 1 of the visual-programming rework). The frontend
+// palette and node inspector render purely from this — adding a node type is a
+// data change here, never a TypeScript union edit. Each entry advertises:
+//   node_type   unique id (for transforms this equals the transform_kind)
+//   kind        the coarse structural kind the backend runtime validates
+//               (stream_source | transform | viewer | sink | combine)
+//   category    palette grouping (source | transform | viewer | sink)
+//   runner      who executes it (kafka_source | cpp_dsp | frontend | kafka_sink)
+//   config_fields  typed config schema (reused typed-field machinery)
+//   input_ports / output_ports  typed port templates
+// Transform entries also carry the existing input_mappings / output_schema_name
+// so the create_transform path keeps working unchanged.
+nlohmann::json buildNodeCatalogJson()
+{
+    const auto singleInputPort = []() {
+        return nlohmann::json::array(
+            {{{"id", "in"}, {"label", "Input"}}});
+    };
+    const auto singleOutputPort = []() {
+        return nlohmann::json::array(
+            {{{"id", "out"}, {"label", "Output"}}});
+    };
+
+    nlohmann::json nodes = nlohmann::json::array();
+
+    // Stream source — a live Kafka stream selected by the user.
+    nodes.push_back(
+        {{"node_type", "stream_source"},
+         {"kind", "stream_source"},
+         {"category", "source"},
+         {"runner", "kafka_source"},
+         {"label", "Stream source"},
+         {"description",
+          "A live sensor/derived stream selected from the broker. Emits its "
+          "records downstream; the port descriptor is the stream's own."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", nlohmann::json::array()},
+         {"output_ports", singleOutputPort()},
+         {"variadic_inputs", false}});
+
+    // Compiled C++ DSP transforms — one catalog entry per transform capability.
+    for (const auto& capability : buildTransformCapabilitiesJson()) {
+        nlohmann::json node;
+        node["node_type"] = capability.at("kind");
+        node["kind"] = "transform";
+        node["category"] = "transform";
+        node["runner"] = "cpp_dsp";
+        node["label"] = capability.at("label");
+        node["description"] = capability.at("description");
+        node["config_fields"] = capability.at("config_fields");
+        node["input_mappings"] = capability.at("input_mappings");
+        node["input_descriptor_paths"] = capability.at("input_descriptor_paths");
+        node["output_schema_name"] = capability.at("output_schema_name");
+        node["input_ports"] = singleInputPort();
+        node["output_ports"] = singleOutputPort();
+        node["variadic_inputs"] = false;
+        nodes.push_back(node);
+    }
+
+    // Combine — fans in >=2 upstream frames into one flattened feature vector.
+    nodes.push_back(
+        {{"node_type", "combine"},
+         {"kind", "combine"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Combine"},
+         {"description",
+          "Fans in two or more upstream channel frames into one flattened "
+          "feature-vector frame (e.g. several feature extractors into a model "
+          "input)."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", singleInputPort()},
+         {"output_ports", singleOutputPort()},
+         {"variadic_inputs", true}});
+
+    // Viewer — renders its upstream output on the canvas (runs in the browser).
+    nodes.push_back(
+        {{"node_type", "viewer"},
+         {"kind", "viewer"},
+         {"category", "viewer"},
+         {"runner", "frontend"},
+         {"label", "Viewer"},
+         {"description",
+          "Renders the upstream node's output live on the canvas. The renderer "
+          "is chosen from the output descriptor's capabilities."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", singleInputPort()},
+         {"output_ports", nlohmann::json::array()},
+         {"variadic_inputs", false}});
+
+    // Sink — persists/forwards its upstream output.
+    nodes.push_back(
+        {{"node_type", "sink"},
+         {"kind", "sink"},
+         {"category", "sink"},
+         {"runner", "kafka_sink"},
+         {"label", "Sink"},
+         {"description",
+          "Terminal node that consumes its upstream output (e.g. records it)."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", singleInputPort()},
+         {"output_ports", nlohmann::json::array()},
+         {"variadic_inputs", false}});
+
+    return nodes;
 }
 
 struct StreamGraphPosition {
@@ -2810,7 +2945,8 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
         config.kind != "zc" &&
         config.kind != "ssc" &&
         config.kind != "ar_coeffs" &&
-        config.kind != "lda_classify") {
+        config.kind != "lda_classify" &&
+        config.kind != "channel_select") {
         return std::nullopt;
     }
 
@@ -2963,6 +3099,20 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
             }
             config.model_path = parsed.value();
         }
+        if (values.contains("select_mode")) {
+            const auto parsed = parseString(values["select_mode"]);
+            if (!parsed.has_value()) {
+                return std::nullopt;
+            }
+            config.select_mode = parsed.value();
+        }
+        if (values.contains("selection")) {
+            const auto parsed = parseString(values["selection"]);
+            if (!parsed.has_value()) {
+                return std::nullopt;
+            }
+            config.selection = parsed.value();
+        }
     }
 
     if (!std::isfinite(config.low_cutoff_hz) || config.low_cutoff_hz <= 0.0 ||
@@ -2999,6 +3149,11 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
     }
     if (config.kind == "ar_coeffs" &&
         (config.ar_order == 0U || config.ar_order > 32U)) {
+        return std::nullopt;
+    }
+    if (config.kind == "channel_select" &&
+        config.select_mode != "label" && config.select_mode != "index" &&
+        config.select_mode != "all") {
         return std::nullopt;
     }
     if (config.kind == "lda_classify") {
@@ -3339,6 +3494,9 @@ private:
         if (config.kind == "lda_classify") {
             return transformLdaClassify(record);
         }
+        if (config.kind == "channel_select") {
+            return transformChannelSelect(record);
+        }
 
         const size_t channel_count = record.channelLabels.size();
         const size_t samples_per_channel = record.samplesPerChannel;
@@ -3388,6 +3546,95 @@ private:
             record.sampleRateHz,
             transformed_labels,
             transformed_samples,
+            static_cast<uint32_t>(samples_per_channel));
+        return output;
+    }
+
+    // Structural (stateless) transform: emit a subset of the input frame's
+    // channels unchanged. "all" keeps everything (identity); "label" keeps
+    // channels whose label contains the selection substring (e.g. "mav" to pull
+    // just the MAV features out of a concatenated feature vector); "index" keeps
+    // an explicit comma-separated list of indices and a-b ranges (e.g. "0-8,12").
+    // Labels are preserved so downstream nodes/viewers keep meaningful names.
+    std::vector<nat::core::NatSignalFrameDataSchemaV1> transformChannelSelect(
+        const NormalizedNumericChannelFrame& record)
+    {
+        const size_t channel_count = record.channelLabels.size();
+        const size_t samples_per_channel = record.samplesPerChannel;
+
+        std::vector<size_t> selected{};
+        if (config.select_mode == "index" && !config.selection.empty()) {
+            std::stringstream token_stream(config.selection);
+            std::string token;
+            while (std::getline(token_stream, token, ',')) {
+                const auto first = token.find_first_not_of(" \t");
+                if (first == std::string::npos) {
+                    continue;
+                }
+                const auto last = token.find_last_not_of(" \t");
+                token = token.substr(first, last - first + 1);
+                const auto dash = token.find('-');
+                try {
+                    if (dash != std::string::npos) {
+                        const long lo = std::stol(token.substr(0, dash));
+                        const long hi = std::stol(token.substr(dash + 1));
+                        for (long i = std::max<long>(0, lo);
+                             i <= hi && i < static_cast<long>(channel_count);
+                             ++i) {
+                            selected.push_back(static_cast<size_t>(i));
+                        }
+                    } else {
+                        const long idx = std::stol(token);
+                        if (idx >= 0 && idx < static_cast<long>(channel_count)) {
+                            selected.push_back(static_cast<size_t>(idx));
+                        }
+                    }
+                } catch (const std::exception&) {
+                    // Skip malformed tokens rather than dropping the frame.
+                }
+            }
+        } else if (config.select_mode == "label" && !config.selection.empty()) {
+            for (size_t i = 0; i < channel_count; ++i) {
+                if (record.channelLabels[i].find(config.selection) !=
+                    std::string::npos) {
+                    selected.push_back(i);
+                }
+            }
+        } else {
+            // "all", or an empty selection: pass every channel through.
+            for (size_t i = 0; i < channel_count; ++i) {
+                selected.push_back(i);
+            }
+        }
+
+        std::vector<std::string> out_labels{};
+        std::vector<float> out_samples{};
+        out_labels.reserve(selected.size());
+        out_samples.reserve(selected.size() * samples_per_channel);
+        std::vector<bool> emitted(channel_count, false);
+        for (const size_t channel_index : selected) {
+            if (channel_index >= channel_count || emitted[channel_index]) {
+                continue;
+            }
+            emitted[channel_index] = true;
+            out_labels.push_back(record.channelLabels[channel_index]);
+            const size_t offset = channel_index * samples_per_channel;
+            for (size_t sample_index = 0; sample_index < samples_per_channel;
+                 ++sample_index) {
+                const size_t flat = offset + sample_index;
+                out_samples.push_back(
+                    flat < record.samples.size() ? record.samples[flat] : 0.0f);
+            }
+        }
+
+        std::vector<nat::core::NatSignalFrameDataSchemaV1> output{};
+        output.emplace_back(
+            record.deviceId,
+            record.seqNo,
+            record.deviceTsUs,
+            record.sampleRateHz,
+            out_labels,
+            out_samples,
             static_cast<uint32_t>(samples_per_channel));
         return output;
     }
@@ -4570,6 +4817,9 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "list_transform_capabilities") {
             handleListTransformCapabilities(conn, json);
         }
+        else if (action == "list_node_catalog") {
+            handleListNodeCatalog(conn, json);
+        }
         else if (action == "create_transform" || action == "create_emg_transform") {
             handleCreateTransform(conn, json);
         }
@@ -4634,11 +4884,19 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
                     if (dataTopic != nullptr) {
                         ctx->messengers.push_back(broker_manager_->createMessenger(dataTopic));
                     }
-                    ctx->subscribed_streams.insert(stream_id);
-                    LOG_INFO << "StreamViewer: Subscribed to stream " << stream_id;
                     break;
                 }
             }
+
+            // Record the subscription intent regardless of whether the stream
+            // was discoverable just now. A stream produced by a graph that was
+            // only just started (a transform/combine output) frequently isn't
+            // in getAllStreams() yet at subscribe time; the streaming thread
+            // resolves such pending subscriptions lazily. Previously the intent
+            // was only recorded inside the "found" branch, so a not-yet-visible
+            // stream was dropped silently and never delivered any data.
+            ctx->subscribed_streams.insert(stream_id);
+            LOG_INFO << "StreamViewer: Subscribed to stream " << stream_id;
         }
 
         // Start streaming thread if not already running
@@ -4752,6 +5010,13 @@ void StreamViewerWebSocket::handleListTransformCapabilities(
     const nlohmann::json& json)
 {
     sendTransformCapabilities(conn, json.value("request_id", std::string{}));
+}
+
+void StreamViewerWebSocket::handleListNodeCatalog(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    sendNodeCatalog(conn, json.value("request_id", std::string{}));
 }
 
 void StreamViewerWebSocket::handleCreateTransform(
@@ -4980,6 +5245,463 @@ void StreamViewerWebSocket::handleGetStreamGraphStatus(
         graph_id);
 }
 
+namespace {
+
+// Push helpers usable from the background start thread (the member send*
+// methods are only reachable with `this`, and this free-function form lets the
+// detached worker report progress). Both no-op if the client has gone away.
+void pushStreamGraphStatusMessage(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const std::string& graph_id)
+{
+    if (!conn || !conn->connected()) {
+        return;
+    }
+    nlohmann::json response;
+    response["type"] = "stream_graph_status";
+    response["request_id"] = request_id;
+    response["graph_id"] = graph_id;
+    response["status"] = nlohmann::json::object();
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto search = g_stream_graphs.find(graph_id);
+        if (search != g_stream_graphs.end()) {
+            response["status"] = makeGraphStatusJson(search->second);
+        }
+    }
+    conn->send(response.dump());
+}
+
+void pushStreamGraphStartedMessage(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const std::string& graph_id)
+{
+    if (!conn || !conn->connected()) {
+        return;
+    }
+    nlohmann::json response;
+    response["type"] = "stream_graph_started";
+    response["request_id"] = request_id;
+    response["graph_id"] = graph_id;
+    response["graph_run_id"] = nullptr;
+    response["node_statuses"] = nlohmann::json::object();
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto runtime_search = g_stream_graph_runtime.find(graph_id);
+        if (runtime_search != g_stream_graph_runtime.end()) {
+            response["graph_run_id"] = runtime_search->second.activeRunId;
+            for (const auto& entry : runtime_search->second.nodeStatuses) {
+                response["node_statuses"][entry.first] = entry.second;
+            }
+        }
+    }
+    conn->send(response.dump());
+}
+
+// Brings a validated graph up node-by-node on a background thread. Each
+// transform/combine node creates Kafka topics + a worker, which is slow, so the
+// caller runs this detached after seeding a "starting" runtime; here we stream a
+// stream_graph_status after every node so the client watches progress instead of
+// staring at a frozen UI. activeRunId is the generation token: if the user stops
+// the graph or starts a fresh run mid-flight, this run is cancelled and any
+// workers it already created are torn back down.
+void executeStreamGraphStart(
+    std::shared_ptr<nat::kafka::BrokerManager> broker_manager,
+    WebSocketConnectionPtr conn,
+    std::string request_id,
+    StreamGraphDefinition graph,
+    std::string active_run_id)
+{
+    std::unordered_map<std::string, const StreamGraphNode*> nodes_by_id;
+    std::unordered_map<std::string, StreamGraphNode*> mutable_nodes_by_id;
+    std::unordered_map<std::string, uint64_t> resolved_output_stream_ids;
+    for (auto& node : graph.nodes) {
+        nodes_by_id[node.id] = &node;
+        mutable_nodes_by_id[node.id] = &node;
+        if (node.kind == "stream_source" && node.streamId.has_value()) {
+            resolved_output_stream_ids[node.id] = node.streamId.value();
+        }
+    }
+
+    struct ResolvedInput {
+        std::optional<uint64_t> streamId;
+        std::optional<std::string> upstreamNodeId;
+    };
+
+    const auto resolveInputStreamId = [&](const StreamGraphNode& node) -> ResolvedInput {
+        const auto upstream_edge = std::find_if(
+            graph.edges.begin(),
+            graph.edges.end(),
+            [&node](const StreamGraphEdge& edge) {
+                return edge.targetNodeId == node.id;
+            });
+        if (upstream_edge == graph.edges.end()) {
+            return ResolvedInput{std::nullopt, std::nullopt};
+        }
+
+        const auto upstream_node_search =
+            nodes_by_id.find(upstream_edge->sourceNodeId);
+        if (upstream_node_search == nodes_by_id.end()) {
+            return ResolvedInput{std::nullopt, std::nullopt};
+        }
+
+        if (upstream_node_search->second->kind == "stream_source" &&
+            upstream_node_search->second->streamId.has_value()) {
+            return ResolvedInput{
+                upstream_node_search->second->streamId.value(),
+                upstream_edge->sourceNodeId};
+        }
+
+        const auto resolved_search =
+            resolved_output_stream_ids.find(upstream_edge->sourceNodeId);
+        if (resolved_search == resolved_output_stream_ids.end()) {
+            return ResolvedInput{std::nullopt, upstream_edge->sourceNodeId};
+        }
+        return ResolvedInput{resolved_search->second, upstream_edge->sourceNodeId};
+    };
+
+    // True if this run has been superseded/stopped (checked without mutating).
+    const auto runCancelled = [&]() -> bool {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto it = g_stream_graph_runtime.find(graph.graphId);
+        return it == g_stream_graph_runtime.end() ||
+               it->second.activeRunId != active_run_id ||
+               it->second.runState == "stopped";
+    };
+
+    std::vector<uint64_t> created_output_ids;
+    const auto abortCleanup = [&]() {
+        for (uint64_t id : created_output_ids) {
+            stopGraphWorkerByOutputStreamId(id);
+        }
+    };
+
+    // Publishes a node's status into the shared runtime, but only while this run
+    // is still the active one — the check and the write happen under the same
+    // lock so a concurrent stop can't slip a leaked worker past us. Returns false
+    // when the run was cancelled, signalling the caller to abort. new_output_id,
+    // when set, is registered so a later stop tears that worker down.
+    const auto commitNodeStatus =
+        [&](const std::string& node_id,
+            const StreamGraphNodeRuntimeStatus& status,
+            std::optional<uint64_t> new_output_id) -> bool {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto it = g_stream_graph_runtime.find(graph.graphId);
+        if (it == g_stream_graph_runtime.end() ||
+            it->second.activeRunId != active_run_id ||
+            it->second.runState == "stopped") {
+            return false;
+        }
+        it->second.nodeStatuses[node_id] = status;
+        if (new_output_id.has_value()) {
+            it->second.outputStreamIds.push_back(new_output_id.value());
+        }
+        return true;
+    };
+
+    bool encountered_error = false;
+    bool aborted = false;
+
+    for (const auto& node_id : topologicallySortStreamGraph(graph)) {
+        if (runCancelled()) {
+            aborted = true;
+            break;
+        }
+        const auto node_search = nodes_by_id.find(node_id);
+        if (node_search == nodes_by_id.end()) {
+            continue;
+        }
+        const auto& node = *node_search->second;
+
+        // Sources were marked running when the runtime was seeded.
+        if (node.kind == "stream_source") {
+            continue;
+        }
+
+        if (node.kind == "viewer" || node.kind == "sink") {
+            const auto resolved_input = resolveInputStreamId(node);
+            StreamGraphNodeRuntimeStatus status;
+            if (!resolved_input.streamId.has_value()) {
+                encountered_error = true;
+                status = StreamGraphNodeRuntimeStatus{
+                    "blocked",
+                    std::nullopt,
+                    std::nullopt,
+                    std::nullopt,
+                    0,
+                    0,
+                    resolved_input.upstreamNodeId.has_value()
+                        ? std::string("Blocked: upstream node ") +
+                              resolved_input.upstreamNodeId.value() + " failed to start."
+                        : std::string("Utility node input is not connected to a stream-producing node.")};
+            } else {
+                status = StreamGraphNodeRuntimeStatus{
+                    "running",
+                    resolved_input.streamId.value(),
+                    std::nullopt,
+                    std::nullopt,
+                    0,
+                    0,
+                    node.kind == "viewer"
+                        ? std::optional<std::string>("Viewer node is ready to inspect the upstream stream.")
+                        : std::optional<std::string>("Sink node is attached to the upstream stream.")};
+            }
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+        if (node.kind == "combine") {
+            std::vector<uint64_t> input_stream_ids{};
+            std::optional<std::string> blocking_upstream{};
+            bool all_resolved = true;
+            for (const auto& edge : graph.edges) {
+                if (edge.targetNodeId != node.id) {
+                    continue;
+                }
+                const auto upstream_node_search = nodes_by_id.find(edge.sourceNodeId);
+                std::optional<uint64_t> resolved_stream_id{};
+                if (upstream_node_search != nodes_by_id.end() &&
+                    upstream_node_search->second->kind == "stream_source" &&
+                    upstream_node_search->second->streamId.has_value()) {
+                    resolved_stream_id = upstream_node_search->second->streamId.value();
+                } else {
+                    const auto resolved_search =
+                        resolved_output_stream_ids.find(edge.sourceNodeId);
+                    if (resolved_search != resolved_output_stream_ids.end()) {
+                        resolved_stream_id = resolved_search->second;
+                    }
+                }
+                if (!resolved_stream_id.has_value()) {
+                    all_resolved = false;
+                    blocking_upstream = edge.sourceNodeId;
+                    break;
+                }
+                input_stream_ids.push_back(resolved_stream_id.value());
+            }
+
+            if (!all_resolved || input_stream_ids.size() < 2U) {
+                encountered_error = true;
+                const StreamGraphNodeRuntimeStatus status{
+                    blocking_upstream.has_value() ? "blocked" : "error",
+                    std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                    blocking_upstream.has_value()
+                        ? std::string("Blocked: upstream node ") + blocking_upstream.value() +
+                              " failed to start."
+                        : std::string("combine node requires at least two connected inputs.")};
+                if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                    aborted = true;
+                    break;
+                }
+                pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                continue;
+            }
+
+            const auto create_result = createCombineWorker(
+                broker_manager, input_stream_ids, node.outputIdentifier.value_or(node.id));
+            if (!create_result.ok) {
+                encountered_error = true;
+                const StreamGraphNodeRuntimeStatus status{
+                    "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                    create_result.error};
+                if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                    aborted = true;
+                    break;
+                }
+                pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                continue;
+            }
+
+            created_output_ids.push_back(create_result.outputStreamId);
+            const StreamGraphNodeRuntimeStatus status{
+                "running",
+                create_result.outputStreamId,
+                create_result.workerId,
+                create_result.threadSlotId,
+                0, 0,
+                create_result.alreadyExists
+                    ? std::optional<std::string>("Reused existing combine worker.")
+                    : std::nullopt,
+            };
+            if (!commitNodeStatus(node.id, status, create_result.outputStreamId)) {
+                aborted = true;
+                break;
+            }
+            resolved_output_stream_ids[node.id] = create_result.outputStreamId;
+            const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
+            if (mutable_node_search != mutable_nodes_by_id.end() &&
+                mutable_node_search->second != nullptr) {
+                mutable_node_search->second->outputStreamId = create_result.outputStreamId;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+
+        if (node.kind != "transform") {
+            continue;
+        }
+
+        const auto resolved_input = resolveInputStreamId(node);
+        if (!resolved_input.streamId.has_value()) {
+            encountered_error = true;
+            const StreamGraphNodeRuntimeStatus status{
+                resolved_input.upstreamNodeId.has_value() ? "blocked" : "error",
+                std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                resolved_input.upstreamNodeId.has_value()
+                    ? std::string("Blocked: upstream node ") +
+                          resolved_input.upstreamNodeId.value() + " failed to start."
+                    : std::string("Transform node input is not connected.")};
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+
+        nlohmann::json transform_json;
+        transform_json["transform_kind"] =
+            node.transformKind.value_or(std::string{});
+        transform_json["config"] = node.config;
+        const auto config_maybe = parseEmgTransformConfig(transform_json);
+        if (!config_maybe.has_value()) {
+            encountered_error = true;
+            const StreamGraphNodeRuntimeStatus status{
+                "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                std::string("Transform configuration could not be parsed.")};
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+
+        const auto create_result = createTransformWorker(
+            broker_manager,
+            resolved_input.streamId.value(),
+            node.outputIdentifier.value_or(node.id),
+            config_maybe.value(),
+            node.inputMappingId.value_or(std::string{}),
+            graph.graphId,
+            active_run_id,
+            node.id);
+        if (!create_result.ok) {
+            encountered_error = true;
+            const StreamGraphNodeRuntimeStatus status{
+                "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                create_result.error};
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+
+        created_output_ids.push_back(create_result.outputStreamId);
+        const StreamGraphNodeRuntimeStatus status{
+            "running",
+            create_result.outputStreamId,
+            create_result.workerId,
+            create_result.threadSlotId,
+            0,
+            0,
+            create_result.alreadyExists
+                ? std::optional<std::string>("Reused existing transform worker.")
+                : std::nullopt,
+        };
+        if (!commitNodeStatus(node.id, status, create_result.outputStreamId)) {
+            aborted = true;
+            break;
+        }
+        resolved_output_stream_ids[node.id] = create_result.outputStreamId;
+        const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
+        if (mutable_node_search != mutable_nodes_by_id.end() &&
+            mutable_node_search->second != nullptr) {
+            mutable_node_search->second->outputStreamId = create_result.outputStreamId;
+        }
+        pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+    }
+
+    if (aborted) {
+        abortCleanup();
+        return;
+    }
+
+    // Finalize under the lock: derive the terminal run state and, mirroring the
+    // original all-or-nothing failure handling, tear every worker back down if
+    // any node failed. Persist the graph with its resolved output stream ids.
+    std::vector<uint64_t> ids_to_stop;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto it = g_stream_graph_runtime.find(graph.graphId);
+        if (it == g_stream_graph_runtime.end() ||
+            it->second.activeRunId != active_run_id ||
+            it->second.runState == "stopped") {
+            aborted = true;
+        } else {
+            auto& runtime = it->second;
+            bool has_running_node = false;
+            for (const auto& entry : runtime.nodeStatuses) {
+                if (entry.second.state == "running") {
+                    has_running_node = true;
+                    break;
+                }
+            }
+
+            if (encountered_error && !runtime.outputStreamIds.empty()) {
+                ids_to_stop = runtime.outputStreamIds;
+                for (auto& entry : runtime.nodeStatuses) {
+                    auto& status = entry.second;
+                    if (status.outputStreamId.has_value() &&
+                        (status.state == "running" || status.state == "starting" ||
+                         status.state == "stalled")) {
+                        status.state = "stopped";
+                        if (!status.message.has_value()) {
+                            status.message =
+                                std::string("Stopped after graph startup failed.");
+                        }
+                    }
+                }
+                runtime.outputStreamIds.clear();
+            }
+
+            runtime.runState = encountered_error
+                ? "error"
+                : (has_running_node ? "running" : "stopped");
+
+            g_stream_graphs[graph.graphId] = graph;
+            std::string persist_error;
+            if (!persistStreamGraphStoreLocked(persist_error)) {
+                LOG_ERROR << "Failed to persist stream graph runtime outputs for "
+                          << graph.graphId << ": " << persist_error;
+            }
+        }
+    }
+
+    if (aborted) {
+        abortCleanup();
+        return;
+    }
+
+    for (uint64_t id : ids_to_stop) {
+        stopGraphWorkerByOutputStreamId(id);
+    }
+
+    pushStreamGraphStartedMessage(conn, request_id, graph.graphId);
+    // Follow the started signal with an authoritative status so a graph that
+    // came up in an error/stopped state lands immediately — the client's
+    // started handler optimistically assumes "running".
+    pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+}
+
+}  // namespace
+
 void StreamViewerWebSocket::handleStartStreamGraph(
     const WebSocketConnectionPtr& conn,
     const nlohmann::json& json)
@@ -5030,21 +5752,18 @@ void StreamViewerWebSocket::handleStartStreamGraph(
         return;
     }
 
+    // Seed a "starting" runtime up front — sources are immediately available,
+    // every other node is pending — so a status snapshot reflects the click at
+    // once. The slow per-node worker creation then runs on a detached thread
+    // (executeStreamGraphStart) that streams incremental status updates. Doing
+    // this inline previously froze the WebSocket handler for the full Kafka
+    // topic-creation time (tens of seconds) before the client saw anything.
     StreamGraphRuntimeState runtime;
     runtime.graphId = graph.graphId;
     runtime.activeRunId = graph.graphId + ":" + std::to_string(nowUs());
     runtime.runState = "starting";
-
-    std::unordered_map<std::string, const StreamGraphNode*> nodes_by_id;
-    std::unordered_map<std::string, StreamGraphNode*> mutable_nodes_by_id;
-    std::unordered_map<std::string, uint64_t> resolved_output_stream_ids;
-    for (auto& node : graph.nodes) {
-        nodes_by_id[node.id] = &node;
-        mutable_nodes_by_id[node.id] = &node;
+    for (const auto& node : graph.nodes) {
         if (node.kind == "stream_source") {
-            if (node.streamId.has_value()) {
-                resolved_output_stream_ids[node.id] = node.streamId.value();
-            }
             runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
                 "running",
                 node.streamId,
@@ -5056,268 +5775,34 @@ void StreamViewerWebSocket::handleStartStreamGraph(
                     ? std::optional<std::string>("Source stream is available to downstream nodes.")
                     : std::nullopt};
         } else {
-            runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{};
-        }
-    }
-
-    struct ResolvedInput {
-        std::optional<uint64_t> streamId;
-        std::optional<std::string> upstreamNodeId;
-    };
-
-    const auto resolveInputStreamId = [&](const StreamGraphNode& node) -> ResolvedInput {
-        const auto upstream_edge = std::find_if(
-            graph.edges.begin(),
-            graph.edges.end(),
-            [&node](const StreamGraphEdge& edge) {
-                return edge.targetNodeId == node.id;
-            });
-        if (upstream_edge == graph.edges.end()) {
-            return ResolvedInput{std::nullopt, std::nullopt};
-        }
-
-        const auto upstream_node_search =
-            nodes_by_id.find(upstream_edge->sourceNodeId);
-        if (upstream_node_search == nodes_by_id.end()) {
-            return ResolvedInput{std::nullopt, std::nullopt};
-        }
-
-        if (upstream_node_search->second->kind == "stream_source" &&
-            upstream_node_search->second->streamId.has_value()) {
-            return ResolvedInput{
-                upstream_node_search->second->streamId.value(),
-                upstream_edge->sourceNodeId};
-        }
-
-        const auto resolved_search =
-            resolved_output_stream_ids.find(upstream_edge->sourceNodeId);
-        if (resolved_search == resolved_output_stream_ids.end()) {
-            return ResolvedInput{std::nullopt, upstream_edge->sourceNodeId};
-        }
-        return ResolvedInput{resolved_search->second, upstream_edge->sourceNodeId};
-    };
-
-    for (const auto& node_id : topologicallySortStreamGraph(graph)) {
-        const auto node_search = nodes_by_id.find(node_id);
-        if (node_search == nodes_by_id.end()) {
-            continue;
-        }
-        const auto& node = *node_search->second;
-        if (node.kind == "viewer" || node.kind == "sink") {
-            const auto resolved_input = resolveInputStreamId(node);
-            if (!resolved_input.streamId.has_value()) {
-                const std::string message = resolved_input.upstreamNodeId.has_value()
-                    ? std::string("Blocked: upstream node ") +
-                          resolved_input.upstreamNodeId.value() + " failed to start."
-                    : std::string("Utility node input is not connected to a stream-producing node.");
-                runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                    "blocked",
-                    std::nullopt,
-                    std::nullopt,
-                    std::nullopt,
-                    0,
-                    0,
-                    message};
-                runtime.runState = "error";
-                continue;
-            }
-
             runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                "running",
-                resolved_input.streamId.value(),
+                "starting",
+                std::nullopt,
                 std::nullopt,
                 std::nullopt,
                 0,
                 0,
-                node.kind == "viewer"
-                    ? std::optional<std::string>("Viewer node is ready to inspect the upstream stream.")
-                    : std::optional<std::string>("Sink node is attached to the upstream stream.")};
-            continue;
-        }
-        if (node.kind == "combine") {
-            std::vector<uint64_t> input_stream_ids{};
-            std::optional<std::string> blocking_upstream{};
-            bool all_resolved = true;
-            for (const auto& edge : graph.edges) {
-                if (edge.targetNodeId != node.id) {
-                    continue;
-                }
-                const auto upstream_node_search = nodes_by_id.find(edge.sourceNodeId);
-                std::optional<uint64_t> resolved_stream_id{};
-                if (upstream_node_search != nodes_by_id.end() &&
-                    upstream_node_search->second->kind == "stream_source" &&
-                    upstream_node_search->second->streamId.has_value()) {
-                    resolved_stream_id = upstream_node_search->second->streamId.value();
-                } else {
-                    const auto resolved_search =
-                        resolved_output_stream_ids.find(edge.sourceNodeId);
-                    if (resolved_search != resolved_output_stream_ids.end()) {
-                        resolved_stream_id = resolved_search->second;
-                    }
-                }
-                if (!resolved_stream_id.has_value()) {
-                    all_resolved = false;
-                    blocking_upstream = edge.sourceNodeId;
-                    break;
-                }
-                input_stream_ids.push_back(resolved_stream_id.value());
-            }
-
-            if (!all_resolved || input_stream_ids.size() < 2U) {
-                const std::string message = blocking_upstream.has_value()
-                    ? std::string("Blocked: upstream node ") + blocking_upstream.value() +
-                          " failed to start."
-                    : std::string("combine node requires at least two connected inputs.");
-                runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                    blocking_upstream.has_value() ? "blocked" : "error",
-                    std::nullopt, std::nullopt, std::nullopt, 0, 0,
-                    message};
-                runtime.runState = "error";
-                continue;
-            }
-
-            const auto create_result = createCombineWorker(
-                broker_manager_, input_stream_ids, node.outputIdentifier.value_or(node.id));
-            if (!create_result.ok) {
-                runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                    "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
-                    create_result.error};
-                runtime.runState = "error";
-                continue;
-            }
-
-            resolved_output_stream_ids[node.id] = create_result.outputStreamId;
-            runtime.outputStreamIds.push_back(create_result.outputStreamId);
-            const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
-            if (mutable_node_search != mutable_nodes_by_id.end() &&
-                mutable_node_search->second != nullptr) {
-                mutable_node_search->second->outputStreamId = create_result.outputStreamId;
-            }
-            runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                "running",
-                create_result.outputStreamId,
-                create_result.workerId,
-                create_result.threadSlotId,
-                0, 0,
-                create_result.alreadyExists
-                    ? std::optional<std::string>("Reused existing combine worker.")
-                    : std::nullopt,
-            };
-            continue;
-        }
-
-        if (node.kind != "transform") {
-            continue;
-        }
-
-        const auto resolved_input = resolveInputStreamId(node);
-        if (!resolved_input.streamId.has_value()) {
-            const std::string message = resolved_input.upstreamNodeId.has_value()
-                ? std::string("Blocked: upstream node ") +
-                      resolved_input.upstreamNodeId.value() + " failed to start."
-                : std::string("Transform node input is not connected.");
-            runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                resolved_input.upstreamNodeId.has_value() ? "blocked" : "error",
-                std::nullopt, std::nullopt, std::nullopt, 0, 0,
-                message};
-            runtime.runState = "error";
-            continue;
-        }
-        const auto input_stream_id = resolved_input.streamId;
-
-        nlohmann::json transform_json;
-        transform_json["transform_kind"] =
-            node.transformKind.value_or(std::string{});
-        transform_json["config"] = node.config;
-        const auto config_maybe = parseEmgTransformConfig(transform_json);
-        if (!config_maybe.has_value()) {
-            runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
-                std::string("Transform configuration could not be parsed.")};
-            runtime.runState = "error";
-            continue;
-        }
-
-        const auto create_result = createTransformWorker(
-            broker_manager_,
-            input_stream_id.value(),
-            node.outputIdentifier.value_or(node.id),
-            config_maybe.value(),
-            node.inputMappingId.value_or(std::string{}),
-            graph.graphId,
-            runtime.activeRunId,
-            node.id);
-        if (!create_result.ok) {
-            runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-                "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
-                create_result.error};
-            runtime.runState = "error";
-            continue;
-        }
-
-        resolved_output_stream_ids[node.id] = create_result.outputStreamId;
-        runtime.outputStreamIds.push_back(create_result.outputStreamId);
-        const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
-        if (mutable_node_search != mutable_nodes_by_id.end() &&
-            mutable_node_search->second != nullptr) {
-            mutable_node_search->second->outputStreamId = create_result.outputStreamId;
-        }
-        runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
-            "running",
-            create_result.outputStreamId,
-            create_result.workerId,
-            create_result.threadSlotId,
-            0,
-            0,
-            create_result.alreadyExists
-                ? std::optional<std::string>("Reused existing transform worker.")
-                : std::nullopt,
-        };
-    }
-
-    bool has_running_node = false;
-    for (const auto& entry : runtime.nodeStatuses) {
-        if (entry.second.state == "running") {
-            has_running_node = true;
-            break;
+                std::optional<std::string>("Waiting to start…")};
         }
     }
 
-    if (runtime.runState == "error" && !runtime.outputStreamIds.empty()) {
-        for (const auto output_stream_id : runtime.outputStreamIds) {
-            stopGraphWorkerByOutputStreamId(output_stream_id);
-        }
-        for (auto& entry : runtime.nodeStatuses) {
-            auto& status = entry.second;
-            if (status.outputStreamId.has_value() &&
-                (status.state == "running" || status.state == "starting" ||
-                 status.state == "stalled")) {
-                status.state = "stopped";
-                if (!status.message.has_value()) {
-                    status.message =
-                        std::string("Stopped after graph startup failed.");
-                }
-            }
-        }
-        runtime.outputStreamIds.clear();
-    }
-
-    if (runtime.runState != "error") {
-        runtime.runState = has_running_node ? "running" : "stopped";
-    }
-
+    const std::string active_run_id = runtime.activeRunId;
     {
         std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
-        g_stream_graphs[graph.graphId] = graph;
-        std::string persist_error;
-        if (!persistStreamGraphStoreLocked(persist_error)) {
-            LOG_ERROR << "Failed to persist stream graph runtime outputs for "
-                      << graph.graphId << ": " << persist_error;
-        }
         g_stream_graph_runtime[graph.graphId] = runtime;
     }
 
-    sendStreamGraphStarted(conn, request_id, graph.graphId);
+    // Immediate feedback before the (slow) worker creation begins.
+    sendStreamGraphStatus(conn, request_id, graph.graphId);
+
+    std::thread(
+        executeStreamGraphStart,
+        broker_manager_,
+        conn,
+        request_id,
+        std::move(graph),
+        active_run_id)
+        .detach();
 }
 
 void StreamViewerWebSocket::handleStopStreamGraph(
@@ -5451,6 +5936,8 @@ void StreamViewerWebSocket::streamingThreadFunc(const WebSocketConnectionPtr& co
 {
     LOG_INFO << "StreamViewer: Streaming thread started";
 
+    uint64_t last_pending_resolve_us = 0;
+
     while (ctx->active.load()) {
         // Check if connection is still valid
         if (!conn || !conn->connected()) {
@@ -5463,7 +5950,48 @@ void StreamViewerWebSocket::streamingThreadFunc(const WebSocketConnectionPtr& co
 
         try {
             std::lock_guard<std::mutex> lock(ctx->mutex);
-            
+
+            // Lazily bind messengers for any subscription whose stream wasn't
+            // discoverable at subscribe time (e.g. a transform/combine output
+            // from a graph that had only just been started). Without this, such
+            // a subscription would never deliver data — the "Waiting for
+            // EMG data…" that showed up whenever the viewer was opened before
+            // the output stream had propagated. Throttled so we don't call
+            // getAllStreams() on every 10 ms poll.
+            if (broker_manager_ &&
+                ctx->messengers.size() < ctx->subscribed_streams.size()) {
+                std::set<uint64_t> resolved_ids;
+                for (const auto& messenger : ctx->messengers) {
+                    resolved_ids.insert(messenger->getId());
+                }
+                const uint64_t now_us = nowUs();
+                if (now_us - last_pending_resolve_us > 500000ULL) {
+                    last_pending_resolve_us = now_us;
+                    auto rawStreams = broker_manager_->getAllStreams();
+                    for (uint64_t stream_id : ctx->subscribed_streams) {
+                        if (resolved_ids.count(stream_id) > 0) {
+                            continue;
+                        }
+                        for (const auto& stream : rawStreams) {
+                            if (stream->getId() != stream_id) {
+                                continue;
+                            }
+                            auto dataTopics = stream->getTopicsByType(
+                                nat::core::StreamType::DATA);
+                            auto dataTopic = choosePreferredDataTopic(dataTopics);
+                            if (dataTopic != nullptr) {
+                                ctx->messengers.push_back(
+                                    broker_manager_->createMessenger(dataTopic));
+                                LOG_INFO << "StreamViewer: Lazily bound messenger "
+                                            "for stream "
+                                         << stream_id;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             for (auto& messenger : ctx->messengers) {
                 if (!ctx->active.load()) break;  // Check again in case we should stop
                 
@@ -5976,6 +6504,17 @@ void StreamViewerWebSocket::sendTransformCapabilities(
     json["type"] = "transform_capabilities";
     json["request_id"] = request_id;
     json["transforms"] = buildTransformCapabilitiesJson();
+    conn->send(json.dump());
+}
+
+void StreamViewerWebSocket::sendNodeCatalog(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id)
+{
+    nlohmann::json json;
+    json["type"] = "node_catalog";
+    json["request_id"] = request_id;
+    json["nodes"] = buildNodeCatalogJson();
     conn->send(json.dump());
 }
 
