@@ -764,6 +764,52 @@ nlohmann::json formatSignalFrameAsJson(
     return json;
 }
 
+// Descriptor-driven generic channel-frame message (Phase 3 of the
+// visual-programming rework). ANY record whose descriptor matches the canonical
+// channel-frame contract is projected to this one wire message via
+// tryNormalizeNumericChannelFrame — no per-sensor formatter, no dynamic_cast.
+// The frontend treats `frame` exactly like the legacy `emg_data` message (kept
+// as a compatibility alias). This is how a new sensor is onboarded with zero
+// dispatch/formatter edits.
+nlohmann::json formatNormalizedFrameAsJson(
+    const NormalizedNumericChannelFrame& frame,
+    uint64_t stream_id,
+    const std::string& encoding_type,
+    const std::string& schema_name)
+{
+    nlohmann::json json;
+    json["type"] = "frame";
+    json["stream_id"] = std::to_string(stream_id);
+    json["schema_name"] = schema_name;
+    json["encoding"]["type"] = encoding_type;
+    json["encoding"]["size"] = 0;
+    json["schema_version"] = "1";
+    json["device_id"] = frame.deviceId;
+    json["seq_no"] = frame.seqNo;
+    json["device_ts_us"] = frame.deviceTsUs;
+    json["n_channels"] = frame.channelLabels.size();
+    json["samples_per_channel"] = frame.samplesPerChannel;
+    json["sample_rate_hz"] = frame.sampleRateHz;
+    json["channel_labels"] = frame.channelLabels;
+    json["payload"] = nlohmann::json::array();
+
+    const size_t samples_per_channel = frame.samplesPerChannel;
+    for (size_t channel_index = 0; channel_index < frame.channelLabels.size();
+         ++channel_index) {
+        nlohmann::json channel = nlohmann::json::array();
+        const size_t offset = channel_index * samples_per_channel;
+        for (size_t sample_index = 0; sample_index < samples_per_channel;
+             ++sample_index) {
+            if (offset + sample_index < frame.samples.size()) {
+                channel.push_back(frame.samples[offset + sample_index]);
+            }
+        }
+        json["payload"].push_back(channel);
+    }
+
+    return json;
+}
+
 struct TransformConfig {
     std::string kind;
     double cutoff_hz = 20.0;
@@ -6133,6 +6179,33 @@ void StreamViewerWebSocket::streamingThreadFunc(const WebSocketConnectionPtr& co
                             conn->send(json.dump());
                         }
                         continue;
+                    }
+
+                    // --- Generic descriptor-driven fallback (Phase 3) ---
+                    // No concrete formatter matched. If the record's descriptor
+                    // matches the canonical channel-frame contract, project it
+                    // to one generic `frame` message. This is how a NEW sensor
+                    // is onboarded end-to-end with zero dispatch/formatter edits:
+                    // register a schema + descriptor whose fields match the
+                    // channel-frame contract and it plots + is transform-ready.
+                    auto descriptor_maybe =
+                        nat::core::DataSchemaDescriptorRegistry::getDefault()
+                            .findBySchemaName(schema_name);
+                    if (descriptor_maybe.has_value() &&
+                        descriptor_maybe.value() != nullptr) {
+                        auto frame = tryNormalizeNumericChannelFrame(
+                            *message, *descriptor_maybe.value());
+                        if (frame.has_value()) {
+                            auto json = formatNormalizedFrameAsJson(
+                                frame.value(),
+                                stream_id,
+                                encoding_type,
+                                schema_name);
+                            if (conn && conn->connected()) {
+                                conn->send(json.dump());
+                            }
+                            continue;
+                        }
                     }
                 }
             }
