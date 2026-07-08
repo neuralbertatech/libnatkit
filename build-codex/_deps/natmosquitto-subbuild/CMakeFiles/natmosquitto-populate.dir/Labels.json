@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/CMakeFiles/natmosquitto-populate"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/CMakeFiles/natmosquitto-populate.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/CMakeFiles/natmosquitto-populate-complete.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-build.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-configure.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-download.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-install.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-patch.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-test.rule"
+		},
+		{
+			"file" : "/home/zach/code/natKit/libnatkit/build-codex/_deps/natmosquitto-subbuild/natmosquitto-populate-prefix/src/natmosquitto-populate-stamp/natmosquitto-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"natmosquitto-populate"
+		],
+		"name" : "natmosquitto-populate"
+	}
+}

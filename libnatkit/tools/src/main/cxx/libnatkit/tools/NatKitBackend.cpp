@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdlib.h>
 #include <thread>
@@ -29,6 +30,7 @@
 #include <iostream>
 
 #include "StreamViewerWebSocket.hpp"
+#include "Auth.hpp"
 
 using namespace drogon;
 using namespace std::chrono_literals;
@@ -48,6 +50,90 @@ std::string generate_uuid() {
         ss << hex[dis(gen)];
     }
     return ss.str();
+}
+
+Json::Value authUserToJson(const AuthenticatedUser& user)
+{
+    Json::Value json;
+    json["username"] = user.username;
+    json["display_name"] = user.display_name;
+    json["is_admin"] = user.is_admin;
+    return json;
+}
+
+std::optional<Json::Value> getDescriptorJsonForSchemaName(
+    const std::string& schema_name)
+{
+    auto descriptor_maybe =
+        nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
+            schema_name);
+    if (!descriptor_maybe.has_value()) {
+        return std::nullopt;
+    }
+
+    auto encoded = descriptor_maybe.value()->encodeToBytes(
+        nat::core::SerializationType::Json);
+    if (!encoded) {
+        return std::nullopt;
+    }
+
+    Json::Value descriptor_json;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::string payload(encoded->begin(), encoded->end());
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    if (!reader->parse(
+            payload.data(),
+            payload.data() + payload.size(),
+            &descriptor_json,
+            &errors)) {
+        return std::nullopt;
+    }
+
+    return descriptor_json;
+}
+
+Json::Value authUserSummaryToJson(const AuthUserSummary& user)
+{
+    Json::Value json = authUserToJson(
+        AuthenticatedUser{user.username, user.display_name, user.is_admin});
+    json["enabled"] = user.enabled;
+    json["shared_compute_access"] = user.shared_compute_access;
+    json["created_at_us"] = Json::Value::UInt64(user.created_at_us);
+    json["updated_at_us"] = Json::Value::UInt64(user.updated_at_us);
+    json["password_updated_at_us"] = Json::Value::UInt64(user.password_updated_at_us);
+    json["last_login_at_us"] = Json::Value::UInt64(user.last_login_at_us);
+    return json;
+}
+
+HttpResponsePtr makeJsonResponse(
+    const Json::Value& json,
+    HttpStatusCode status = k200OK)
+{
+    auto resp = HttpResponse::newHttpJsonResponse(json);
+    resp->setStatusCode(status);
+    resp->setContentTypeCode(drogon::CT_APPLICATION_JSON);
+    return resp;
+}
+
+std::optional<bool> optionalBoolField(
+    const std::shared_ptr<Json::Value>& json,
+    const std::string& key)
+{
+    if (!json || !json->isMember(key)) {
+        return std::nullopt;
+    }
+    return (*json)[key].asBool();
+}
+
+std::optional<std::string> optionalStringField(
+    const std::shared_ptr<Json::Value>& json,
+    const std::string& key)
+{
+    if (!json || !json->isMember(key)) {
+        return std::nullopt;
+    }
+    return (*json)[key].asString();
 }
 
 // Structure to hold a marker event
@@ -468,6 +554,11 @@ public:
                     topic["schema_name"] = dataTopic->schemaName;
                     topic["type"] = toString(dataTopic->type);
                     topic["serialization_type"] = toString(dataTopic->serializationType);
+                    const auto descriptor_json =
+                        getDescriptorJsonForSchemaName(dataTopic->schemaName);
+                    if (descriptor_json.has_value()) {
+                        topic["descriptor"] = descriptor_json.value();
+                    }
                     topics.append(topic);
                 }
                 for (const auto& metaTopic : metaTopics) {
@@ -475,6 +566,11 @@ public:
                     topic["schema_name"] = metaTopic->schemaName;
                     topic["type"] = toString(metaTopic->type);
                     topic["serialization_type"] = toString(metaTopic->serializationType);
+                    const auto descriptor_json =
+                        getDescriptorJsonForSchemaName(metaTopic->schemaName);
+                    if (descriptor_json.has_value()) {
+                        topic["descriptor"] = descriptor_json.value();
+                    }
                     topics.append(topic);
                 }
                 json[std::to_string(id)]["topics"] = topics;
@@ -896,10 +992,16 @@ int main()
     //app().setThreadNum(8);
 
     std::cout << "Threads set\n";
-    // Add a listener on 0.0.0.0:7409.
+    const char* backendPortEnv = std::getenv("NATKIT_BACKEND_PORT");
+    const int backendPort =
+        (backendPortEnv != nullptr && std::string(backendPortEnv).size() > 0)
+            ? std::stoi(backendPortEnv)
+            : 7409;
+
+    // Add a listener on 0.0.0.0:${backendPort}.
     // This allows connections from any network interface.
-    app().addListener("0.0.0.0", 7409);
-    std::cout << "Listening on port 7409\n";
+    app().addListener("0.0.0.0", backendPort);
+    std::cout << "Listening on port " << backendPort << "\n";
     app().registerFilter(std::make_shared<CorsFilter>());
     app().registerPostHandlingAdvice(
         [](const drogon::HttpRequestPtr& req, const drogon::HttpResponsePtr& resp) {
@@ -936,6 +1038,7 @@ int main()
     
     Config config{};
     auto api_controller = std::make_shared<ApiController>(manager, config);
+    auto& auth_manager = AuthManager::instance();
     std::cout << "API Controller created\n";
     
     // Set broker manager and register WebSocket controller
@@ -947,90 +1050,391 @@ int main()
     // Register the controller we defined above.
     // Drogon will automatically handle routing for it.
     //app().registerController(api_controller);
+
+    app().registerHandler("/api/auth/session",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                Json::Value resp_json;
+                const auto user = auth_manager.authenticateRequest(req);
+                resp_json["authenticated"] = user.has_value();
+                resp_json["bootstrap_required"] = auth_manager.bootstrapRequired();
+                resp_json["bootstrap_mode"] = auth_manager.bootstrapMode();
+                if (user.has_value()) {
+                    resp_json["user"] = authUserToJson(user.value());
+                }
+                callback(makeJsonResponse(resp_json));
+        },
+        { Get });
+
+    app().registerHandler("/api/auth/bootstrap",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (req->getContentType() != drogon::ContentType::CT_APPLICATION_JSON) {
+                    Json::Value err_json;
+                    err_json["message"] = "Expected JSON content.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                auto json = req->getJsonObject();
+                if (!json) {
+                    Json::Value err_json;
+                    err_json["message"] = "Invalid JSON payload.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                const auto result = auth_manager.bootstrapAdmin(
+                    (*json)["username"].asString(),
+                    json->isMember("display_name") ? (*json)["display_name"].asString() : std::string{},
+                    (*json)["password"].asString(),
+                    json->isMember("bootstrap_password")
+                        ? (*json)["bootstrap_password"].asString()
+                        : std::string{});
+
+                Json::Value resp_json;
+                resp_json["message"] = result.message;
+                if (result.user.has_value()) {
+                    resp_json["user"] = authUserToJson(result.user.value());
+                }
+                auto resp = makeJsonResponse(resp_json, result.status);
+                auth_manager.applySessionCookie(result.session_token, resp);
+                callback(resp);
+        },
+        { Post, Options });
+
+    app().registerHandler("/api/auth/login",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (req->getContentType() != drogon::ContentType::CT_APPLICATION_JSON) {
+                    Json::Value err_json;
+                    err_json["message"] = "Expected JSON content.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                auto json = req->getJsonObject();
+                if (!json) {
+                    Json::Value err_json;
+                    err_json["message"] = "Invalid JSON payload.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                const auto result = auth_manager.login(
+                    (*json)["username"].asString(),
+                    (*json)["password"].asString());
+                Json::Value resp_json;
+                resp_json["message"] = result.message;
+                if (result.user.has_value()) {
+                    resp_json["user"] = authUserToJson(result.user.value());
+                }
+                auto resp = makeJsonResponse(resp_json, result.status);
+                auth_manager.applySessionCookie(result.session_token, resp);
+                callback(resp);
+        },
+        { Post, Options });
+
+    app().registerHandler("/api/auth/logout",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                Json::Value resp_json;
+                resp_json["message"] = "Signed out.";
+                auto resp = makeJsonResponse(resp_json);
+                auth_manager.logout(req, resp);
+                callback(resp);
+        },
+        { Post, Options });
+
+    app().registerHandler("/api/admin/users",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                const auto user = auth_manager.authenticateRequest(req);
+                if (!user.has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
+                if (!user->is_admin) {
+                    Json::Value err_json;
+                    err_json["message"] = "Admin access required.";
+                    callback(makeJsonResponse(err_json, k403Forbidden));
+                    return;
+                }
+
+                Json::Value resp_json;
+                Json::Value users_json(Json::arrayValue);
+                for (const auto& entry : auth_manager.listUsers()) {
+                    users_json.append(authUserSummaryToJson(entry));
+                }
+                resp_json["users"] = users_json;
+                callback(makeJsonResponse(resp_json));
+        },
+        { Get });
+
+    app().registerHandler("/api/admin/users/create",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                const auto actor = auth_manager.authenticateRequest(req);
+                if (!actor.has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
+                if (!actor->is_admin) {
+                    Json::Value err_json;
+                    err_json["message"] = "Admin access required.";
+                    callback(makeJsonResponse(err_json, k403Forbidden));
+                    return;
+                }
+                auto json = req->getJsonObject();
+                if (!json) {
+                    Json::Value err_json;
+                    err_json["message"] = "Invalid JSON payload.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                const auto result = auth_manager.createUser(
+                    actor->username,
+                    (*json)["username"].asString(),
+                    json->isMember("display_name") ? (*json)["display_name"].asString() : std::string{},
+                    (*json)["password"].asString(),
+                    json->isMember("is_admin") ? (*json)["is_admin"].asBool() : false,
+                    !json->isMember("enabled") || (*json)["enabled"].asBool(),
+                    json->isMember("shared_compute_access") && (*json)["shared_compute_access"].asBool());
+
+                Json::Value resp_json;
+                resp_json["message"] = result.message;
+                if (result.user.has_value()) {
+                    resp_json["user"] = authUserToJson(result.user.value());
+                }
+                callback(makeJsonResponse(resp_json, result.status));
+        },
+        { Post, Options });
+
+    app().registerHandler("/api/admin/users/update",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                const auto actor = auth_manager.authenticateRequest(req);
+                if (!actor.has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
+                if (!actor->is_admin) {
+                    Json::Value err_json;
+                    err_json["message"] = "Admin access required.";
+                    callback(makeJsonResponse(err_json, k403Forbidden));
+                    return;
+                }
+                auto json = req->getJsonObject();
+                if (!json) {
+                    Json::Value err_json;
+                    err_json["message"] = "Invalid JSON payload.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                const auto result = auth_manager.updateUser(
+                    actor->username,
+                    (*json)["username"].asString(),
+                    optionalStringField(json, "display_name"),
+                    optionalStringField(json, "password"),
+                    optionalBoolField(json, "is_admin"),
+                    optionalBoolField(json, "enabled"),
+                    optionalBoolField(json, "shared_compute_access"));
+
+                Json::Value resp_json;
+                resp_json["message"] = result.message;
+                if (result.user.has_value()) {
+                    resp_json["user"] = authUserToJson(result.user.value());
+                }
+                callback(makeJsonResponse(resp_json, result.status));
+        },
+        { Post, Options });
+
+    app().registerHandler("/api/admin/users/delete",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                const auto actor = auth_manager.authenticateRequest(req);
+                if (!actor.has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
+                if (!actor->is_admin) {
+                    Json::Value err_json;
+                    err_json["message"] = "Admin access required.";
+                    callback(makeJsonResponse(err_json, k403Forbidden));
+                    return;
+                }
+                auto json = req->getJsonObject();
+                if (!json) {
+                    Json::Value err_json;
+                    err_json["message"] = "Invalid JSON payload.";
+                    callback(makeJsonResponse(err_json, k400BadRequest));
+                    return;
+                }
+
+                const auto result = auth_manager.deleteUser(
+                    actor->username,
+                    (*json)["username"].asString());
+                Json::Value resp_json;
+                resp_json["message"] = result.message;
+                callback(makeJsonResponse(resp_json, result.status));
+        },
+        { Post, Options });
+
     // Register GET /api/heartbeat
     app().registerHandler("/api/heartbeat",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->heartbeat(req, std::move(callback));
         },
         { Get });
 
     // Register GET /api/is_connected_to_broker
     app().registerHandler("/api/is_connected_to_broker",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->is_connected_to_broker(req, std::move(callback));
         },
         { Get });
 
     // Register GET /api/get_all_streams
     app().registerHandler("/api/get_all_streams",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->get_all_streams(req, std::move(callback));
         },
         { Get });
 
     // Register GET /api/get_accuracies
     app().registerHandler("/api/get_accuracies",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->get_accuracies(req, std::move(callback));
         },
         { Get });
 
     // Register POST /api/set_streams
     app().registerHandler("/api/set_streams",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->set_streams(req, std::move(callback));
         },
         { Post, Options });
 
     // Register POST /api/start_calibration
     app().registerHandler("/api/start_calibration",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->start_calibration(req, std::move(callback));
         },
         { Post, Options });
 
     // Register POST /api/start_recording
     app().registerHandler("/api/start_recording",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->start_recording(req, std::move(callback));
         },
         { Post, Options });
 
     // Register POST /api/stop_recording
     app().registerHandler("/api/stop_recording",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->stop_recording(req, std::move(callback));
         },
         { Post, Options });
 
     // Register POST /api/insert_marker
     app().registerHandler("/api/insert_marker",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->insert_marker(req, std::move(callback));
         },
         { Post, Options });
 
     // Register GET /api/get_session_data
     app().registerHandler("/api/get_session_data",
-        [api_controller](const HttpRequestPtr& req,
+        [api_controller, &auth_manager](const HttpRequestPtr& req,
             std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
                 api_controller->get_session_data(req, std::move(callback));
         },
         { Get });
 
     // WebSocket endpoint at /ws/stream_viewer is registered above via registerController
 
-    std::cout << "Server running on http://127.0.0.1:7409\n";
-    std::cout << "WebSocket endpoint available at ws://127.0.0.1:7409/ws/stream_viewer\n";
+    std::cout << "Server running on http://127.0.0.1:" << backendPort << "\n";
+    std::cout << "WebSocket endpoint available at ws://127.0.0.1:" << backendPort
+              << "/ws/stream_viewer\n";
 
     // Run the application's event loop.
     // This call will block until the application is terminated.

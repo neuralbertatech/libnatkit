@@ -12,6 +12,7 @@ target_link_libraries(libnatkit-core-bridge-cxx PUBLIC
   libnatkit-util-cxx
   libnatkit-core-mqtt-cxx
   libnatkit-core-kafka-cxx
+  nlohmann
 )
 target_include_directories(libnatkit-core-bridge-cxx
   PUBLIC
@@ -25,5 +26,4 @@ target_include_directories(libnatkit-core-bridge-cxx
 )
 
 set_property(TARGET libnatkit-core-bridge-cxx PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS true)
-
 

@@ -62,6 +62,7 @@ target_link_libraries(libnatkit-natkit-menu PRIVATE
 
 if(BUILD_NATKIT_BACKEND)
   add_executable(libnatkit-natkit-backend
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/Auth.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/StreamViewerWebSocket.cpp
   )

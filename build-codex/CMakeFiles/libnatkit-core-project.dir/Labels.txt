@@ -1,0 +1,14 @@
+# Target labels
+ libnatkit-core-project
+# Source files and their labels
+/home/zach/code/natKit/libnatkit/build-codex/CMakeFiles/libnatkit-core-project
+/home/zach/code/natKit/libnatkit/build-codex/CMakeFiles/libnatkit-core-project.rule
+/home/zach/code/natKit/libnatkit/build-codex/CMakeFiles/libnatkit-core-project-complete.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-build.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-configure.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-download.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-install.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-mkdir.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-patch.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-test.rule
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-project-prefix/src/libnatkit-core-project-stamp/libnatkit-core-project-update.rule

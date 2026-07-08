@@ -75,6 +75,19 @@ public:
       exit(1);
     }
     std::cout << "  [Kafka] ✓ Delivery report callback set\n";
+
+    std::cout << "  [Kafka] Setting low-latency consumer fetch policy...\n";
+    if (conf->set("fetch.wait.max.ms", "10", errstr) != RdKafka::Conf::CONF_OK) {
+      std::cerr << "  [Kafka] ✗ FATAL: Failed to set fetch.wait.max.ms: " << errstr
+                << std::endl;
+      exit(1);
+    }
+    if (conf->set("fetch.min.bytes", "1", errstr) != RdKafka::Conf::CONF_OK) {
+      std::cerr << "  [Kafka] ✗ FATAL: Failed to set fetch.min.bytes: " << errstr
+                << std::endl;
+      exit(1);
+    }
+    std::cout << "  [Kafka] ✓ Consumer fetch policy set\n";
   }
 
   virtual bool isConnected() const override { return connectedToBroker; }

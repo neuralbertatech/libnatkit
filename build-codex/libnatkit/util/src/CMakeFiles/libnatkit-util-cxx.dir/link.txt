@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -Wl,--disable-new-dtags -O3 -DNDEBUG -O3 -Wl,--dependency-file=CMakeFiles/libnatkit-util-cxx.dir/link.d -shared -Wl,-soname,liblibnatkit-util-cxx.so -o liblibnatkit-util-cxx.so "CMakeFiles/libnatkit-util-cxx.dir/main/cxx/libnatkit/util/Strings.cpp.o"

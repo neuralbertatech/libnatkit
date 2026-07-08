@@ -1,0 +1,11 @@
+prefix=/home/zach/code/natKit/libnatkit/build-codex
+libdir=/home/zach/code/natKit/libnatkit/build-codex/lib
+includedir=/home/zach/code/natKit/libnatkit/build-codex/include
+
+Name: librdkafka++
+Description: The Apache Kafka C/C++ library
+Version: 2.3.0
+Requires.private: rdkafka
+Cflags: -I${includedir}
+Libs: -L${libdir} -lrdkafka++
+Libs.private: -lm -ldl -lpthread -lrt -lpthread -lrt

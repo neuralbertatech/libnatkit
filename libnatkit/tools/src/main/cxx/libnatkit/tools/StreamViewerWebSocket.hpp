@@ -12,6 +12,8 @@
 #include <atomic>
 #include <memory>
 
+#include "Auth.hpp"
+
 // Client context for tracking subscriptions and streaming thread
 struct StreamViewerClientContext {
     std::set<uint64_t> subscribed_streams;
@@ -19,6 +21,7 @@ struct StreamViewerClientContext {
     std::atomic<bool> active{true};
     std::thread streaming_thread;
     std::mutex mutex;
+    std::optional<AuthenticatedUser> user;
 
     ~StreamViewerClientContext() {
         active = false;
@@ -69,6 +72,44 @@ private:
                            StreamViewerClientContext* ctx,
                            const std::vector<uint64_t>& stream_ids);
 
+    // Publish experiment metadata and markers to Kafka
+    void handlePublishSessionBundle(const drogon::WebSocketConnectionPtr& conn,
+                                    const nlohmann::json& json);
+
+    void handleListTransformCapabilities(
+        const drogon::WebSocketConnectionPtr& conn,
+        const nlohmann::json& json);
+
+    // Create a derived EMG transform stream
+    void handleCreateTransform(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
+
+    // List active transform workers
+    void handleListTransforms(const drogon::WebSocketConnectionPtr& conn,
+                              const nlohmann::json& json);
+
+    // Stop a derived transform stream
+    void handleStopTransform(const drogon::WebSocketConnectionPtr& conn,
+                             const nlohmann::json& json);
+
+    void handleListStreamGraphs(const drogon::WebSocketConnectionPtr& conn,
+                                const nlohmann::json& json);
+
+    void handleSaveStreamGraph(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
+
+    void handleValidateStreamGraph(const drogon::WebSocketConnectionPtr& conn,
+                                   const nlohmann::json& json);
+
+    void handleGetStreamGraphStatus(const drogon::WebSocketConnectionPtr& conn,
+                                    const nlohmann::json& json);
+
+    void handleStartStreamGraph(const drogon::WebSocketConnectionPtr& conn,
+                                const nlohmann::json& json);
+
+    void handleStopStreamGraph(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
+
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
 
@@ -100,9 +141,92 @@ private:
                                             const std::string& encoding_type,
                                             size_t encoding_size);
 
+    // Format ExgPillEmgDataSchemaV1 as Stream Viewer JSON
+    nlohmann::json formatEmgDataAsJson(const nat::core::ExgPillEmgDataSchemaV1& data,
+                                       uint64_t stream_id,
+                                       const std::string& encoding_type,
+                                       size_t encoding_size);
+
+    // Format ExgPillEmgTransformDataSchemaV1 as Stream Viewer JSON
+    nlohmann::json formatEmgDataAsJson(
+        const nat::core::ExgPillEmgTransformDataSchemaV1& data,
+        uint64_t stream_id,
+        const std::string& encoding_type,
+        size_t encoding_size);
+
+    nlohmann::json formatEmgDataAsJson(
+        const nat::core::NatSignalFrameDataSchemaV1& data,
+        uint64_t stream_id,
+        const std::string& encoding_type,
+        size_t encoding_size);
+
+    nlohmann::json formatTransformProvenanceAsJson(
+        const nat::core::TransformProvenanceRecord& record,
+        uint64_t stream_id,
+        const std::string& encoding_type,
+        size_t encoding_size);
+
     // Send error message to client
     void sendError(const drogon::WebSocketConnectionPtr& conn, const std::string& message);
 
     // Send status update to client
     void sendStatus(const drogon::WebSocketConnectionPtr& conn, StreamViewerClientContext* ctx);
+
+    // Send publish acknowledgement to client
+    void sendPublishResult(const drogon::WebSocketConnectionPtr& conn,
+                           const std::string& request_id,
+                           const std::string& session_id,
+                           size_t published_meta_records,
+                           size_t published_marker_events);
+
+    void sendTransformCapabilities(
+        const drogon::WebSocketConnectionPtr& conn,
+        const std::string& request_id);
+
+    void sendTransformResult(const drogon::WebSocketConnectionPtr& conn,
+                             const std::string& request_id,
+                             uint64_t source_stream_id,
+                             uint64_t output_stream_id,
+                             const std::string& output_identifier,
+                             const std::string& transform_kind,
+                             const std::string& input_mapping_id,
+                             const std::string& topic,
+                             const std::string& worker_id,
+                             const std::string& thread_slot_id,
+                             size_t slot_capacity,
+                             size_t active_count,
+                             bool already_exists);
+
+    void sendTransformList(const drogon::WebSocketConnectionPtr& conn,
+                           const std::string& request_id);
+
+    void sendStreamGraphList(const drogon::WebSocketConnectionPtr& conn,
+                             const std::string& request_id);
+
+    void sendStreamGraphSaved(const drogon::WebSocketConnectionPtr& conn,
+                              const std::string& request_id,
+                              const nlohmann::json& graph_json);
+
+    void sendStreamGraphValidation(
+        const drogon::WebSocketConnectionPtr& conn,
+        const std::string& request_id,
+        const std::string& graph_id,
+        bool valid,
+        const nlohmann::json& graph_diagnostics,
+        const nlohmann::json& node_diagnostics,
+        const nlohmann::json& edge_diagnostics);
+
+    void sendStreamGraphStatus(const drogon::WebSocketConnectionPtr& conn,
+                               const std::string& request_id,
+                               const std::string& graph_id);
+
+    void sendStreamGraphStarted(const drogon::WebSocketConnectionPtr& conn,
+                                const std::string& request_id,
+                                const std::string& graph_id);
+
+    void sendStreamGraphStopped(const drogon::WebSocketConnectionPtr& conn,
+                                const std::string& request_id,
+                                const std::string& graph_id);
+
+    void broadcastTransformList();
 };

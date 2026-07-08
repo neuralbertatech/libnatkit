@@ -1,0 +1,1 @@
+/usr/bin/cc -fPIC -O3 -DNDEBUG -O3 -Wl,--dependency-file=CMakeFiles/mosquitto_payload_modification.dir/link.d -shared  -o mosquitto_payload_modification.so CMakeFiles/mosquitto_payload_modification.dir/mosquitto_payload_modification.c.o   -L/home/zach/code/natKit/libnatkit/third-party/mosquitto

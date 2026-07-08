@@ -45,6 +45,7 @@ private:
 class KafkaMosquittoBridge {
   std::shared_ptr<kafka::BrokerManager> kafkaBroker;
   std::shared_ptr<mosquitto::MosquittoBroker> mosquittoBroker;
+  std::unique_ptr<core::Registry> registry;
   std::unique_ptr<mosquitto::MosquittoPublisher> mosquittoPublisher;
   std::unique_ptr<mosquitto::MosquittoClient> mosquittoClient;
   std::unique_ptr<KafkaMessengerPool> kafkaMessengerPool;

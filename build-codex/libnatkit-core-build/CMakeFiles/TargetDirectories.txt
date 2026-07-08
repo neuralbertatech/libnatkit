@@ -1,0 +1,7 @@
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/libnatkit-core.dir
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/edit_cache.dir
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/rebuild_cache.dir
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/list_install_components.dir
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/install.dir
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/install/local.dir
+/home/zach/code/natKit/libnatkit/build-codex/libnatkit-core-build/CMakeFiles/install/strip.dir
