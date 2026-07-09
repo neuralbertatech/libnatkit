@@ -304,6 +304,18 @@ AuthResult AuthManager::login(const std::string& username, const std::string& pa
     return buildSessionForUserLocked(user.value());
 }
 
+std::optional<std::string> AuthManager::createServiceSession(
+    const std::string& username)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    initializeDatabaseLocked();
+    const auto user = loadUserLocked(username);
+    if (!user.has_value() || !user->enabled) {
+        return std::nullopt;
+    }
+    return buildSessionForUserLocked(user.value()).session_token;
+}
+
 void AuthManager::logout(const HttpRequestPtr& req, HttpResponsePtr& resp)
 {
     std::lock_guard<std::mutex> lock(mutex_);

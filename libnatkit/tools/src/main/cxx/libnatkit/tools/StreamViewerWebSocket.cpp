@@ -4921,6 +4921,9 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "list_node_catalog") {
             handleListNodeCatalog(conn, json);
         }
+        else if (action == "ml_proxy") {
+            handleMlProxyAction(conn, json);
+        }
         else if (action == "create_transform" || action == "create_emg_transform") {
             handleCreateTransform(conn, json);
         }
@@ -6903,4 +6906,148 @@ void StreamViewerWebSocket::broadcastTransformList()
     for (const auto& conn : connections) {
         sendTransformList(conn, std::string{});
     }
+}
+
+// --- ML control-plane proxy (Phase 5, decision #3) -------------------------
+
+void StreamViewerWebSocket::broadcastMlControlPlaneMessage(
+    const std::string& raw_message)
+{
+    // Wrap so the control-plane message can't collide with stream_viewer's own
+    // message types, then fan it out to every connected browser client.
+    nlohmann::json envelope;
+    envelope["type"] = "ml_control_plane";
+    try {
+        envelope["message"] = nlohmann::json::parse(raw_message);
+    } catch (const std::exception&) {
+        return;  // ignore non-JSON frames
+    }
+    const std::string payload = envelope.dump();
+
+    std::vector<WebSocketConnectionPtr> connections;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        connections.reserve(clients_.size());
+        for (const auto& entry : clients_) {
+            connections.push_back(entry.first);
+        }
+    }
+    for (const auto& conn : connections) {
+        if (conn && conn->connected()) {
+            conn->send(payload);
+        }
+    }
+}
+
+void StreamViewerWebSocket::ensureMlControlPlaneClient()
+{
+    std::lock_guard<std::mutex> lock(ml_client_mutex_);
+    if (ml_client_ && ml_client_->getConnection() &&
+        ml_client_->getConnection()->connected()) {
+        return;
+    }
+    if (ml_client_connecting_) {
+        return;
+    }
+    ml_client_connecting_ = true;
+
+    const char* url_env = std::getenv("NATKIT_ML_CONTROL_PLANE_URL");
+    const std::string url =
+        (url_env != nullptr && std::string(url_env).size() > 0)
+            ? std::string(url_env)
+            : std::string("ws://127.0.0.1:8786");
+    const char* user_env = std::getenv("NATKIT_ML_PROXY_USERNAME");
+    const std::string service_user =
+        (user_env != nullptr && std::string(user_env).size() > 0)
+            ? std::string(user_env)
+            : std::string("admin");
+
+    const auto token = AuthManager::instance().createServiceSession(service_user);
+    if (!token.has_value()) {
+        LOG_ERROR << "ML proxy: could not mint a service session for '"
+                  << service_user << "'; control-plane proxy unavailable.";
+        ml_client_connecting_ = false;
+        return;
+    }
+
+    auto client = drogon::WebSocketClient::newWebSocketClient(url);
+    ml_client_ = client;
+
+    client->setMessageHandler(
+        [this](std::string&& message,
+               const drogon::WebSocketClientPtr&,
+               const drogon::WebSocketMessageType& msg_type) {
+            if (msg_type == drogon::WebSocketMessageType::Text) {
+                broadcastMlControlPlaneMessage(message);
+            }
+        });
+
+    client->setConnectionClosedHandler(
+        [this](const drogon::WebSocketClientPtr&) {
+            LOG_WARN << "ML proxy: control-plane connection closed; reconnecting.";
+            {
+                std::lock_guard<std::mutex> relock(ml_client_mutex_);
+                ml_client_connecting_ = false;
+            }
+            if (auto* loop = drogon::app().getLoop()) {
+                loop->runAfter(2.0, [this]() { ensureMlControlPlaneClient(); });
+            }
+        });
+
+    auto req = drogon::HttpRequest::newHttpRequest();
+    req->setPath("/");
+    req->addHeader("Cookie",
+                   AuthManager::instance().cookieName() + "=" + token.value());
+
+    LOG_INFO << "ML proxy: connecting to control plane at " << url;
+    client->connectToServer(
+        req,
+        [this](drogon::ReqResult result,
+               const drogon::HttpResponsePtr&,
+               const drogon::WebSocketClientPtr&) {
+            std::lock_guard<std::mutex> relock(ml_client_mutex_);
+            ml_client_connecting_ = false;
+            if (result != drogon::ReqResult::Ok) {
+                LOG_ERROR << "ML proxy: control-plane connect failed ("
+                          << static_cast<int>(result) << "); retrying.";
+                if (auto* loop = drogon::app().getLoop()) {
+                    loop->runAfter(2.0,
+                                   [this]() { ensureMlControlPlaneClient(); });
+                }
+                return;
+            }
+            LOG_INFO << "ML proxy: connected to control plane.";
+        });
+}
+
+void StreamViewerWebSocket::handleMlProxyAction(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    ensureMlControlPlaneClient();
+
+    if (!json.contains("message") || !json["message"].is_object()) {
+        sendError(conn, "ml_proxy requires an object 'message' payload");
+        return;
+    }
+
+    drogon::WebSocketClientPtr client;
+    {
+        std::lock_guard<std::mutex> lock(ml_client_mutex_);
+        client = ml_client_;
+    }
+    if (!client || !client->getConnection() ||
+        !client->getConnection()->connected()) {
+        // Connect is async; tell the browser it can retry (the MlPipeline UI
+        // already polls list_* on an interval, so it recovers on the next tick).
+        nlohmann::json envelope;
+        envelope["type"] = "ml_control_plane";
+        envelope["message"] = {
+            {"type", "error"},
+            {"error", "ML control plane is connecting; retry shortly."},
+            {"request_id", json["message"].value("request_id", std::string{})}};
+        conn->send(envelope.dump());
+        return;
+    }
+    client->getConnection()->send(json["message"].dump());
 }

@@ -2,6 +2,7 @@
 
 #include <drogon/WebSocketController.h>
 #include <drogon/HttpAppFramework.h>
+#include <drogon/WebSocketClient.h>
 #include <libnatkit-kafka.hpp>
 #include <libnatkit-core.hpp>
 #include <nlohmann/json.hpp>
@@ -61,6 +62,24 @@ private:
     static std::shared_ptr<nat::kafka::BrokerManager> broker_manager_;
     std::map<drogon::WebSocketConnectionPtr, std::unique_ptr<StreamViewerClientContext>> clients_;
     std::mutex clients_mutex_;
+
+    // --- ML control-plane proxy (Phase 5, decision #3) ---
+    // The backend is the SOLE client of the Python ML control plane (:8786); the
+    // browser no longer connects there directly. Browser ML actions arrive on
+    // /ws/stream_viewer wrapped as {"action":"ml_proxy","message":<cp-action>}
+    // and are forwarded up; control-plane messages are re-broadcast down wrapped
+    // as {"type":"ml_control_plane","message":<cp-message>}.
+    drogon::WebSocketClientPtr ml_client_;
+    std::mutex ml_client_mutex_;
+    bool ml_client_connecting_ = false;
+
+    // Lazily (re)connect the outbound control-plane client.
+    void ensureMlControlPlaneClient();
+    // Forward a browser-originated control-plane action up to the control plane.
+    void handleMlProxyAction(const drogon::WebSocketConnectionPtr& conn,
+                             const nlohmann::json& json);
+    // Re-broadcast a raw control-plane message to all /ws/stream_viewer clients.
+    void broadcastMlControlPlaneMessage(const std::string& raw_message);
 
     // Handle subscribe action
     void handleSubscribe(const drogon::WebSocketConnectionPtr& conn,

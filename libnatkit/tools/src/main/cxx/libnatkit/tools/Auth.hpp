@@ -65,6 +65,12 @@ public:
         const std::string& bootstrap_password);
 
     AuthResult login(const std::string& username, const std::string& password);
+
+    // Mint a session token for an existing, enabled user WITHOUT a password.
+    // Used by the backend to authenticate its own outbound connection to the ML
+    // control plane as a service identity (the backend already owns the shared
+    // auth DB). Returns nullopt if the user is missing/disabled.
+    std::optional<std::string> createServiceSession(const std::string& username);
     void logout(const drogon::HttpRequestPtr& req, drogon::HttpResponsePtr& resp);
 
     std::vector<AuthUserSummary> listUsers() const;
