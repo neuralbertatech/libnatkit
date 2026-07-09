@@ -1368,6 +1368,11 @@ struct StreamGraphDefinition {
     std::vector<StreamGraphNode> nodes{};
     std::vector<StreamGraphEdge> edges{};
     std::vector<std::string> notes{};
+    // Opaque frontend-only metadata (Phase 7): the unflattened composite editor
+    // tree. The backend stores and returns it verbatim (never interprets it) so
+    // a saved composite graph reloads from the backend alone; the executed graph
+    // is still the flattened `nodes`/`edges` above.
+    nlohmann::json editorMetadata = nlohmann::json(nullptr);
 };
 
 struct StreamGraphDiagnostic {
@@ -1559,6 +1564,9 @@ void to_json(nlohmann::json& json, const StreamGraphDefinition& value)
                ? nlohmann::json(value.selectedNodeId.value())
                : nlohmann::json(nullptr)}}},
     };
+    if (!value.editorMetadata.is_null()) {
+        json["editor_metadata"] = value.editorMetadata;
+    }
 }
 
 void from_json(const nlohmann::json& json, StreamGraphDefinition& value)
@@ -1572,6 +1580,7 @@ void from_json(const nlohmann::json& json, StreamGraphDefinition& value)
     value.nodes = json.at("nodes").get<std::vector<StreamGraphNode>>();
     value.edges = json.value("edges", std::vector<StreamGraphEdge>{});
     value.notes = json.value("notes", std::vector<std::string>{});
+    value.editorMetadata = json.value("editor_metadata", nlohmann::json(nullptr));
     if (json.contains("ui") && json["ui"].is_object()) {
         const auto& ui = json["ui"];
         if (ui.contains("viewport")) {
