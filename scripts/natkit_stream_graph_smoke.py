@@ -76,6 +76,29 @@ def build_smoke_graph(args: argparse.Namespace) -> dict[str, Any]:
                 "input_port_ids": ["input"],
                 "output_port_ids": ["output"],
             },
+            {
+                "id": "session/smoke",
+                "kind": "session",
+                "label": "Smoke session",
+                "position": {"x": 480, "y": 0},
+                "input_port_ids": ["in1"],
+                "config": {
+                    "protocol": {
+                        "protocol_id": "smoke-protocol",
+                        "label": "Smoke protocol",
+                        "classes": ["a", "b"],
+                        "rest_class": "rest",
+                        "repetitions": 1,
+                        "hold_s": 1,
+                        "rest_s": 1,
+                        "lead_in_s": 1,
+                        "tail_rest_s": 1,
+                        "seed": 1,
+                    },
+                    "participant_id": "smoke",
+                    "notes": "",
+                },
+            },
         ],
         "edges": [
             {
@@ -84,7 +107,14 @@ def build_smoke_graph(args: argparse.Namespace) -> dict[str, Any]:
                 "source_port": "data",
                 "target_node_id": "transform/smoke",
                 "target_port": "input",
-            }
+            },
+            {
+                "id": "edge/smoke-session",
+                "source_node_id": "transform/smoke",
+                "source_port": "output",
+                "target_node_id": "session/smoke",
+                "target_port": "in1",
+            },
         ],
         "notes": [],
     }
@@ -185,6 +215,15 @@ async def run_smoke_test(args: argparse.Namespace) -> None:
         if not transform_status.get("output_stream_id"):
             raise AssertionError("started transform node has no output_stream_id")
         print(f"  transform running with output_stream_id={transform_status['output_stream_id']}")
+
+        # Phase 4: the session node is a first-class kind — it validates, starts,
+        # and is marked running (recording itself is client-side).
+        session_status = node_statuses.get("session/smoke")
+        if session_status is None or session_status.get("state") != "running":
+            raise AssertionError(f"expected session node running, got: {json.dumps(started, indent=2)}")
+        if session_status.get("output_stream_id"):
+            raise AssertionError("session node must not produce an output stream")
+        print("  session node running (client-side recorder)")
 
         print("stopping graph...")
         stopped = await client.request(

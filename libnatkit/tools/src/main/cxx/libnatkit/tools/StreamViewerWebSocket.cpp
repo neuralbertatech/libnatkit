@@ -1281,6 +1281,24 @@ nlohmann::json buildNodeCatalogJson()
          {"output_ports", nlohmann::json::array()},
          {"variadic_inputs", false}});
 
+    // Session — records N upstream sensor streams under one protocol/marker
+    // timeline and publishes a labeled session bundle (client-driven). Produces
+    // no output stream; its protocol config lives on the node.
+    nodes.push_back(
+        {{"node_type", "session"},
+         {"kind", "session"},
+         {"category", "session"},
+         {"runner", "frontend"},
+         {"label", "Session"},
+         {"description",
+          "Records one or more upstream sensor streams under a structured "
+          "protocol (ordered cues + labels), producing a labeled dataset for "
+          "training."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", singleInputPort()},
+         {"output_ports", nlohmann::json::array()},
+         {"variadic_inputs", true}});
+
     return nodes;
 }
 
@@ -1635,6 +1653,17 @@ void normalizeGraphNodePorts(StreamGraphNode& node)
             node.inputPortIds = {"input"};
         }
         node.outputPortIds.clear();
+    } else if (node.kind == "session") {
+        // A session node records N upstream sensor streams under one protocol;
+        // it may have several input ports and never produces an output stream.
+        // Multiple input ports (set by the frontend) are preserved here.
+        if (node.inputPortIds.empty()) {
+            node.inputPortIds = {"in1"};
+        }
+        node.outputPortIds.clear();
+        if (node.config.is_null()) {
+            node.config = nlohmann::json::object();
+        }
     }
 }
 
@@ -2003,7 +2032,7 @@ StreamGraphValidationResult validateStreamGraphDefinition(
 
         if (node.kind != "stream_source" && node.kind != "transform" &&
             node.kind != "viewer" && node.kind != "sink" &&
-            node.kind != "combine") {
+            node.kind != "combine" && node.kind != "session") {
             addGraphDiagnostic(
                 result,
                 result.nodeDiagnostics[node.id],
@@ -2110,6 +2139,16 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     result.nodeDiagnostics[node.id],
                     "invalid_combine_output_ports",
                     "combine nodes must expose exactly one output port in V1.");
+            }
+        } else if (node.kind == "session") {
+            // A session node records its upstream sensor streams; it produces
+            // markers/metadata (published client-side), never an output stream.
+            if (!node.outputPortIds.empty()) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "invalid_session_output_ports",
+                    "session nodes do not expose output ports.");
             }
         }
     }
@@ -2317,6 +2356,22 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                         result.nodeDiagnostics[node.id],
                         "too_many_inputs",
                         node.kind + " nodes support exactly one input in V1.");
+                }
+            } else if (node.kind == "session") {
+                // A session records one or more sensor streams — at least one
+                // input must be connected; there is no upper bound.
+                const auto input_count = std::count_if(
+                    graph.edges.begin(),
+                    graph.edges.end(),
+                    [&node](const StreamGraphEdge& edge) {
+                        return edge.targetNodeId == node.id;
+                    });
+                if (input_count == 0) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "missing_input",
+                        "session node must record at least one connected stream.");
                 }
             }
             continue;
@@ -5494,6 +5549,27 @@ void executeStreamGraphStart(
                         ? std::optional<std::string>("Viewer node is ready to inspect the upstream stream.")
                         : std::optional<std::string>("Sink node is attached to the upstream stream.")};
             }
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+        if (node.kind == "session") {
+            // Recording is driven client-side (the browser runs the protocol
+            // timeline and publishes the session bundle via
+            // publish_session_bundle). The runtime just marks the node ready;
+            // it consumes its upstream streams but produces no output stream.
+            StreamGraphNodeRuntimeStatus status{
+                "running",
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                0,
+                0,
+                std::optional<std::string>(
+                    "Session node is ready to record its upstream streams.")};
             if (!commitNodeStatus(node.id, status, std::nullopt)) {
                 aborted = true;
                 break;
