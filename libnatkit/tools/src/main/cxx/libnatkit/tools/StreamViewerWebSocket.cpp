@@ -5164,6 +5164,7 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
         return;
     }
 
+    bool has_subscriptions = false;
     {
         std::lock_guard<std::mutex> lock(ctx->mutex);
 
@@ -5175,16 +5176,26 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
                 continue; // Already subscribed
             }
 
-            // Find the stream and create messengers for its DATA topics
+            // Find the stream and create a messenger for its DATA topic.
+            std::shared_ptr<nat::core::BasicTopicInformation> dataTopic;
             for (const auto& stream : rawStreams) {
                 if (stream->getId() == stream_id) {
                     auto dataTopics = stream->getTopicsByType(nat::core::StreamType::DATA);
-                    auto dataTopic = choosePreferredDataTopic(dataTopics);
-                    if (dataTopic != nullptr) {
-                        ctx->messengers.push_back(broker_manager_->createMessenger(dataTopic));
-                    }
+                    dataTopic = choosePreferredDataTopic(dataTopics);
                     break;
                 }
+            }
+            // Fallback: a transform/combine output whose Kafka DATA topic has not
+            // yet appeared in broker metadata (no frame produced yet). Resolve its
+            // deterministic output topic from the in-process worker registry, the
+            // same way createTransformWorker resolves a worker's input. Without
+            // this, subscribing to a graph output raced the first frame and got
+            // stuck on "Waiting for data" until the topic materialized.
+            if (dataTopic == nullptr) {
+                dataTopic = findGraphInternalOutputTopicForStream(stream_id);
+            }
+            if (dataTopic != nullptr) {
+                ctx->messengers.push_back(broker_manager_->createMessenger(dataTopic));
             }
 
             // Record the subscription intent regardless of whether the stream
@@ -5198,12 +5209,25 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
             LOG_INFO << "StreamViewer: Subscribed to stream " << stream_id;
         }
 
-        // Start streaming thread if not already running
-        if (!ctx->streaming_thread.joinable() && !ctx->subscribed_streams.empty()) {
-            ctx->active = true;
-            ctx->streaming_thread = std::thread(&StreamViewerWebSocket::streamingThreadFunc, this, conn, ctx);
+        has_subscriptions = !ctx->subscribed_streams.empty();
+    } // Release lock before touching the thread / calling sendStatus
+
+    // Manage the streaming thread OUTSIDE ctx->mutex (the loop body holds that
+    // lock every iteration; joining under it would deadlock). Per-connection
+    // handlers are serialized, so streaming_thread has no other writer here.
+    // Reap a thread a prior unsubscribe stopped (still joinable but active=false)
+    // before starting a fresh one — assigning onto a joinable std::thread calls
+    // std::terminate.
+    if (has_subscriptions) {
+        if (ctx->streaming_thread.joinable() && !ctx->active.load()) {
+            ctx->streaming_thread.join();
         }
-    } // Release lock before calling sendStatus
+        if (!ctx->streaming_thread.joinable()) {
+            ctx->active = true;
+            ctx->streaming_thread = std::thread(
+                &StreamViewerWebSocket::streamingThreadFunc, this, conn, ctx);
+        }
+    }
 
     sendStatus(conn, ctx);
 }
@@ -6489,6 +6513,7 @@ void StreamViewerWebSocket::handleUnsubscribe(const WebSocketConnectionPtr& conn
                                                StreamViewerClientContext* ctx,
                                                const std::vector<uint64_t>& stream_ids)
 {
+    bool went_idle = false;
     {
         std::lock_guard<std::mutex> lock(ctx->mutex);
 
@@ -6510,8 +6535,18 @@ void StreamViewerWebSocket::handleUnsubscribe(const WebSocketConnectionPtr& conn
         // Stop streaming thread if no subscriptions
         if (ctx->subscribed_streams.empty()) {
             ctx->active = false;
+            went_idle = true;
         }
     } // Release lock before calling sendStatus
+
+    // Join the stopped thread OUTSIDE ctx->mutex (the loop body holds that lock
+    // each iteration, so joining under it would deadlock). Leaving the thread
+    // unjoined here was the "close/reopen a few times" bug: the object stayed
+    // joinable, so the next subscribe neither restarted the loop nor reset
+    // active, wedging the viewer on "Waiting for data".
+    if (went_idle && ctx->streaming_thread.joinable()) {
+        ctx->streaming_thread.join();
+    }
 
     sendStatus(conn, ctx);
 }
@@ -6608,21 +6643,28 @@ void StreamViewerWebSocket::streamingThreadFunc(const WebSocketConnectionPtr& co
                         if (resolved_ids.count(stream_id) > 0) {
                             continue;
                         }
+                        std::shared_ptr<nat::core::BasicTopicInformation> dataTopic;
                         for (const auto& stream : rawStreams) {
                             if (stream->getId() != stream_id) {
                                 continue;
                             }
                             auto dataTopics = stream->getTopicsByType(
                                 nat::core::StreamType::DATA);
-                            auto dataTopic = choosePreferredDataTopic(dataTopics);
-                            if (dataTopic != nullptr) {
-                                ctx->messengers.push_back(
-                                    broker_manager_->createMessenger(dataTopic));
-                                LOG_INFO << "StreamViewer: Lazily bound messenger "
-                                            "for stream "
-                                         << stream_id;
-                            }
+                            dataTopic = choosePreferredDataTopic(dataTopics);
                             break;
+                        }
+                        // Same in-memory fallback as handleSubscribe for a
+                        // graph output not yet visible in broker metadata.
+                        if (dataTopic == nullptr) {
+                            dataTopic =
+                                findGraphInternalOutputTopicForStream(stream_id);
+                        }
+                        if (dataTopic != nullptr) {
+                            ctx->messengers.push_back(
+                                broker_manager_->createMessenger(dataTopic));
+                            LOG_INFO << "StreamViewer: Lazily bound messenger "
+                                        "for stream "
+                                     << stream_id;
                         }
                     }
                 }
