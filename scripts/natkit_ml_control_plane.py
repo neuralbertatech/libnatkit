@@ -237,10 +237,46 @@ def sanitize_replay_report(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def sanitize_pipeline_report(report: dict[str, Any]) -> dict[str, Any]:
+def resolve_artifacts_dir() -> Path:
+    # Durable, backend-accessible location for trained model artifacts (Phase 5,
+    # slice C). In the dev stack this is a volume shared read-only with the
+    # backend so a classify node can load model_path directly.
+    return Path(os.getenv("NATKIT_ML_ARTIFACTS_DIR", "/models"))
+
+
+def persist_selected_model_artifact(
+    report: dict[str, Any], job_id: str
+) -> str | None:
+    """Copy the winning model out of the ephemeral job workspace into the durable
+    artifacts directory before the workspace is deleted. Returns the durable path
+    (valid on the shared volume) or None if there is nothing to persist. Only the
+    in-process control-plane worker can do this; remote-worker artifacts stay on
+    the worker's filesystem (a documented follow-up)."""
+    source = report.get("selected_model_path")
+    if not source:
+        return None
+    source_path = Path(str(source))
+    if not source_path.is_file():
+        return None
+    dest_dir = resolve_artifacts_dir() / job_id
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / source_path.name
+        shutil.copy2(source_path, dest_path)
+    except OSError as exc:
+        LOG.warning("Could not persist model artifact for job %s: %s", job_id, exc)
+        return None
+    return str(dest_path)
+
+
+def sanitize_pipeline_report(
+    report: dict[str, Any], model_path: str | None = None
+) -> dict[str, Any]:
     return {
         "broker": report.get("broker"),
-        "artifact_storage": "ephemeral_scratch",
+        "artifact_storage": "durable" if model_path else "ephemeral_scratch",
+        "model_path": model_path,
+        "model_family": report.get("selected_family"),
         "selected_fields": list(report.get("selected_fields") or []),
         "selected_channel_indexes": list(report.get("selected_channel_indexes") or []),
         "train_runs": [
@@ -3020,7 +3056,8 @@ class MlControlPlaneServer:
             await self._broadcast_job_list()
             return
 
-        sanitized_report = sanitize_pipeline_report(report)
+        durable_model_path = persist_selected_model_artifact(report, job_id)
+        sanitized_report = sanitize_pipeline_report(report, durable_model_path)
         shutil.rmtree(job_workspace, ignore_errors=True)
         async with self._jobs_lock:
             job = self._jobs[job_id]
