@@ -99,6 +99,25 @@ def build_smoke_graph(args: argparse.Namespace) -> dict[str, Any]:
                     "notes": "",
                 },
             },
+            {
+                "id": "train/smoke",
+                "kind": "train",
+                "label": "Smoke train",
+                "position": {"x": 480, "y": 160},
+                "config": {
+                    "families": ["lda"],
+                    "train_runs": [],
+                    "eval_runs": [],
+                    "selected_fields": [],
+                    "window_ms": 200,
+                    "hop_ms": 50,
+                    "vote_windows": 5,
+                    "confidence_threshold": 0.6,
+                    "min_hold_windows": 2,
+                    "rest_gesture": "rest",
+                    "active_gesture": "fist",
+                },
+            },
         ],
         "edges": [
             {
@@ -224,6 +243,15 @@ async def run_smoke_test(args: argparse.Namespace) -> None:
         if session_status.get("output_stream_id"):
             raise AssertionError("session node must not produce an output stream")
         print("  session node running (client-side recorder)")
+
+        # Phase 5: the train node is a first-class kind — validates, starts, and
+        # is marked running (the control-plane job is submitted client-side).
+        train_status = node_statuses.get("train/smoke")
+        if train_status is None or train_status.get("state") != "running":
+            raise AssertionError(f"expected train node running, got: {json.dumps(started, indent=2)}")
+        if train_status.get("output_stream_id"):
+            raise AssertionError("train node must not produce an output stream")
+        print("  train node running (control-plane job submitted client-side)")
 
         print("stopping graph...")
         stopped = await client.request(

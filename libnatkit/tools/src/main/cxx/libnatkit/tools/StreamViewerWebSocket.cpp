@@ -1299,6 +1299,25 @@ nlohmann::json buildNodeCatalogJson()
          {"output_ports", nlohmann::json::array()},
          {"variadic_inputs", true}});
 
+    // Train — submits a control-plane train_validate job from a labeled dataset
+    // (client-driven via the ML proxy); its output is a durable model artifact,
+    // not a stream. Config (families/features/windowing/run+field selection)
+    // lives on the node.
+    nodes.push_back(
+        {{"node_type", "train"},
+         {"kind", "train"},
+         {"category", "ml"},
+         {"runner", "control_plane"},
+         {"label", "Train"},
+         {"description",
+          "Trains a classifier on a recorded session dataset (model families + "
+          "feature windowing), producing a durable model artifact a classify "
+          "node can load."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", nlohmann::json::array()},
+         {"output_ports", nlohmann::json::array()},
+         {"variadic_inputs", false}});
+
     return nodes;
 }
 
@@ -1660,6 +1679,14 @@ void normalizeGraphNodePorts(StreamGraphNode& node)
         if (node.inputPortIds.empty()) {
             node.inputPortIds = {"in1"};
         }
+        node.outputPortIds.clear();
+        if (node.config.is_null()) {
+            node.config = nlohmann::json::object();
+        }
+    } else if (node.kind == "train") {
+        // A train node submits a control-plane job (client-driven); it holds a
+        // training spec in config and produces no stream output. Its dataset is
+        // selected in config (run selectors), so inputs are optional.
         node.outputPortIds.clear();
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
@@ -2032,7 +2059,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
 
         if (node.kind != "stream_source" && node.kind != "transform" &&
             node.kind != "viewer" && node.kind != "sink" &&
-            node.kind != "combine" && node.kind != "session") {
+            node.kind != "combine" && node.kind != "session" &&
+            node.kind != "train") {
             addGraphDiagnostic(
                 result,
                 result.nodeDiagnostics[node.id],
@@ -2149,6 +2177,14 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     result.nodeDiagnostics[node.id],
                     "invalid_session_output_ports",
                     "session nodes do not expose output ports.");
+            }
+        } else if (node.kind == "train") {
+            if (!node.outputPortIds.empty()) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "invalid_train_output_ports",
+                    "train nodes do not expose output ports.");
             }
         }
     }
@@ -5573,6 +5609,25 @@ void executeStreamGraphStart(
                 0,
                 std::optional<std::string>(
                     "Session node is ready to record its upstream streams.")};
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+        if (node.kind == "train") {
+            // Training runs as a control-plane job submitted client-side through
+            // the ML proxy; the graph runtime just marks the node ready.
+            StreamGraphNodeRuntimeStatus status{
+                "running",
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                0,
+                0,
+                std::optional<std::string>(
+                    "Train node is ready; submit a job from the inspector.")};
             if (!commitNodeStatus(node.id, status, std::nullopt)) {
                 aborted = true;
                 break;
