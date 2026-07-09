@@ -133,6 +133,11 @@ private:
     void handleStopStreamGraph(const drogon::WebSocketConnectionPtr& conn,
                                const nlohmann::json& json);
 
+    // Incremental reactivity (Phase 7): restart one node + its downstream
+    // subgraph in a running graph after a config change.
+    void handleRestartStreamGraphNode(const drogon::WebSocketConnectionPtr& conn,
+                                      const nlohmann::json& json);
+
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
 
