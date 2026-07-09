@@ -1,5 +1,9 @@
 #include "StreamViewerWebSocket.hpp"
 
+#include "GraphTopicResolution.hpp"
+#include "GraphTransportPlan.hpp"
+#include "InProcessTransport.hpp"
+
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -124,20 +128,10 @@ std::shared_ptr<nat::core::BasicTopicInformation> createTopicInfo(
     const std::string& identifier,
     const std::string& schema_name)
 {
-    const uint64_t stream_id =
-        nat::core::stableStreamId(topic_namespace, identifier);
-    const std::string topic =
-        nat::core::toString(stream_type) + "-" + std::to_string(stream_id) +
-        "-Json-" + schema_name;
-    auto topic_info_maybe = nat::core::BasicTopicInformation::create(topic);
-    if (!topic_info_maybe.has_value()) {
-        return nullptr;
-    }
-
-    std::unique_ptr<nat::core::BasicTopicInformation> topic_info_unique =
-        std::move(topic_info_maybe.value());
-    return std::shared_ptr<nat::core::BasicTopicInformation>(
-        topic_info_unique.release());
+    // Single source of truth for the deterministic topic identity, shared with
+    // the graph-resolution unit tests.
+    return nat::tools::makeTopicInfo(
+        stream_type, topic_namespace, identifier, schema_name);
 }
 
 std::vector<std::string> parseStringArray(const nlohmann::json& value)
@@ -1804,7 +1798,30 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
             runtime.activeRunId.empty() ? nlohmann::json(nullptr)
                                         : nlohmann::json(runtime.activeRunId);
         for (const auto& entry : node_statuses) {
-            json["node_statuses"][entry.first] = entry.second;
+            nlohmann::json node_json = entry.second;
+            // Annotate the data edge's transport so an in-process fast-path edge
+            // is as observable as a Kafka one. A live in-process producer has a
+            // channel registered under its output stream id; its depth and drop
+            // counts ride the same status surface Kafka transforms report.
+            if (entry.second.outputStreamId.has_value()) {
+                const auto channel =
+                    nat::tools::InProcessChannelRegistry::global().find(
+                        entry.second.outputStreamId.value());
+                if (channel) {
+                    const auto metrics = channel->metrics();
+                    node_json["transport"] = "in_process";
+                    node_json["channel"] = {
+                        {"subscribers", metrics.subscriberCount},
+                        {"published", metrics.published},
+                        {"dropped", metrics.dropped},
+                        {"depth", metrics.maxDepth},
+                    };
+                } else if (entry.second.state == "running" ||
+                           entry.second.state == "stalled") {
+                    node_json["transport"] = "kafka";
+                }
+            }
+            json["node_statuses"][entry.first] = node_json;
         }
     }
     return json;
@@ -3520,6 +3537,11 @@ public:
         return outputTopic ? outputTopic->toTopicString() : std::string{};
     }
 
+    std::shared_ptr<nat::core::BasicTopicInformation> getOutputTopicInfo() const
+    {
+        return outputTopic;
+    }
+
     uint64_t getSourceStreamId() const
     {
         return sourceStreamId;
@@ -4263,6 +4285,71 @@ std::optional<size_t> findAvailableTransformSlotIndex()
     return std::nullopt;
 }
 
+// Resolves a graph-internal node's output DATA topic from the in-process worker
+// registries. Defined after the combine registry below; forward-declared here so
+// createTransformWorker() (which precedes that registry) can fall back to it.
+std::shared_ptr<nat::core::BasicTopicInformation>
+findGraphInternalOutputTopicForStream(uint64_t stream_id);
+
+// Buffering policy for graph in-process channels. Graph edges carry real-time
+// signal frames, so a full channel drops its oldest frame (matches the
+// live-monitoring semantics a viewer expects) rather than blocking the producer.
+// Capacity is per frame, not per sample, so rate-changing stages need no special
+// case. Tunable via NATKIT_INPROCESS_CHANNEL_CAPACITY for overloaded pipelines.
+nat::tools::InProcessChannelPolicy graphInProcessChannelPolicy()
+{
+    nat::tools::InProcessChannelPolicy policy;
+    policy.overflow = nat::tools::InProcessOverflowPolicy::DropOldest;
+    if (const char* capacity_env =
+            std::getenv("NATKIT_INPROCESS_CHANNEL_CAPACITY")) {
+        try {
+            const long parsed = std::stol(capacity_env);
+            if (parsed > 0) {
+                policy.capacity = static_cast<size_t>(parsed);
+            }
+        } catch (const std::exception&) {
+            // Ignore a malformed override; keep the default capacity.
+        }
+    }
+    return policy;
+}
+
+// Mint an input (source) messenger for a graph worker: in-process when the
+// upstream producer's output is a private, colocated edge, else Kafka. Both sides
+// rendezvous on the deterministic channel id == topic id, so a channel can be
+// swapped for Kafka without touching node code.
+std::unique_ptr<nat::core::TopicMessenger> makeGraphSourceMessenger(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    const std::shared_ptr<nat::core::BasicTopicInformation>& source_topic,
+    bool in_process)
+{
+    if (in_process) {
+        return nat::tools::createInProcessMessenger(
+            source_topic,
+            broker_manager->getRegistry(),
+            nat::tools::InProcessRole::Consumer,
+            nat::tools::InProcessChannelRegistry::global(),
+            graphInProcessChannelPolicy());
+    }
+    return broker_manager->createMessenger(source_topic);
+}
+
+std::unique_ptr<nat::core::TopicMessenger> makeGraphOutputMessenger(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    const std::shared_ptr<nat::core::BasicTopicInformation>& output_topic,
+    bool in_process)
+{
+    if (in_process) {
+        return nat::tools::createInProcessMessenger(
+            output_topic,
+            broker_manager->getRegistry(),
+            nat::tools::InProcessRole::Producer,
+            nat::tools::InProcessChannelRegistry::global(),
+            graphInProcessChannelPolicy());
+    }
+    return broker_manager->createMessenger(output_topic);
+}
+
 struct CreateTransformWorkerResult {
     bool ok = false;
     bool alreadyExists = false;
@@ -4287,7 +4374,9 @@ CreateTransformWorkerResult createTransformWorker(
     const std::string& requested_input_mapping_id,
     const std::optional<std::string>& graph_id = std::nullopt,
     const std::optional<std::string>& graph_run_id = std::nullopt,
-    const std::optional<std::string>& graph_node_id = std::nullopt)
+    const std::optional<std::string>& graph_node_id = std::nullopt,
+    bool input_in_process = false,
+    bool output_in_process = false)
 {
     CreateTransformWorkerResult result;
     result.sourceStreamId = source_stream_id;
@@ -4300,8 +4389,15 @@ CreateTransformWorkerResult createTransformWorker(
         return result;
     }
 
-    const auto source_topic =
-        findTransformSourceTopicForStream(broker_manager, source_stream_id);
+    // Kafka discovery for hardware sources; deterministic in-process fallback for
+    // an upstream graph node that exists but has not yet produced its first frame
+    // (so its DATA topic is not in broker metadata). See resolveGraphSourceTopic.
+    auto source_topic = nat::tools::resolveGraphSourceTopic(
+        source_stream_id,
+        [&](uint64_t id) {
+            return findTransformSourceTopicForStream(broker_manager, id);
+        },
+        [](uint64_t id) { return findGraphInternalOutputTopicForStream(id); });
     if (source_topic == nullptr) {
         result.error =
             "Could not locate a compatible JSON numeric channel topic for source_stream_id";
@@ -4374,8 +4470,12 @@ CreateTransformWorkerResult createTransformWorker(
         }
     }
 
-    auto source_messenger = broker_manager->createMessenger(source_topic);
-    auto output_messenger = broker_manager->createMessenger(output_topic);
+    auto source_messenger =
+        makeGraphSourceMessenger(broker_manager, source_topic, input_in_process);
+    auto output_messenger =
+        makeGraphOutputMessenger(broker_manager, output_topic, output_in_process);
+    // Provenance metadata is always published on Kafka so lineage stays
+    // discoverable regardless of the data edge's transport.
     auto meta_messenger = broker_manager->createMessenger(meta_topic);
     std::shared_ptr<TransformWorker> worker;
     {
@@ -4529,6 +4629,11 @@ public:
     std::string getOutputTopic() const
     {
         return outputTopic ? outputTopic->toTopicString() : std::string{};
+    }
+
+    std::shared_ptr<nat::core::BasicTopicInformation> getOutputTopicInfo() const
+    {
+        return outputTopic;
     }
 
     const std::string& getOutputIdentifier() const
@@ -4695,6 +4800,33 @@ private:
 std::mutex g_combine_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<CombineWorker>> g_combine_workers;
 
+// Forward-declared above createTransformWorker. When a graph node is started in
+// the same topological pass as its upstream, the upstream worker exists here but
+// its Kafka DATA topic has not yet appeared in broker metadata (no frame produced
+// yet), so findTransformSourceTopicForStream() cannot discover it. The output
+// topic name is deterministic and the worker holds it in memory, so resolve it
+// directly from the registries. This keeps deep pipelines starting deterministically
+// instead of racing the first frame through each stage.
+std::shared_ptr<nat::core::BasicTopicInformation>
+findGraphInternalOutputTopicForStream(uint64_t stream_id)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_transform_mutex);
+        const auto search = g_transform_workers.find(stream_id);
+        if (search != g_transform_workers.end() && search->second) {
+            return search->second->getOutputTopicInfo();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_combine_mutex);
+        const auto search = g_combine_workers.find(stream_id);
+        if (search != g_combine_workers.end() && search->second) {
+            return search->second->getOutputTopicInfo();
+        }
+    }
+    return nullptr;
+}
+
 std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
     uint64_t output_stream_id)
 {
@@ -4735,7 +4867,9 @@ struct CreateCombineWorkerResult {
 CreateCombineWorkerResult createCombineWorker(
     const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
     const std::vector<uint64_t>& source_stream_ids,
-    const std::string& output_identifier)
+    const std::string& output_identifier,
+    const std::vector<bool>& input_in_process = {},
+    bool output_in_process = false)
 {
     CreateCombineWorkerResult result;
     result.outputIdentifier = output_identifier;
@@ -4774,9 +4908,18 @@ CreateCombineWorkerResult createCombineWorker(
 
     std::vector<CombineInputState> inputs{};
     inputs.reserve(source_stream_ids.size());
-    for (const auto source_stream_id : source_stream_ids) {
-        const auto source_topic =
-            findTransformSourceTopicForStream(broker_manager, source_stream_id);
+    for (size_t input_index = 0; input_index < source_stream_ids.size();
+         ++input_index) {
+        const auto source_stream_id = source_stream_ids[input_index];
+        // Same intra-graph race as createTransformWorker: an upstream node may
+        // exist but not yet have produced to Kafka. resolveGraphSourceTopic falls
+        // back to its deterministic in-process output topic.
+        auto source_topic = nat::tools::resolveGraphSourceTopic(
+            source_stream_id,
+            [&](uint64_t id) {
+                return findTransformSourceTopicForStream(broker_manager, id);
+            },
+            [](uint64_t id) { return findGraphInternalOutputTopicForStream(id); });
         if (source_topic == nullptr) {
             result.error =
                 "Could not locate a compatible JSON numeric channel topic for one of combine's source streams";
@@ -4791,15 +4934,19 @@ CreateCombineWorkerResult createCombineWorker(
             return result;
         }
 
+        const bool source_in_process =
+            input_index < input_in_process.size() && input_in_process[input_index];
         CombineInputState input{};
         input.sourceStreamId = source_stream_id;
         input.sourceTopic = source_topic;
-        input.sourceMessenger = broker_manager->createMessenger(source_topic);
+        input.sourceMessenger =
+            makeGraphSourceMessenger(broker_manager, source_topic, source_in_process);
         input.descriptorMaybe = descriptor_maybe.value();
         inputs.push_back(std::move(input));
     }
 
-    auto output_messenger = broker_manager->createMessenger(output_topic);
+    auto output_messenger =
+        makeGraphOutputMessenger(broker_manager, output_topic, output_in_process);
     std::shared_ptr<CombineWorker> worker;
     {
         std::lock_guard<std::mutex> lock(g_combine_mutex);
@@ -5459,6 +5606,46 @@ void pushStreamGraphStartedMessage(
 // staring at a frozen UI. activeRunId is the generation token: if the user stops
 // the graph or starts a fresh run mid-flight, this run is cancelled and any
 // workers it already created are torn back down.
+// Global kill-switch for the in-process fast path. In-process is the committed
+// transport for private colocated edges, but a private edge loses Kafka's
+// tap-ability, so a deployment can force every edge back onto Kafka by setting
+// NATKIT_INPROCESS_TRANSPORT to 0/off/false/no.
+bool inProcessTransportEnabled()
+{
+    const char* value = std::getenv("NATKIT_INPROCESS_TRANSPORT");
+    if (value == nullptr) {
+        return true;
+    }
+    const std::string setting = nat::core::Strings::toLowercase(value);
+    return !(setting == "0" || setting == "off" || setting == "false" ||
+             setting == "no");
+}
+
+// Adapt the runtime graph to the pure transport classifier. Returns the set of
+// producer node ids whose output edge may travel in-process.
+std::unordered_set<std::string> classifyGraphPrivateOutputs(
+    const StreamGraphDefinition& graph)
+{
+    if (!inProcessTransportEnabled()) {
+        return {};
+    }
+    std::vector<nat::tools::TransportGraphNode> nodes;
+    nodes.reserve(graph.nodes.size());
+    for (const auto& node : graph.nodes) {
+        nodes.push_back({node.id, node.kind});
+    }
+    std::vector<nat::tools::TransportGraphEdge> edges;
+    edges.reserve(graph.edges.size());
+    for (const auto& edge : graph.edges) {
+        edges.push_back({edge.sourceNodeId, edge.targetNodeId});
+    }
+    // Colocation is trivially true today — every graph node shares the backend
+    // process — so the default proof accepts all edges. When ADR 001 Phase 4
+    // places transforms on independent worker slots, swap in a scheduler proof
+    // here and cross-slot edges fall back to Kafka with no other change.
+    return nat::tools::classifyPrivateOutputs(nodes, edges);
+}
+
 void executeStreamGraphStart(
     std::shared_ptr<nat::kafka::BrokerManager> broker_manager,
     WebSocketConnectionPtr conn,
@@ -5476,6 +5663,15 @@ void executeStreamGraphStart(
             resolved_output_stream_ids[node.id] = node.streamId.value();
         }
     }
+
+    // Transport classification (ADR 005): decide, per producer output, whether the
+    // edge is private + colocated (in-process) or published (Kafka). Recomputed on
+    // every run, so exposing a previously private edge to a viewer/sink/session/
+    // train — or ungrouping a subgraph — promotes it back to Kafka automatically.
+    const auto privateOutputs = classifyGraphPrivateOutputs(graph);
+    const auto outputInProcess = [&](const std::string& node_id) {
+        return privateOutputs.count(node_id) != 0;
+    };
 
     struct ResolvedInput {
         std::optional<uint64_t> streamId;
@@ -5649,6 +5845,7 @@ void executeStreamGraphStart(
         }
         if (node.kind == "combine") {
             std::vector<uint64_t> input_stream_ids{};
+            std::vector<bool> combine_input_in_process{};
             std::optional<std::string> blocking_upstream{};
             bool all_resolved = true;
             for (const auto& edge : graph.edges) {
@@ -5674,6 +5871,8 @@ void executeStreamGraphStart(
                     break;
                 }
                 input_stream_ids.push_back(resolved_stream_id.value());
+                combine_input_in_process.push_back(
+                    outputInProcess(edge.sourceNodeId));
             }
 
             if (!all_resolved || input_stream_ids.size() < 2U) {
@@ -5694,7 +5893,8 @@ void executeStreamGraphStart(
             }
 
             const auto create_result = createCombineWorker(
-                broker_manager, input_stream_ids, node.outputIdentifier.value_or(node.id));
+                broker_manager, input_stream_ids, node.outputIdentifier.value_or(node.id),
+                combine_input_in_process, outputInProcess(node.id));
             if (!create_result.ok) {
                 encountered_error = true;
                 const StreamGraphNodeRuntimeStatus status{
@@ -5773,6 +5973,9 @@ void executeStreamGraphStart(
             continue;
         }
 
+        const bool input_in_process =
+            resolved_input.upstreamNodeId.has_value() &&
+            outputInProcess(resolved_input.upstreamNodeId.value());
         const auto create_result = createTransformWorker(
             broker_manager,
             resolved_input.streamId.value(),
@@ -5781,7 +5984,9 @@ void executeStreamGraphStart(
             node.inputMappingId.value_or(std::string{}),
             graph.graphId,
             active_run_id,
-            node.id);
+            node.id,
+            input_in_process,
+            outputInProcess(node.id));
         if (!create_result.ok) {
             encountered_error = true;
             const StreamGraphNodeRuntimeStatus status{
@@ -6034,6 +6239,14 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
         active_run_id = runtime_search->second.activeRunId;
     }
 
+    // Re-classify transport over the whole (flattened) graph so a restarted node
+    // agrees with its still-running upstream about the transport of the shared
+    // edge, and any edit that exposed a previously private edge is honored.
+    const auto privateOutputs = classifyGraphPrivateOutputs(graph);
+    const auto outputInProcess = [&](const std::string& id) {
+        return privateOutputs.count(id) != 0;
+    };
+
     // Forward adjacency + BFS to collect node_id and all its descendants.
     std::unordered_map<std::string, std::vector<std::string>> adjacency;
     for (const auto& edge : graph.edges) {
@@ -6103,10 +6316,12 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
 
         if (node.kind == "transform") {
             std::optional<uint64_t> input_stream_id;
+            std::optional<std::string> upstream_node_id;
             for (const auto& edge : graph.edges) {
                 if (edge.targetNodeId != node.id) {
                     continue;
                 }
+                upstream_node_id = edge.sourceNodeId;
                 const auto up = output_stream_ids.find(edge.sourceNodeId);
                 if (up != output_stream_ids.end()) {
                     input_stream_id = up->second;
@@ -6126,6 +6341,9 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                     status = {"error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                               std::optional<std::string>("Transform configuration could not be parsed.")};
                 } else {
+                    const bool input_in_process =
+                        upstream_node_id.has_value() &&
+                        outputInProcess(upstream_node_id.value());
                     const auto create_result = createTransformWorker(
                         broker_manager_,
                         input_stream_id.value(),
@@ -6134,7 +6352,9 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                         node.inputMappingId.value_or(std::string{}),
                         graph.graphId,
                         active_run_id,
-                        node.id);
+                        node.id,
+                        input_in_process,
+                        outputInProcess(node.id));
                     if (!create_result.ok) {
                         status = {"error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                                   create_result.error};
@@ -6149,6 +6369,7 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
             }
         } else if (node.kind == "combine") {
             std::vector<uint64_t> input_stream_ids;
+            std::vector<bool> combine_input_in_process;
             bool all_resolved = true;
             for (const auto& edge : graph.edges) {
                 if (edge.targetNodeId != node.id) {
@@ -6160,6 +6381,8 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                     break;
                 }
                 input_stream_ids.push_back(up->second);
+                combine_input_in_process.push_back(
+                    outputInProcess(edge.sourceNodeId));
             }
             if (!all_resolved || input_stream_ids.size() < 2U) {
                 status = {"blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
@@ -6167,7 +6390,8 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
             } else {
                 const auto create_result = createCombineWorker(
                     broker_manager_, input_stream_ids,
-                    node.outputIdentifier.value_or(node.id));
+                    node.outputIdentifier.value_or(node.id),
+                    combine_input_in_process, outputInProcess(node.id));
                 if (!create_result.ok) {
                     status = {"error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                               create_result.error};

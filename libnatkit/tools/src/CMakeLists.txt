@@ -63,6 +63,7 @@ target_link_libraries(libnatkit-natkit-menu PRIVATE
 if(BUILD_NATKIT_BACKEND)
   add_executable(libnatkit-natkit-backend
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/Auth.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/StreamViewerWebSocket.cpp
   )
@@ -82,4 +83,22 @@ if(BUILD_NATKIT_BACKEND)
     uuid
     brotlienc
   )
+endif()
+
+if(BUILD_TESTING)
+  add_executable(libnatkit-tools-unittest-cxx
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/GraphTopicResolutionTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/InProcessTransportTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/GraphTransportPlanTest.cpp
+  )
+  add_gtest(libnatkit-tools-unittest-cxx)
+  target_link_libraries(libnatkit-tools-unittest-cxx PRIVATE
+    libnatkit-core-kafka-cxx
+    nlohmann
+  )
+  target_include_directories(libnatkit-tools-unittest-cxx PRIVATE
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx
+  )
+  set_target_properties(libnatkit-tools-unittest-cxx PROPERTIES LINKER_LANGUAGE CXX)
 endif()
