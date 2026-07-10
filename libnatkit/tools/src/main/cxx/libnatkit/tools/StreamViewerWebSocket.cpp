@@ -5630,10 +5630,10 @@ void pushStreamGraphStartedMessage(
 // staring at a frozen UI. activeRunId is the generation token: if the user stops
 // the graph or starts a fresh run mid-flight, this run is cancelled and any
 // workers it already created are torn back down.
-// Global kill-switch for the in-process fast path. In-process is the committed
-// transport for private colocated edges, but a private edge loses Kafka's
-// tap-ability, so a deployment can force every edge back onto Kafka by setting
-// NATKIT_INPROCESS_TRANSPORT to 0/off/false/no.
+// Global kill-switch for the in-process fast path. In-process is the default
+// transport for private colocated edges (it also cuts startup latency — an
+// internal edge skips Kafka messenger creation); a deployment can force every
+// edge back onto Kafka by setting NATKIT_INPROCESS_TRANSPORT to 0/off/false/no.
 bool inProcessTransportEnabled()
 {
     const char* value = std::getenv("NATKIT_INPROCESS_TRANSPORT");
@@ -6179,6 +6179,46 @@ void StreamViewerWebSocket::handleStartStreamGraph(
     // (executeStreamGraphStart) that streams incremental status updates. Doing
     // this inline previously froze the WebSocket handler for the full Kafka
     // topic-creation time (tens of seconds) before the client saw anything.
+    // Precompute every node's deterministic output stream id (transform/combine
+    // outputs are a pure function of their identifier, so they're known before
+    // any worker exists). This lets us seed a viewer/sink with the stream it will
+    // inspect immediately, so the frontend can subscribe and start rendering as
+    // soon as the upstream produces its first frame — instead of waiting for the
+    // whole pipeline to finish starting (which, for a deep composite, is the
+    // multi-second "Waiting for data" window users hit).
+    std::unordered_map<std::string, uint64_t> node_output_id;
+    for (const auto& node : graph.nodes) {
+        if (node.kind == "stream_source" && node.streamId.has_value()) {
+            node_output_id[node.id] = node.streamId.value();
+        } else if (node.kind == "transform" || node.kind == "combine") {
+            if (node.outputStreamId.has_value()) {
+                node_output_id[node.id] = node.outputStreamId.value();
+            } else if (node.outputIdentifier.has_value()) {
+                const auto topic = createTopicInfo(
+                    nat::core::StreamType::DATA,
+                    node.kind == "combine" ? "combine" : "transform",
+                    node.outputIdentifier.value(),
+                    nat::core::NatSignalFrameDataSchemaV1::name);
+                if (topic != nullptr) {
+                    node_output_id[node.id] = topic->id;
+                }
+            }
+        }
+    }
+    const auto seedUpstreamOutput =
+        [&](const std::string& nodeId) -> std::optional<uint64_t> {
+        for (const auto& edge : graph.edges) {
+            if (edge.targetNodeId != nodeId) {
+                continue;
+            }
+            const auto it = node_output_id.find(edge.sourceNodeId);
+            return it != node_output_id.end()
+                       ? std::optional<uint64_t>(it->second)
+                       : std::nullopt;
+        }
+        return std::nullopt;
+    };
+
     StreamGraphRuntimeState runtime;
     runtime.graphId = graph.graphId;
     runtime.activeRunId = graph.graphId + ":" + std::to_string(nowUs());
@@ -6195,10 +6235,26 @@ void StreamViewerWebSocket::handleStartStreamGraph(
                 node.streamId.has_value()
                     ? std::optional<std::string>("Source stream is available to downstream nodes.")
                     : std::nullopt};
-        } else {
+        } else if (node.kind == "viewer" || node.kind == "sink") {
+            // Seed the resolved upstream stream so the frontend subscribes now.
             runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
                 "starting",
+                seedUpstreamOutput(node.id),
                 std::nullopt,
+                std::nullopt,
+                0,
+                0,
+                std::optional<std::string>("Waiting to start…")};
+        } else {
+            // transform/combine: seed the deterministic output id too.
+            std::optional<uint64_t> seeded_output;
+            const auto it = node_output_id.find(node.id);
+            if (it != node_output_id.end()) {
+                seeded_output = it->second;
+            }
+            runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
+                "starting",
+                seeded_output,
                 std::nullopt,
                 std::nullopt,
                 0,
