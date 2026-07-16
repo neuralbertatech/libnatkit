@@ -2184,6 +2184,146 @@ bool persistStreamGraphStoreLocked(std::string& error)
     return true;
 }
 
+// --- Individual profiles (Phase 4) -----------------------------------------
+//
+// A Profile persists a person as a first-class object so they can walk up later
+// and resume live classifying in one click. It is a thin pointer: the trained
+// bundle path (placement-specific) is already baked into the referenced classify
+// graph (graph_id) via the graph store, so "load profile" = load that graph and
+// Start. The store mirrors the stream-graph store mechanics (atomic write,
+// load-on-startup) under NATKIT_PROFILE_STORE.
+
+struct Profile {
+    std::string participantId;
+    std::string displayName;
+    std::string modelPath;  // bundle path (reference/display; also baked into the graph)
+    std::string graphId;    // the classify graph to reload
+    std::string protocolId;
+    std::string deviceId;   // channel binding
+    std::vector<std::string> sessionIds;
+    double bestAccuracy = 0.0;
+    uint64_t createdAtUs = 0;
+    uint64_t updatedAtUs = 0;
+};
+
+void to_json(nlohmann::json& json, const Profile& value)
+{
+    json = {
+        {"participant_id", value.participantId},
+        {"display_name", value.displayName},
+        {"model_path", value.modelPath},
+        {"graph_id", value.graphId},
+        {"protocol_id", value.protocolId},
+        {"device_id", value.deviceId},
+        {"session_ids", value.sessionIds},
+        {"best_accuracy", value.bestAccuracy},
+        {"created_at_us", value.createdAtUs},
+        {"updated_at_us", value.updatedAtUs},
+    };
+}
+
+void from_json(const nlohmann::json& json, Profile& value)
+{
+    value.participantId = json.at("participant_id").get<std::string>();
+    value.displayName = json.value("display_name", std::string{});
+    value.modelPath = json.value("model_path", std::string{});
+    value.graphId = json.value("graph_id", std::string{});
+    value.protocolId = json.value("protocol_id", std::string{});
+    value.deviceId = json.value("device_id", std::string{});
+    value.sessionIds = json.value("session_ids", std::vector<std::string>{});
+    value.bestAccuracy = json.value("best_accuracy", 0.0);
+    value.createdAtUs = json.value("created_at_us", static_cast<uint64_t>(0));
+    value.updatedAtUs = json.value("updated_at_us", static_cast<uint64_t>(0));
+}
+
+std::filesystem::path resolveProfileStorePath()
+{
+    const char* store_path = std::getenv("NATKIT_PROFILE_STORE");
+    if (store_path != nullptr && store_path[0] != '\0') {
+        return std::filesystem::path(store_path);
+    }
+    return std::filesystem::path("./data/profiles.json");
+}
+
+std::unordered_map<std::string, Profile> g_profiles;
+std::mutex g_profile_mutex;
+bool g_profile_store_loaded = false;
+std::string g_profile_store_error{};
+
+void ensureProfileStoreLoadedLocked()
+{
+    if (g_profile_store_loaded) {
+        return;
+    }
+    g_profile_store_loaded = true;
+    g_profile_store_error.clear();
+    g_profiles.clear();
+    const auto store_path = resolveProfileStorePath();
+    if (!std::filesystem::exists(store_path)) {
+        return;
+    }
+    std::ifstream input(store_path);
+    if (!input) {
+        g_profile_store_error =
+            "Failed to open profile store at " + store_path.string();
+        return;
+    }
+    try {
+        nlohmann::json json = nlohmann::json::parse(input);
+        if (json.value("store_version", 0) != 1 || !json["profiles"].is_array()) {
+            throw std::runtime_error(
+                "Profile store must contain store_version=1 and a profiles array");
+        }
+        for (const auto& profile_json : json["profiles"]) {
+            Profile profile = profile_json.get<Profile>();
+            g_profiles[profile.participantId] = std::move(profile);
+        }
+    } catch (const std::exception& exception) {
+        g_profiles.clear();
+        g_profile_store_error =
+            "Failed to parse profile store: " + std::string(exception.what());
+    }
+}
+
+bool persistProfileStoreLocked(std::string& error)
+{
+    const auto store_path = resolveProfileStorePath();
+    if (store_path.has_parent_path()) {
+        std::filesystem::create_directories(store_path.parent_path());
+    }
+    nlohmann::json store_json;
+    store_json["store_version"] = 1;
+    store_json["profiles"] = nlohmann::json::array();
+    for (const auto& entry : g_profiles) {
+        store_json["profiles"].push_back(entry.second);
+    }
+    const auto temp_path = store_path.string() + ".tmp";
+    {
+        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            error = "Failed to open temporary profile store file for write";
+            return false;
+        }
+        output << store_json.dump(2);
+        if (!output.good()) {
+            error = "Failed while writing profile store";
+            return false;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temp_path, store_path, rename_error);
+    if (rename_error) {
+        std::filesystem::remove(store_path, rename_error);
+        rename_error.clear();
+        std::filesystem::rename(temp_path, store_path, rename_error);
+    }
+    if (rename_error) {
+        error = "Failed to atomically replace profile store: " + rename_error.message();
+        return false;
+    }
+    return true;
+}
+
 StreamGraphValidationResult validateStreamGraphDefinition(
     const StreamGraphDefinition& graph,
     std::shared_ptr<nat::kafka::BrokerManager> broker_manager)
@@ -6041,6 +6181,15 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "restart_stream_graph_node") {
             handleRestartStreamGraphNode(conn, json);
         }
+        else if (action == "list_profiles") {
+            handleListProfiles(conn, json);
+        }
+        else if (action == "save_profile") {
+            handleSaveProfile(conn, json);
+        }
+        else if (action == "delete_profile") {
+            handleDeleteProfile(conn, json);
+        }
         else {
             sendError(conn, "Unknown action: " + action);
         }
@@ -6498,6 +6647,105 @@ void StreamViewerWebSocket::handleSaveStreamGraph(
         conn,
         json.value("request_id", std::string{}),
         graph);
+}
+
+void StreamViewerWebSocket::handleListProfiles(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        ensureProfileStoreLoadedLocked();
+        if (!g_profile_store_error.empty()) {
+            sendError(conn, g_profile_store_error);
+            return;
+        }
+    }
+    sendProfileList(conn, request_id);
+}
+
+void StreamViewerWebSocket::handleSaveProfile(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    if (!json.contains("profile")) {
+        sendError(conn, "save_profile requires a profile payload");
+        return;
+    }
+
+    Profile profile;
+    try {
+        profile = json.at("profile").get<Profile>();
+    } catch (const std::exception& exception) {
+        sendError(
+            conn,
+            std::string("Failed to parse profile payload: ") + exception.what());
+        return;
+    }
+    if (profile.participantId.empty()) {
+        sendError(conn, "save_profile requires a non-empty participant_id");
+        return;
+    }
+
+    if (profile.createdAtUs == 0) {
+        profile.createdAtUs = nowUs();
+    }
+    profile.updatedAtUs = nowUs();
+
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        ensureProfileStoreLoadedLocked();
+        if (!g_profile_store_error.empty()) {
+            sendError(conn, g_profile_store_error);
+            return;
+        }
+        // Preserve the original creation timestamp on update.
+        const auto existing = g_profiles.find(profile.participantId);
+        if (existing != g_profiles.end() && existing->second.createdAtUs != 0) {
+            profile.createdAtUs = existing->second.createdAtUs;
+        }
+        g_profiles[profile.participantId] = profile;
+        if (!persistProfileStoreLocked(persist_error)) {
+            sendError(conn, persist_error);
+            return;
+        }
+    }
+
+    sendProfileSaved(conn, json.value("request_id", std::string{}), profile);
+}
+
+void StreamViewerWebSocket::handleDeleteProfile(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string participant_id = json.value("participant_id", std::string{});
+    if (participant_id.empty()) {
+        sendError(conn, "delete_profile requires a participant_id");
+        return;
+    }
+
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        ensureProfileStoreLoadedLocked();
+        if (!g_profile_store_error.empty()) {
+            sendError(conn, g_profile_store_error);
+            return;
+        }
+        if (g_profiles.erase(participant_id) == 0) {
+            sendError(conn, "No profile found for participant_id " + participant_id);
+            return;
+        }
+        if (!persistProfileStoreLocked(persist_error)) {
+            sendError(conn, persist_error);
+            return;
+        }
+    }
+
+    sendProfileDeleted(
+        conn, json.value("request_id", std::string{}), participant_id);
 }
 
 void StreamViewerWebSocket::handleValidateStreamGraph(
@@ -8664,6 +8912,46 @@ void StreamViewerWebSocket::sendStreamGraphSaved(
     response["request_id"] = request_id;
     response["graph"] = graph_json;
     response["graph_id"] = graph_json.value("graph_id", std::string{});
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendProfileList(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id)
+{
+    nlohmann::json response;
+    response["type"] = "profile_list";
+    response["request_id"] = request_id;
+    response["profiles"] = nlohmann::json::array();
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    for (const auto& entry : g_profiles) {
+        response["profiles"].push_back(entry.second);
+    }
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendProfileSaved(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const nlohmann::json& profile_json)
+{
+    nlohmann::json response;
+    response["type"] = "profile_saved";
+    response["request_id"] = request_id;
+    response["profile"] = profile_json;
+    response["participant_id"] = profile_json.value("participant_id", std::string{});
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendProfileDeleted(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const std::string& participant_id)
+{
+    nlohmann::json response;
+    response["type"] = "profile_deleted";
+    response["request_id"] = request_id;
+    response["participant_id"] = participant_id;
     conn->send(response.dump());
 }
 

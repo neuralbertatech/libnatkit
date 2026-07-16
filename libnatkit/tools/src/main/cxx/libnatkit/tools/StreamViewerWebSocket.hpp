@@ -19,6 +19,18 @@
 struct StreamViewerClientContext {
     std::set<uint64_t> subscribed_streams;
     std::vector<std::unique_ptr<nat::core::TopicMessenger>> messengers;
+    // Requested consumer start offset per subscribed stream (Phase 3 — historical
+    // reads). -1 = live tail (OFFSET_END, default), -2 = OFFSET_BEGINNING, >=0 a
+    // concrete offset (e.g. from offsets_for_times when scrubbing to a timestamp).
+    // Consulted by both the immediate bind and the lazy-bind path.
+    std::map<uint64_t, int64_t> requested_start_offsets;
+    // Topic-aware channels: a channel id can bind BOTH a DATA and a MARKER topic
+    // (a combine "stream" output). Track which topic types have been bound per
+    // stream id so the lazy-bind path can still attach the marker topic after the
+    // data topic (or vice versa) once it materialises — both share one id, so a
+    // messenger-count check can't tell them apart.
+    std::set<uint64_t> bound_data_ids;
+    std::set<uint64_t> bound_marker_ids;
     std::atomic<bool> active{true};
     std::thread streaming_thread;
     std::mutex mutex;
@@ -81,10 +93,19 @@ private:
     // Re-broadcast a raw control-plane message to all /ws/stream_viewer clients.
     void broadcastMlControlPlaneMessage(const std::string& raw_message);
 
-    // Handle subscribe action
+    // Handle subscribe action. start_offset selects where each stream's consumer
+    // begins: -1 live tail (default), -2 OFFSET_BEGINNING, >=0 a concrete offset.
     void handleSubscribe(const drogon::WebSocketConnectionPtr& conn,
                          StreamViewerClientContext* ctx,
-                         const std::vector<uint64_t>& stream_ids);
+                         const std::vector<uint64_t>& stream_ids,
+                         int64_t start_offset = -1);
+
+    // Handle a time-introspection query: earliest/latest offset for a stream and
+    // (optionally) the offset for a given timestamp (offsets_for_times). Lets the
+    // UI know a stream's available history extent and map a scrubbed timestamp to
+    // a start offset. (Phase 3.)
+    void handleQueryStreamTime(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
 
     // Handle unsubscribe action
     void handleUnsubscribe(const drogon::WebSocketConnectionPtr& conn,
@@ -137,6 +158,14 @@ private:
     // subgraph in a running graph after a config change.
     void handleRestartStreamGraphNode(const drogon::WebSocketConnectionPtr& conn,
                                       const nlohmann::json& json);
+
+    // Individual profiles (Phase 4): resume a person's live classify graph.
+    void handleListProfiles(const drogon::WebSocketConnectionPtr& conn,
+                            const nlohmann::json& json);
+    void handleSaveProfile(const drogon::WebSocketConnectionPtr& conn,
+                           const nlohmann::json& json);
+    void handleDeleteProfile(const drogon::WebSocketConnectionPtr& conn,
+                             const nlohmann::json& json);
 
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
@@ -238,6 +267,15 @@ private:
     void sendStreamGraphSaved(const drogon::WebSocketConnectionPtr& conn,
                               const std::string& request_id,
                               const nlohmann::json& graph_json);
+
+    void sendProfileList(const drogon::WebSocketConnectionPtr& conn,
+                         const std::string& request_id);
+    void sendProfileSaved(const drogon::WebSocketConnectionPtr& conn,
+                          const std::string& request_id,
+                          const nlohmann::json& profile_json);
+    void sendProfileDeleted(const drogon::WebSocketConnectionPtr& conn,
+                            const std::string& request_id,
+                            const std::string& participant_id);
 
     void sendStreamGraphValidation(
         const drogon::WebSocketConnectionPtr& conn,
