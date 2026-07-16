@@ -1232,10 +1232,14 @@ nlohmann::json buildTransformCapabilitiesJson()
         "entirely by a model bundle so live accuracy matches training. Point "
         "model_path at the emg-gesture-bundle.json written by the train node.",
         nlohmann::json::array(
+            // Not required at author/validate time: it is auto-filled from the
+            // train job and only needs to be non-empty at start (enforced in
+            // parseEmgTransformConfig). This lets a Quick-Start graph validate
+            // clean before the model is trained.
             {{{"id", "model_path"},
               {"label", "Model bundle path"},
               {"type", "string"},
-              {"required", true}}})));
+              {"required", false}}})));
     transforms.push_back(buildTransformCapabilityJson(
         "channel_select",
         "Select / Split channels",
@@ -2084,7 +2088,17 @@ bool validateTransformConfigAgainstCapability(
                 ok = false;
             }
         } else if (type == "string") {
-            if (!value.is_string() || value.get_ref<const std::string&>().empty()) {
+            if (!value.is_string()) {
+                addGraphDiagnostic(
+                    result,
+                    diagnostics,
+                    "invalid_config_type",
+                    "Transform config field '" + field_id + "' must be a string.");
+                ok = false;
+            } else if (required && value.get_ref<const std::string&>().empty()) {
+                // Empty is allowed for optional string fields (e.g. an
+                // emg_gesture_classify model_path that is filled after training);
+                // the actual requirement is enforced at start time.
                 addGraphDiagnostic(
                     result,
                     diagnostics,
