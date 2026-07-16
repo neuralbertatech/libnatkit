@@ -3648,7 +3648,7 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
         config.select_mode != "all") {
         return std::nullopt;
     }
-    if (config.kind == "lda_classify" || config.kind == "emg_gesture_classify") {
+    if (config.kind == "lda_classify") {
         if (config.model_path.empty()) {
             return std::nullopt;
         }
@@ -3657,6 +3657,11 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
             return std::nullopt;
         }
     }
+    // emg_gesture_classify intentionally accepts an empty / not-yet-present
+    // model_path: it starts idle (emits nothing) until a trained bundle exists.
+    // A Quick-Start graph can then run (view the raw signal, record a session)
+    // before training, and go live via reactive restart once the train job
+    // auto-fills the bundle path — no "failed to start" on an untrained graph.
     if (config.kind == "bandpass_iir" &&
         config.low_cutoff_hz >= config.high_cutoff_hz) {
         return std::nullopt;
@@ -4785,15 +4790,19 @@ private:
 
         if (!gestureBundleLoadAttempted) {
             gestureBundleLoadAttempted = true;
-            gestureBundle = loadEmgGestureBundle(config.model_path);
-            if (!gestureBundle.has_value()) {
-                LOG_ERROR
-                    << "StreamViewer: emg_gesture_classify could not load bundle at "
-                    << config.model_path;
+            // An empty path is the normal "not trained yet" state — stay idle
+            // silently. Only a non-empty path that fails to load is an error.
+            if (!config.model_path.empty()) {
+                gestureBundle = loadEmgGestureBundle(config.model_path);
+                if (!gestureBundle.has_value()) {
+                    LOG_ERROR
+                        << "StreamViewer: emg_gesture_classify could not load bundle at "
+                        << config.model_path;
+                }
             }
         }
         if (!gestureBundle.has_value()) {
-            return output;
+            return output;  // idle until a valid bundle is present
         }
         const EmgGestureBundle& bundle = *gestureBundle;
 
