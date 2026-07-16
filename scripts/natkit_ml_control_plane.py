@@ -269,13 +269,40 @@ def persist_selected_model_artifact(
     return str(dest_path)
 
 
+def persist_bundle_artifact(report: dict[str, Any], job_id: str) -> str | None:
+    """Copy the self-describing emg-gesture bundle (the artifact the live C++
+    emg_gesture_classify transform loads) into the durable artifacts directory,
+    alongside the model. Returns the durable bundle path or None."""
+    source = report.get("bundle_path")
+    if not source:
+        return None
+    source_path = Path(str(source))
+    if not source_path.is_file():
+        return None
+    dest_dir = resolve_artifacts_dir() / job_id
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / source_path.name
+        shutil.copy2(source_path, dest_path)
+    except OSError as exc:
+        LOG.warning("Could not persist bundle artifact for job %s: %s", job_id, exc)
+        return None
+    return str(dest_path)
+
+
 def sanitize_pipeline_report(
-    report: dict[str, Any], model_path: str | None = None
+    report: dict[str, Any],
+    model_path: str | None = None,
+    bundle_path: str | None = None,
 ) -> dict[str, Any]:
     return {
         "broker": report.get("broker"),
         "artifact_storage": "durable" if model_path else "ephemeral_scratch",
         "model_path": model_path,
+        # Durable path to the live-inference bundle. Auto-filled into an
+        # emg_gesture_classify node's model_path on the frontend so live
+        # classification uses the guaranteed-parity artifact.
+        "bundle_path": bundle_path,
         "model_family": report.get("selected_family"),
         "selected_fields": list(report.get("selected_fields") or []),
         "selected_channel_indexes": list(report.get("selected_channel_indexes") or []),
@@ -3057,7 +3084,10 @@ class MlControlPlaneServer:
             return
 
         durable_model_path = persist_selected_model_artifact(report, job_id)
-        sanitized_report = sanitize_pipeline_report(report, durable_model_path)
+        durable_bundle_path = persist_bundle_artifact(report, job_id)
+        sanitized_report = sanitize_pipeline_report(
+            report, durable_model_path, durable_bundle_path
+        )
         shutil.rmtree(job_workspace, ignore_errors=True)
         async with self._jobs_lock:
             job = self._jobs[job_id]

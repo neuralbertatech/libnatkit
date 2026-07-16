@@ -342,6 +342,39 @@ std::shared_ptr<nat::core::BasicTopicInformation> findTransformSourceTopicForStr
     const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
     uint64_t source_stream_id);
 
+// Marker/meta consumers read from the START of the topic (OFFSET_BEGINNING, -2)
+// rather than live-tailing (OFFSET_END). Markers are low-volume, a subscriber
+// wants the whole cue timeline (not just events after it connected), and a
+// marker topic only materializes on the first publish — so a live-tail consumer
+// that bound before/around the first publish would miss the burst. Reading from
+// the beginning is robust regardless of when the subscription binds.
+constexpr int64_t kMarkerConsumerStartOffset = -2;  // RdKafka OFFSET_BEGINNING
+
+// Resolve a stream_id to a MARKER (or META) topic. Markers/meta are not DATA
+// topics, so the DATA-only resolution in handleSubscribe/the streaming thread
+// misses them. A subscriber to an experiment node's `markers` output (Phase 2 —
+// the marker renderer) needs the matching MARKER topic bound so its
+// MarkerEventV1 records get forwarded. We scan the FLAT getAllTopics() rather
+// than getAllStreams() — the stream grouping drops marker topics (a marker
+// stream surfaces there with no topics attached), whereas the flat topic list
+// carries each topic with its real StreamType.
+std::shared_ptr<nat::core::BasicTopicInformation> findMarkerOrMetaTopicForStreamId(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    uint64_t stream_id)
+{
+    if (!broker_manager) {
+        return nullptr;
+    }
+    for (auto& topic : broker_manager->getAllTopics()) {
+        if (topic && topic->id == stream_id &&
+            (topic->type == nat::core::StreamType::MARKER ||
+             topic->type == nat::core::StreamType::META)) {
+            return std::make_shared<nat::core::BasicTopicInformation>(*topic);
+        }
+    }
+    return nullptr;
+}
+
 struct NormalizedNumericChannelFrame {
     std::string deviceId;
     uint64_t seqNo = 0;
@@ -804,6 +837,46 @@ nlohmann::json formatNormalizedFrameAsJson(
     return json;
 }
 
+// Project a MarkerEventV1 record to a `marker` wire message (Phase 2 — markers
+// as a first-class, observable stream). The marker renderer subscribes to a
+// marker stream and draws cue/session events as ticks/regions + data-chart
+// overlays. attributes are parsed back into an object (they were stored as a
+// JSON string) so the frontend gets structured fields (e.g. the cue class).
+nlohmann::json formatMarkerEventAsJson(
+    const nat::core::MarkerEventV1& marker,
+    uint64_t stream_id,
+    const std::string& encoding_type,
+    size_t encoding_size)
+{
+    nlohmann::json json;
+    json["type"] = "marker";
+    json["stream_id"] = std::to_string(stream_id);
+    json["schema_name"] = nat::core::MarkerEventV1::name;
+    json["encoding"]["type"] = encoding_type;
+    json["encoding"]["size"] = encoding_size;
+    json["session_id"] = marker.getSessionId();
+    json["marker_type"] = marker.getMarkerType();
+    json["marker_id"] = marker.getMarkerId();
+    json["event"] = marker.getEvent();
+    json["label"] = marker.getLabel();
+    json["emitted_at_us"] = marker.getEmittedAtUs();
+    // Canonical time axis for markers is emitted_at_us (see the Timestamped
+    // base, Phase 3); mirror it as `timestamp` so viewers share one accessor.
+    json["timestamp"] = marker.getEmittedAtUs();
+    nlohmann::json attributes = nlohmann::json::object();
+    try {
+        auto parsed = nlohmann::json::parse(marker.getAttributesJson());
+        if (parsed.is_object()) {
+            attributes = std::move(parsed);
+        }
+    } catch (const std::exception&) {
+        // Malformed attributes: fall back to an empty object rather than drop
+        // the whole marker.
+    }
+    json["attributes"] = std::move(attributes);
+    return json;
+}
+
 struct TransformConfig {
     std::string kind;
     double cutoff_hz = 20.0;
@@ -871,7 +944,8 @@ std::string serializeTransformConfigJson(const TransformConfig& config)
         json["ssc_threshold"] = config.ssc_threshold;
     } else if (config.kind == "ar_coeffs") {
         json["ar_order"] = config.ar_order;
-    } else if (config.kind == "lda_classify") {
+    } else if (config.kind == "lda_classify" ||
+               config.kind == "emg_gesture_classify") {
         json["model_path"] = config.model_path;
     } else if (config.kind == "channel_select") {
         json["select_mode"] = config.select_mode;
@@ -1150,6 +1224,19 @@ nlohmann::json buildTransformCapabilitiesJson()
               {"type", "string"},
               {"required", true}}})));
     transforms.push_back(buildTransformCapabilityJson(
+        "emg_gesture_classify",
+        "EMG Gesture Classify",
+        "Self-contained EMG gesture classifier: consumes raw EMG frames and "
+        "internally reproduces the training pipeline (sliding window -> DSP -> "
+        "Hudgins features -> rest-calibration normalization -> LDA), driven "
+        "entirely by a model bundle so live accuracy matches training. Point "
+        "model_path at the emg-gesture-bundle.json written by the train node.",
+        nlohmann::json::array(
+            {{{"id", "model_path"},
+              {"label", "Model bundle path"},
+              {"type", "string"},
+              {"required", true}}})));
+    transforms.push_back(buildTransformCapabilityJson(
         "channel_select",
         "Select / Split channels",
         "Passes through a subset of a multi-channel frame's channels — e.g. "
@@ -1275,23 +1362,32 @@ nlohmann::json buildNodeCatalogJson()
          {"output_ports", nlohmann::json::array()},
          {"variadic_inputs", false}});
 
-    // Session — records N upstream sensor streams under one protocol/marker
-    // timeline and publishes a labeled session bundle (client-driven). Produces
-    // no output stream; its protocol config lives on the node.
+    // Experiment — a SOURCE of timestamped cue/session markers. It runs a
+    // structured protocol (ordered cues + labels) and emits a `markers` stream
+    // (MarkerEventV1 for its session_id); it has NO inputs — the marker timeline
+    // is generated independently of any data source (the raw data already lives
+    // in Kafka), so an experiment is source-like, not a processing node.
+    // Downstream marker-aware nodes (a marker viewer, a train node) consume the
+    // cue timeline. Its protocol config lives on the node.
+    const auto markersOutputPort = []() {
+        return nlohmann::json::array(
+            {{{"id", "markers"}, {"label", "Markers"}}});
+    };
     nodes.push_back(
-        {{"node_type", "session"},
-         {"kind", "session"},
-         {"category", "session"},
+        {{"node_type", "experiment"},
+         {"kind", "experiment"},
+         {"category", "source"},
          {"runner", "frontend"},
-         {"label", "Session"},
+         {"label", "Experiment"},
          {"description",
-          "Records one or more upstream sensor streams under a structured "
-          "protocol (ordered cues + labels), producing a labeled dataset for "
-          "training."},
+          "A source of timestamped markers: runs a structured protocol (ordered "
+          "cues + labels) and emits a `markers` stream (cue/session events) that "
+          "marker-aware nodes downstream can render or train on. Has no inputs — "
+          "the cue timeline is generated independently of any data source."},
          {"config_fields", nlohmann::json::array()},
-         {"input_ports", singleInputPort()},
-         {"output_ports", nlohmann::json::array()},
-         {"variadic_inputs", true}});
+         {"input_ports", nlohmann::json::array()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", false}});
 
     // Train — submits a control-plane train_validate job from a labeled dataset
     // (client-driven via the ML proxy); its output is a durable model artifact,
@@ -1348,6 +1444,11 @@ struct StreamGraphEdge {
     std::string sourcePort{};
     std::string targetNodeId{};
     std::string targetPort{};
+    // Topic-aware channels: StreamType strings ("Data"/"Marker"/"Meta") the user
+    // has hidden on this link, so they don't reach the target node. Empty = the
+    // whole channel flows (default). Lets a viewer/combine act on only part of a
+    // "stream" channel (e.g. drop the markers, keep the data).
+    std::vector<std::string> hiddenTopicTypes{};
 };
 
 struct StreamGraphDefinition {
@@ -1384,6 +1485,15 @@ struct StreamGraphValidationResult {
         edgeDiagnostics{};
 };
 
+// One topic carried by a node's output channel (Part A: a channel is a topic
+// set, at most one per StreamType). `type` is the StreamType string
+// ("Data"/"Marker"/"Meta"); `id` is the stableStreamId of the full topic.
+struct StreamGraphOutputTopic {
+    std::string type{};
+    uint64_t id = 0;
+    std::string schemaName{};
+};
+
 struct StreamGraphNodeRuntimeStatus {
     std::string state{"draft"};
     std::optional<uint64_t> outputStreamId{};
@@ -1392,7 +1502,23 @@ struct StreamGraphNodeRuntimeStatus {
     uint64_t framesProcessed = 0;
     uint64_t lastFrameAtUs = 0;
     std::optional<std::string> message{};
+    // The node's output channel: an ordered topic set, at most one per type
+    // (Part A). Empty for nodes with no output. Kept LAST so existing positional
+    // aggregate initializers (7 fields) still compile; populated after
+    // construction. When present it includes the DATA topic id equal to
+    // outputStreamId for the one-topic (backward-compat) case.
+    std::vector<StreamGraphOutputTopic> outputTopics{};
 };
+
+// Build one output-channel topic entry directly (used where no worker exists,
+// e.g. an experiment's MARKER output, a raw source's DATA topic, or the combine
+// merger's output). `type` becomes the StreamType string ("Data"/"Marker"/…).
+inline StreamGraphOutputTopic makeChannelTopic(
+    nat::core::StreamType type, uint64_t id, std::string schema_name)
+{
+    return StreamGraphOutputTopic{
+        nat::core::toString(type), id, std::move(schema_name)};
+}
 
 struct StreamGraphRuntimeState {
     std::string graphId{};
@@ -1480,6 +1606,12 @@ void from_json(const nlohmann::json& json, StreamGraphNode& value)
 {
     value.id = json.at("id").get<std::string>();
     value.kind = json.at("kind").get<std::string>();
+    // Backward compat: the "session" node kind was renamed to "experiment"
+    // (same recording semantics, now with a markers output). Old persisted
+    // graphs still load.
+    if (value.kind == "session") {
+        value.kind = "experiment";
+    }
     value.label = json.at("label").get<std::string>();
     value.position = json.at("position").get<StreamGraphPosition>();
     value.inputPortIds =
@@ -1528,6 +1660,9 @@ void to_json(nlohmann::json& json, const StreamGraphEdge& value)
         {"target_node_id", value.targetNodeId},
         {"target_port", value.targetPort},
     };
+    if (!value.hiddenTopicTypes.empty()) {
+        json["hidden_topic_types"] = value.hiddenTopicTypes;
+    }
 }
 
 void from_json(const nlohmann::json& json, StreamGraphEdge& value)
@@ -1537,6 +1672,11 @@ void from_json(const nlohmann::json& json, StreamGraphEdge& value)
     value.sourcePort = json.at("source_port").get<std::string>();
     value.targetNodeId = json.at("target_node_id").get<std::string>();
     value.targetPort = json.at("target_port").get<std::string>();
+    if (json.contains("hidden_topic_types") &&
+        json.at("hidden_topic_types").is_array()) {
+        value.hiddenTopicTypes =
+            json.at("hidden_topic_types").get<std::vector<std::string>>();
+    }
 }
 
 void to_json(nlohmann::json& json, const StreamGraphDefinition& value)
@@ -1604,6 +1744,17 @@ void to_json(nlohmann::json& json, const StreamGraphNodeRuntimeStatus& value)
     };
     if (value.outputStreamId.has_value()) {
         json["output_stream_id"] = std::to_string(value.outputStreamId.value());
+    }
+    if (!value.outputTopics.empty()) {
+        nlohmann::json topics = nlohmann::json::array();
+        for (const auto& topic : value.outputTopics) {
+            topics.push_back({
+                {"type", topic.type},
+                {"id", std::to_string(topic.id)},
+                {"schema", topic.schemaName},
+            });
+        }
+        json["output_topics"] = std::move(topics);
     }
     if (value.workerId.has_value()) {
         json["worker_id"] = value.workerId.value();
@@ -1675,14 +1826,13 @@ void normalizeGraphNodePorts(StreamGraphNode& node)
             node.inputPortIds = {"input"};
         }
         node.outputPortIds.clear();
-    } else if (node.kind == "session") {
-        // A session node records N upstream sensor streams under one protocol;
-        // it may have several input ports and never produces an output stream.
-        // Multiple input ports (set by the frontend) are preserved here.
-        if (node.inputPortIds.empty()) {
-            node.inputPortIds = {"in1"};
-        }
-        node.outputPortIds.clear();
+    } else if (node.kind == "experiment") {
+        // An experiment is source-like: it generates a marker timeline from its
+        // protocol independently of any data source, so it has NO inputs and
+        // exposes exactly one output port, `markers` (the MarkerEventV1 stream
+        // for its session_id).
+        node.inputPortIds.clear();
+        node.outputPortIds = {"markers"};
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
         }
@@ -2085,7 +2235,7 @@ StreamGraphValidationResult validateStreamGraphDefinition(
 
         if (node.kind != "stream_source" && node.kind != "transform" &&
             node.kind != "viewer" && node.kind != "sink" &&
-            node.kind != "combine" && node.kind != "session" &&
+            node.kind != "combine" && node.kind != "experiment" &&
             node.kind != "train") {
             addGraphDiagnostic(
                 result,
@@ -2194,15 +2344,17 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     "invalid_combine_output_ports",
                     "combine nodes must expose exactly one output port in V1.");
             }
-        } else if (node.kind == "session") {
-            // A session node records its upstream sensor streams; it produces
-            // markers/metadata (published client-side), never an output stream.
-            if (!node.outputPortIds.empty()) {
+        } else if (node.kind == "experiment") {
+            // An experiment node records its upstream sensor streams and exposes
+            // exactly one output port, `markers` (the MarkerEventV1 stream for
+            // its session_id). Any other output-port shape is invalid.
+            if (node.outputPortIds.size() != 1U ||
+                node.outputPortIds.front() != "markers") {
                 addGraphDiagnostic(
                     result,
                     result.nodeDiagnostics[node.id],
-                    "invalid_session_output_ports",
-                    "session nodes do not expose output ports.");
+                    "invalid_experiment_output_ports",
+                    "experiment nodes expose exactly one output port, 'markers'.");
             }
         } else if (node.kind == "train") {
             if (!node.outputPortIds.empty()) {
@@ -2366,26 +2518,47 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     "combine nodes require at least two connected inputs.");
             }
 
+            // Topic-aware combine (Part B): combine is a per-type merger, so each
+            // input is classified as a data input (numeric channel frame — merged
+            // by concat) or a marker input (an experiment's `markers` output —
+            // interleaved). A marker input no longer errors; the output carries
+            // one topic per type present across the inputs.
             bool all_inputs_resolved = true;
+            bool has_data_input = false;
+            bool has_marker_input = false;
             for (const auto& edge : graph.edges) {
                 if (edge.targetNodeId != node.id) {
                     continue;
                 }
+                const auto src_search = nodes_by_id.find(edge.sourceNodeId);
+                const bool source_is_marker =
+                    src_search != nodes_by_id.end() &&
+                    src_search->second != nullptr &&
+                    src_search->second->kind == "experiment";
+                if (source_is_marker) {
+                    has_marker_input = true;
+                    continue;
+                }
                 const auto descriptor_search =
                     resolved_output_descriptors.find(edge.sourceNodeId);
-                if (descriptor_search == resolved_output_descriptors.end() ||
-                    descriptor_search->second == nullptr ||
-                    !descriptorSupportsNumericChannelFrame(*descriptor_search->second)) {
-                    all_inputs_resolved = false;
-                    addGraphDiagnostic(
-                        result,
-                        result.nodeDiagnostics[node.id],
-                        "unresolved_input_descriptor",
-                        "Upstream descriptor could not be resolved for one of combine's inputs.");
+                if (descriptor_search != resolved_output_descriptors.end() &&
+                    descriptor_search->second != nullptr &&
+                    descriptorSupportsNumericChannelFrame(*descriptor_search->second)) {
+                    has_data_input = true;
+                    continue;
                 }
+                all_inputs_resolved = false;
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "unresolved_input_descriptor",
+                    "Upstream descriptor could not be resolved for one of combine's inputs.");
             }
 
-            if (all_inputs_resolved) {
+            // The combine output channel: a DATA descriptor when any data input is
+            // present (so a downstream data consumer resolves it). A markers-only
+            // combine carries only a marker topic (no numeric descriptor).
+            if (all_inputs_resolved && has_data_input) {
                 auto output_descriptor_maybe =
                     nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
                         nat::core::NatSignalFrameDataSchemaV1::name);
@@ -2395,6 +2568,7 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                         std::string(nat::core::NatSignalFrameDataSchemaV1::name);
                 }
             }
+            (void)has_marker_input;
             continue;
         }
 
@@ -2419,21 +2593,21 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                         "too_many_inputs",
                         node.kind + " nodes support exactly one input in V1.");
                 }
-            } else if (node.kind == "session") {
-                // A session records one or more sensor streams — at least one
-                // input must be connected; there is no upper bound.
+            } else if (node.kind == "experiment") {
+                // An experiment is source-like: it generates markers from its
+                // protocol and takes no inputs. Any inbound edge is invalid.
                 const auto input_count = std::count_if(
                     graph.edges.begin(),
                     graph.edges.end(),
                     [&node](const StreamGraphEdge& edge) {
                         return edge.targetNodeId == node.id;
                     });
-                if (input_count == 0) {
+                if (input_count > 0) {
                     addGraphDiagnostic(
                         result,
                         result.nodeDiagnostics[node.id],
-                        "missing_input",
-                        "session node must record at least one connected stream.");
+                        "invalid_experiment_input",
+                        "experiment nodes take no inputs (they generate markers).");
                 }
             }
             continue;
@@ -3109,6 +3283,7 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
         config.kind != "ssc" &&
         config.kind != "ar_coeffs" &&
         config.kind != "lda_classify" &&
+        config.kind != "emg_gesture_classify" &&
         config.kind != "channel_select") {
         return std::nullopt;
     }
@@ -3319,7 +3494,7 @@ std::optional<EmgTransformConfig> parseEmgTransformConfig(const nlohmann::json& 
         config.select_mode != "all") {
         return std::nullopt;
     }
-    if (config.kind == "lda_classify") {
+    if (config.kind == "lda_classify" || config.kind == "emg_gesture_classify") {
         if (config.model_path.empty()) {
             return std::nullopt;
         }
@@ -3458,6 +3633,256 @@ std::optional<LdaClassifierModel> loadLdaClassifierModel(const std::string& path
     }
     return model;
 }
+
+// --- Self-contained EMG gesture classifier (train/serve parity) ------------
+//
+// The emg_gesture_classify transform consumes RAW EMG frames and reproduces the
+// natVR training feature pipeline end to end from a single self-describing
+// bundle (natVR/src/natvr/model_bundle.py): sliding window -> DSP (60 Hz notch
+// chain + 20 Hz high-pass, applied fresh per window) -> Hudgins features in the
+// canonical order -> per-channel rest-calibration normalization -> diagonal LDA
+// score. Because the same bundle drives windowing, DSP, feature order, and
+// normalization, live features land in the exact space the model was fit in --
+// parity holds by construction, unlike a hand-wired feature pipeline.
+
+// RBJ biquad, ported 1:1 from natVR/src/natvr/dsp.py (design_notch /
+// design_highpass + BiquadFilter). Direct-form I; each window is filtered from
+// zero state, exactly as featurize.window_feature_vectors does per window.
+struct RbjBiquad {
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+};
+
+inline RbjBiquad designNotchBiquad(double sample_rate_hz, double frequency_hz, double q)
+{
+    const double w0 = 2.0 * kPi * frequency_hz / sample_rate_hz;
+    const double alpha = std::sin(w0) / (2.0 * q);
+    const double cos_w0 = std::cos(w0);
+    const double a0 = 1.0 + alpha;
+    return RbjBiquad{
+        1.0 / a0,
+        (-2.0 * cos_w0) / a0,
+        1.0 / a0,
+        (-2.0 * cos_w0) / a0,
+        (1.0 - alpha) / a0};
+}
+
+inline RbjBiquad designHighpassBiquad(double sample_rate_hz, double cutoff_hz, double q)
+{
+    const double w0 = 2.0 * kPi * cutoff_hz / sample_rate_hz;
+    const double alpha = std::sin(w0) / (2.0 * q);
+    const double cos_w0 = std::cos(w0);
+    const double a0 = 1.0 + alpha;
+    return RbjBiquad{
+        ((1.0 + cos_w0) / 2.0) / a0,
+        (-(1.0 + cos_w0)) / a0,
+        ((1.0 + cos_w0) / 2.0) / a0,
+        (-2.0 * cos_w0) / a0,
+        (1.0 - alpha) / a0};
+}
+
+inline std::vector<double> applyBiquadFresh(
+    const RbjBiquad& c, const std::vector<double>& input)
+{
+    std::vector<double> output;
+    output.reserve(input.size());
+    double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+    for (const double x0 : input) {
+        const double y0 =
+            c.b0 * x0 + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+        output.push_back(y0);
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+    return output;
+}
+
+struct EmgGestureBundle {
+    uint32_t sampleRateHz = 0;
+    uint32_t windowSamples = 0;
+    uint32_t hopSamples = 0;
+    uint32_t channelCount = 0;
+    double notchBaseHz = 60.0;
+    uint32_t notchHarmonics = 3;
+    double highpassHz = 20.0;  // <= 0 disables the high-pass stage
+    bool rectify = false;
+    double zcThreshold = 0.0;
+    double sscThreshold = 0.0;
+    std::vector<int> selectedChannelIndexes{};  // empty => all incoming channels
+    std::vector<double> restMeanRms{};
+    std::vector<double> scaleRms{};
+    LdaClassifierModel lda{};
+};
+
+// Applies the training DSP chain to one window (fresh filter state per stage),
+// matching natVR dsp.preprocess_channel with the training-time parameters.
+inline std::vector<double> preprocessGestureWindow(
+    const std::vector<double>& window, const EmgGestureBundle& bundle)
+{
+    std::vector<double> processed = window;
+    // Notch chain over base * {1..harmonics}, skipping any >= Nyquist
+    // (matches dsp.apply_notch_chain; q=30 is the dsp default).
+    for (uint32_t harmonic = 1; harmonic <= bundle.notchHarmonics; ++harmonic) {
+        const double frequency = bundle.notchBaseHz * static_cast<double>(harmonic);
+        if (frequency >= static_cast<double>(bundle.sampleRateHz) / 2.0) {
+            break;
+        }
+        processed = applyBiquadFresh(
+            designNotchBiquad(bundle.sampleRateHz, frequency, 30.0), processed);
+    }
+    if (bundle.highpassHz > 0.0) {
+        processed = applyBiquadFresh(
+            designHighpassBiquad(bundle.sampleRateHz, bundle.highpassHz, std::sqrt(0.5)),
+            processed);
+    }
+    if (bundle.rectify) {
+        for (double& value : processed) {
+            value = std::abs(value);
+        }
+    }
+    return processed;
+}
+
+// Loads the bundle produced by natVR's model_bundle.write_model_bundle.
+std::optional<EmgGestureBundle> loadEmgGestureBundle(const std::string& path)
+{
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return std::nullopt;
+    }
+    nlohmann::json json;
+    try {
+        file >> json;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+
+    EmgGestureBundle bundle;
+    try {
+        // feature_order must be the canonical Hudgins order this node hard-codes.
+        static const std::vector<std::string> kExpectedOrder = {
+            "mav", "rms", "zero_crossings", "slope_sign_changes", "waveform_length"};
+        if (json.contains("feature_order")) {
+            std::vector<std::string> order;
+            for (const auto& value : json.at("feature_order")) {
+                order.push_back(value.get<std::string>());
+            }
+            if (order != kExpectedOrder) {
+                return std::nullopt;
+            }
+        }
+        bundle.sampleRateHz = json.value("sample_rate_hz", 0U);
+        bundle.windowSamples = json.value("window_samples", 0U);
+        bundle.hopSamples = json.value("hop_samples", 0U);
+        bundle.channelCount = json.value("channel_count", 0U);
+        bundle.zcThreshold = json.value("zc_threshold", 0.0);
+        bundle.sscThreshold = json.value("ssc_threshold", 0.0);
+        if (json.contains("dsp")) {
+            const auto& dsp = json.at("dsp");
+            bundle.notchBaseHz = dsp.value("notch_base_hz", 60.0);
+            bundle.notchHarmonics = dsp.value("notch_harmonics", 3U);
+            bundle.rectify = dsp.value("rectify", false);
+            if (dsp.contains("highpass_hz")) {
+                bundle.highpassHz = dsp.at("highpass_hz").is_null()
+                    ? 0.0
+                    : dsp.at("highpass_hz").get<double>();
+            }
+        }
+        if (json.contains("selected_channel_indexes")) {
+            for (const auto& value : json.at("selected_channel_indexes")) {
+                bundle.selectedChannelIndexes.push_back(value.get<int>());
+            }
+        }
+        const auto& calibration = json.at("calibration");
+        for (const auto& value : calibration.at("rest_mean_rms")) {
+            bundle.restMeanRms.push_back(value.get<double>());
+        }
+        for (const auto& value : calibration.at("scale_rms")) {
+            bundle.scaleRms.push_back(value.get<double>());
+        }
+        const auto& lda = json.at("lda");
+        if (lda.value("model_type", std::string{}) != "lda") {
+            return std::nullopt;
+        }
+        for (const auto& label : lda.at("labels")) {
+            bundle.lda.labels.push_back(label.get<std::string>());
+        }
+        for (const auto& entry : lda.at("priors").items()) {
+            bundle.lda.priors[entry.key()] = entry.value().get<double>();
+        }
+        for (const auto& entry : lda.at("means").items()) {
+            std::vector<double> mean_values;
+            for (const auto& value : entry.value()) {
+                mean_values.push_back(value.get<double>());
+            }
+            bundle.lda.means[entry.key()] = std::move(mean_values);
+        }
+        for (const auto& value : lda.at("variances")) {
+            bundle.lda.variances.push_back(value.get<double>());
+        }
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+
+    // Structural validation: the bundle must be internally consistent so the
+    // live feature vector length matches the model by construction.
+    if (bundle.sampleRateHz == 0U || bundle.windowSamples == 0U ||
+        bundle.hopSamples == 0U || bundle.channelCount == 0U) {
+        return std::nullopt;
+    }
+    if (bundle.restMeanRms.size() != bundle.channelCount ||
+        bundle.scaleRms.size() != bundle.channelCount) {
+        return std::nullopt;
+    }
+    if (bundle.lda.labels.empty() || bundle.lda.variances.empty()) {
+        return std::nullopt;
+    }
+    if (bundle.lda.variances.size() != static_cast<size_t>(bundle.channelCount) * 5U) {
+        return std::nullopt;
+    }
+    for (const auto& label : bundle.lda.labels) {
+        const auto means_search = bundle.lda.means.find(label);
+        if (means_search == bundle.lda.means.end() ||
+            means_search->second.size() != bundle.lda.variances.size() ||
+            bundle.lda.priors.find(label) == bundle.lda.priors.end()) {
+            return std::nullopt;
+        }
+    }
+    for (const auto variance : bundle.lda.variances) {
+        if (!(variance > 0.0)) {
+            return std::nullopt;
+        }
+    }
+    if (!bundle.selectedChannelIndexes.empty() &&
+        bundle.selectedChannelIndexes.size() != bundle.channelCount) {
+        return std::nullopt;
+    }
+    return bundle;
+}
+
+// Rolling per-channel window state for the streaming classifier. Mirrors
+// SlidingWindowTransformState: emits a window every hop_samples once the first
+// window_samples have accumulated, so the live window set matches training's
+// leading windows in steady state.
+struct EmgGestureClassifyState {
+    uint32_t configured_window_samples = 0;
+    uint32_t configured_hop_samples = 0;
+    std::vector<std::deque<double>> channel_windows{};
+    uint64_t total_samples_seen = 0;
+    uint64_t samples_since_last_emit = 0;
+    uint64_t output_seq_no = 0;
+
+    void reset(uint32_t window_samples, uint32_t hop_samples, size_t channel_count)
+    {
+        configured_window_samples = window_samples;
+        configured_hop_samples = hop_samples;
+        channel_windows.assign(channel_count, {});
+        total_samples_seen = 0;
+        samples_since_last_emit = 0;
+        output_seq_no = 0;
+    }
+};
 
 class TransformWorker {
 public:
@@ -3604,6 +4029,9 @@ private:
     SlidingWindowTransformState slidingWindowState;
     std::optional<LdaClassifierModel> ldaModel{};
     bool ldaModelLoadAttempted = false;
+    std::optional<EmgGestureBundle> gestureBundle{};
+    bool gestureBundleLoadAttempted = false;
+    EmgGestureClassifyState gestureClassifyState;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
     std::atomic<uint64_t> lastFrameAtUs{0};
@@ -3661,6 +4089,9 @@ private:
         }
         if (config.kind == "lda_classify") {
             return transformLdaClassify(record);
+        }
+        if (config.kind == "emg_gesture_classify") {
+            return transformEmgGestureClassify(record);
         }
         if (config.kind == "channel_select") {
             return transformChannelSelect(record);
@@ -4190,6 +4621,206 @@ private:
         return output;
     }
 
+    // Self-contained gesture classifier: raw EMG frames in, predicted_class +
+    // per-class confidences out, reproducing the training feature pipeline from
+    // the bundle so live accuracy matches reported validation accuracy.
+    std::vector<nat::core::NatSignalFrameDataSchemaV1> transformEmgGestureClassify(
+        const NormalizedNumericChannelFrame& record)
+    {
+        std::vector<nat::core::NatSignalFrameDataSchemaV1> output{};
+
+        if (!gestureBundleLoadAttempted) {
+            gestureBundleLoadAttempted = true;
+            gestureBundle = loadEmgGestureBundle(config.model_path);
+            if (!gestureBundle.has_value()) {
+                LOG_ERROR
+                    << "StreamViewer: emg_gesture_classify could not load bundle at "
+                    << config.model_path;
+            }
+        }
+        if (!gestureBundle.has_value()) {
+            return output;
+        }
+        const EmgGestureBundle& bundle = *gestureBundle;
+
+        const size_t incoming_channels = record.channelLabels.size();
+        const size_t samples_per_channel = record.samplesPerChannel;
+        if (incoming_channels == 0U || samples_per_channel == 0U) {
+            return output;
+        }
+
+        // Resolve which incoming channels feed the model (must match training's
+        // channel selection). Empty selection => all incoming channels in order.
+        std::vector<size_t> channel_indexes;
+        if (bundle.selectedChannelIndexes.empty()) {
+            for (size_t c = 0; c < incoming_channels; ++c) {
+                channel_indexes.push_back(c);
+            }
+        } else {
+            for (const int idx : bundle.selectedChannelIndexes) {
+                if (idx < 0 || static_cast<size_t>(idx) >= incoming_channels) {
+                    return output;
+                }
+                channel_indexes.push_back(static_cast<size_t>(idx));
+            }
+        }
+        if (channel_indexes.size() != bundle.channelCount) {
+            return output;
+        }
+
+        const uint32_t window_samples = bundle.windowSamples;
+        const uint32_t hop_samples = bundle.hopSamples;
+        if (gestureClassifyState.configured_window_samples != window_samples ||
+            gestureClassifyState.configured_hop_samples != hop_samples ||
+            gestureClassifyState.channel_windows.size() != channel_indexes.size()) {
+            gestureClassifyState.reset(
+                window_samples, hop_samples, channel_indexes.size());
+        }
+
+        const double sample_period_us = record.sampleRateHz > 0
+            ? 1000000.0 / static_cast<double>(record.sampleRateHz)
+            : 0.0;
+
+        for (size_t sample_index = 0; sample_index < samples_per_channel; ++sample_index) {
+            for (size_t c = 0; c < channel_indexes.size(); ++c) {
+                const size_t offset =
+                    channel_indexes[c] * samples_per_channel + sample_index;
+                const double value = offset < record.samples.size()
+                    ? static_cast<double>(record.samples[offset])
+                    : 0.0;
+                auto& window = gestureClassifyState.channel_windows[c];
+                window.push_back(value);
+                while (window.size() > static_cast<size_t>(window_samples)) {
+                    window.pop_front();
+                }
+            }
+
+            ++gestureClassifyState.total_samples_seen;
+            ++gestureClassifyState.samples_since_last_emit;
+            if (gestureClassifyState.total_samples_seen <
+                    static_cast<uint64_t>(window_samples) ||
+                gestureClassifyState.samples_since_last_emit <
+                    static_cast<uint64_t>(hop_samples)) {
+                continue;
+            }
+            gestureClassifyState.samples_since_last_emit = 0;
+
+            // Build the flat, normalized feature vector in the canonical order:
+            // [mav, rms, zc, ssc, wl] per channel, channel-major.
+            std::vector<double> features;
+            features.reserve(channel_indexes.size() * 5U);
+            bool window_ready = true;
+            for (size_t c = 0; c < channel_indexes.size(); ++c) {
+                const auto& window = gestureClassifyState.channel_windows[c];
+                if (window.size() != static_cast<size_t>(window_samples)) {
+                    window_ready = false;
+                    break;
+                }
+                const std::vector<double> raw(window.begin(), window.end());
+                const std::vector<double> s = preprocessGestureWindow(raw, bundle);
+
+                // Hudgins features (match natVR/src/natvr/features.py exactly).
+                const size_t n = s.size();
+                double mav = 0.0;
+                double sum_squares = 0.0;
+                double wl = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    mav += std::abs(s[i]);
+                    sum_squares += s[i] * s[i];
+                }
+                for (size_t i = 1; i < n; ++i) {
+                    wl += std::abs(s[i] - s[i - 1]);
+                }
+                mav = n > 0 ? mav / static_cast<double>(n) : 0.0;
+                const double rms =
+                    n > 0 ? std::sqrt(sum_squares / static_cast<double>(n)) : 0.0;
+                uint32_t zc = 0;
+                for (size_t i = 1; i < n; ++i) {
+                    const double prev = s[i - 1];
+                    const double curr = s[i];
+                    const bool crosses =
+                        (prev >= 0.0 && curr < 0.0) || (prev < 0.0 && curr >= 0.0);
+                    if (crosses && std::abs(prev - curr) >= bundle.zcThreshold) {
+                        ++zc;
+                    }
+                }
+                uint32_t ssc = 0;
+                for (size_t i = 1; i + 1 < n; ++i) {
+                    const double diff1 = s[i] - s[i - 1];
+                    const double diff2 = s[i] - s[i + 1];
+                    if (diff1 * diff2 > 0.0 &&
+                        std::max(std::abs(diff1), std::abs(diff2)) >=
+                            bundle.sscThreshold) {
+                        ++ssc;
+                    }
+                }
+
+                // Rest-calibration normalization (match calibration.normalize_feature_vector).
+                const double scale = bundle.scaleRms[c];
+                const double rest = bundle.restMeanRms[c];
+                features.push_back(mav / scale);
+                features.push_back((rms - rest) / scale);
+                features.push_back(static_cast<double>(zc));
+                features.push_back(static_cast<double>(ssc));
+                features.push_back(wl / scale);
+            }
+            if (!window_ready || features.size() != bundle.lda.variances.size()) {
+                continue;
+            }
+
+            // Diagonal-covariance Gaussian LDA scoring + softmax (match model.py).
+            const auto& lda = bundle.lda;
+            std::vector<double> scores;
+            scores.reserve(lda.labels.size());
+            for (const auto& label : lda.labels) {
+                const auto& mean_vec = lda.means.at(label);
+                double score = std::log(std::max(lda.priors.at(label), 1e-12));
+                for (size_t f = 0; f < features.size(); ++f) {
+                    const double diff = features[f] - mean_vec[f];
+                    score -= 0.5 * diff * diff / lda.variances[f];
+                }
+                scores.push_back(score);
+            }
+            size_t best_index = 0;
+            for (size_t i = 1; i < scores.size(); ++i) {
+                if (scores[i] > scores[best_index]) {
+                    best_index = i;
+                }
+            }
+            const double max_score = scores[best_index];
+            std::vector<double> exps(scores.size());
+            double denom = 0.0;
+            for (size_t i = 0; i < scores.size(); ++i) {
+                exps[i] = std::exp(scores[i] - max_score);
+                denom += exps[i];
+            }
+            if (denom <= 0.0) {
+                denom = 1.0;
+            }
+
+            std::vector<std::string> labels{"predicted_class"};
+            std::vector<float> out_samples{static_cast<float>(best_index)};
+            for (size_t i = 0; i < lda.labels.size(); ++i) {
+                labels.push_back("confidence." + lda.labels[i]);
+                out_samples.push_back(static_cast<float>(exps[i] / denom));
+            }
+
+            const uint64_t output_ts_us = sample_period_us > 0.0
+                ? record.deviceTsUs + static_cast<uint64_t>(std::llround(
+                      sample_period_us * static_cast<double>(sample_index)))
+                : record.deviceTsUs;
+            output.emplace_back(
+                record.deviceId,
+                gestureClassifyState.output_seq_no++,
+                output_ts_us,
+                record.sampleRateHz,
+                labels,
+                out_samples,
+                static_cast<uint32_t>(1));
+        }
+        return output;
+    }
+
     void run()
     {
         LOG_INFO << "StreamViewer: Starting transform worker source="
@@ -4321,9 +4952,13 @@ nat::tools::InProcessChannelPolicy graphInProcessChannelPolicy()
 std::unique_ptr<nat::core::TopicMessenger> makeGraphSourceMessenger(
     const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
     const std::shared_ptr<nat::core::BasicTopicInformation>& source_topic,
-    bool in_process)
+    bool in_process,
+    int64_t start_offset = -1)
 {
     if (in_process) {
+        // In-process channels are live (a re-run's chain produces into them);
+        // they can't seek Kafka history, so the offset only applies to a Kafka
+        // root source. (Phase 5.)
         return nat::tools::createInProcessMessenger(
             source_topic,
             broker_manager->getRegistry(),
@@ -4331,7 +4966,7 @@ std::unique_ptr<nat::core::TopicMessenger> makeGraphSourceMessenger(
             nat::tools::InProcessChannelRegistry::global(),
             graphInProcessChannelPolicy());
     }
-    return broker_manager->createMessenger(source_topic);
+    return broker_manager->createMessenger(source_topic, start_offset);
 }
 
 std::unique_ptr<nat::core::TopicMessenger> makeGraphOutputMessenger(
@@ -4376,7 +5011,8 @@ CreateTransformWorkerResult createTransformWorker(
     const std::optional<std::string>& graph_run_id = std::nullopt,
     const std::optional<std::string>& graph_node_id = std::nullopt,
     bool input_in_process = false,
-    bool output_in_process = false)
+    bool output_in_process = false,
+    int64_t source_start_offset = -1)
 {
     CreateTransformWorkerResult result;
     result.sourceStreamId = source_stream_id;
@@ -4470,8 +5106,8 @@ CreateTransformWorkerResult createTransformWorker(
         }
     }
 
-    auto source_messenger =
-        makeGraphSourceMessenger(broker_manager, source_topic, input_in_process);
+    auto source_messenger = makeGraphSourceMessenger(
+        broker_manager, source_topic, input_in_process, source_start_offset);
     auto output_messenger =
         makeGraphOutputMessenger(broker_manager, output_topic, output_in_process);
     // Provenance metadata is always published on Kafka so lineage stays
@@ -4582,19 +5218,34 @@ struct CombineInputState {
     std::deque<NormalizedNumericChannelFrame> queue{};
 };
 
+// Topic-aware channels (Part B): a combine input can carry a MARKER topic. The
+// marker lane merges/interleaves MarkerEventV1 records from all marker inputs
+// into one Marker/<out> topic — no numeric transform, no descriptor needed.
+struct CombineMarkerInputState {
+    uint64_t sourceStreamId = 0;
+    std::shared_ptr<nat::core::BasicTopicInformation> sourceTopic;
+    std::unique_ptr<nat::core::TopicMessenger> sourceMessenger;
+};
+
 class CombineWorker {
 public:
     CombineWorker(
         const std::string& output_identifier,
         size_t slot_index,
         std::vector<CombineInputState>&& inputs,
+        std::vector<CombineMarkerInputState>&& marker_inputs,
         const std::shared_ptr<nat::core::BasicTopicInformation>& output_topic,
-        std::unique_ptr<nat::core::TopicMessenger>&& output_messenger)
+        std::unique_ptr<nat::core::TopicMessenger>&& output_messenger,
+        const std::shared_ptr<nat::core::BasicTopicInformation>& marker_output_topic,
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger)
         : outputIdentifier(output_identifier),
           slotIndex(slot_index),
           inputs(std::move(inputs)),
+          markerInputs(std::move(marker_inputs)),
           outputTopic(output_topic),
-          outputMessenger(std::move(output_messenger))
+          outputMessenger(std::move(output_messenger)),
+          markerOutputTopic(marker_output_topic),
+          markerOutputMessenger(std::move(marker_output_messenger))
     {
     }
 
@@ -4623,17 +5274,30 @@ public:
 
     uint64_t getOutputStreamId() const
     {
-        return outputTopic ? outputTopic->id : 0;
+        // Data and marker outputs share one channel id (stableStreamId is keyed
+        // on namespace:identifier, not the topic type), so either topic yields it.
+        if (outputTopic) return outputTopic->id;
+        if (markerOutputTopic) return markerOutputTopic->id;
+        return 0;
     }
 
     std::string getOutputTopic() const
     {
-        return outputTopic ? outputTopic->toTopicString() : std::string{};
+        if (outputTopic) return outputTopic->toTopicString();
+        if (markerOutputTopic) return markerOutputTopic->toTopicString();
+        return std::string{};
     }
 
     std::shared_ptr<nat::core::BasicTopicInformation> getOutputTopicInfo() const
     {
         return outputTopic;
+    }
+
+    // The MARKER topic of a "stream"/markers combine output (null for data-only),
+    // used to resolve the in-memory marker topic before it materializes in Kafka.
+    std::shared_ptr<nat::core::BasicTopicInformation> getMarkerOutputTopicInfo() const
+    {
+        return markerOutputTopic;
     }
 
     const std::string& getOutputIdentifier() const
@@ -4671,12 +5335,19 @@ public:
 
 private:
     static constexpr size_t kMaxQueuedFramesPerInput = 64;
+    // Two frames align if their device_ts_us differ by <= this (Phase 5). ~half
+    // a typical windowed-feature cadence; tolerant enough for jittered live
+    // frames, tight enough that replay pairs the right frames across streams.
+    static constexpr uint64_t kAlignToleranceUs = 50'000;  // 50 ms
 
     std::string outputIdentifier;
     size_t slotIndex;
     std::vector<CombineInputState> inputs;
+    std::vector<CombineMarkerInputState> markerInputs;
     std::shared_ptr<nat::core::BasicTopicInformation> outputTopic;
     std::unique_ptr<nat::core::TopicMessenger> outputMessenger;
+    std::shared_ptr<nat::core::BasicTopicInformation> markerOutputTopic;
+    std::unique_ptr<nat::core::TopicMessenger> markerOutputMessenger;
     uint64_t outputSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -4730,6 +5401,23 @@ private:
             static_cast<uint32_t>(1));
     }
 
+    // Pass a single data input through unchanged (Part B: data+markers → "stream"
+    // is "no cross-transform"). Preserves the original channel labels AND
+    // samples-per-channel, so a raw waveform stays a waveform instead of being
+    // flattened into a one-sample-per-channel feature vector by concatenate().
+    nat::core::NatSignalFrameDataSchemaV1 passThrough(
+        const NormalizedNumericChannelFrame& frame)
+    {
+        return nat::core::NatSignalFrameDataSchemaV1(
+            frame.deviceId,
+            outputSeqNo++,
+            frame.deviceTsUs,
+            frame.sampleRateHz,
+            frame.channelLabels,
+            frame.samples,
+            static_cast<uint32_t>(frame.samplesPerChannel));
+    }
+
     void run()
     {
         LOG_INFO << "StreamViewer: Starting combine worker inputs=" << inputs.size()
@@ -4763,6 +5451,32 @@ private:
                     }
                 }
 
+                // Marker lane (Part B): forward every MarkerEventV1 from each
+                // marker input straight to Marker/<out>. Markers are low-volume
+                // and discrete; consumers order globally by emitted_at_us, so we
+                // interleave by arrival (no cross-input alignment needed) and
+                // never mix them with the numeric data lane.
+                for (auto& marker_input : markerInputs) {
+                    const auto marker_maybe =
+                        marker_input.sourceMessenger->tryGetNexMessage();
+                    if (!marker_maybe.has_value()) {
+                        continue;
+                    }
+                    made_progress = true;
+                    std::unique_ptr<nat::core::Schema> record =
+                        std::move(marker_maybe.value());
+                    if (record == nullptr || markerOutputMessenger == nullptr) {
+                        continue;
+                    }
+                    if (dynamic_cast<nat::core::MarkerEventV1*>(record.get()) ==
+                        nullptr) {
+                        continue;  // not a marker event; skip defensively
+                    }
+                    markerOutputMessenger->sendMessage(*record);
+                    framesProcessed.fetch_add(1);
+                    lastFrameAtUs.store(nowUs());
+                }
+
                 bool all_ready = !inputs.empty();
                 for (const auto& input : inputs) {
                     if (input.queue.empty()) {
@@ -4772,16 +5486,59 @@ private:
                 }
 
                 if (all_ready) {
-                    std::vector<NormalizedNumericChannelFrame> aligned{};
-                    aligned.reserve(inputs.size());
-                    for (auto& input : inputs) {
-                        aligned.push_back(input.queue.front());
-                        input.queue.pop_front();
+                    // Timestamp-aligned combine (Phase 5, Part E): align inputs
+                    // by device_ts_us, not arrival order. FIFO ("pop the front
+                    // of each") silently misaligns mismatched cadences and is
+                    // wrong for replay; here we emit one concatenated frame per
+                    // aligned timestamp group. Each queue is time-ordered, so the
+                    // front is the oldest unconsumed frame per input.
+                    //
+                    // target = the newest of the per-input fronts: every input
+                    // must have reached at least this time to align here.
+                    uint64_t target_ts = 0;
+                    for (const auto& input : inputs) {
+                        target_ts =
+                            std::max(target_ts, input.queue.front().deviceTsUs);
                     }
-                    outputMessenger->sendMessage(concatenate(aligned));
-                    framesProcessed.fetch_add(1);
-                    lastFrameAtUs.store(nowUs());
-                    made_progress = true;
+                    // Drop unmatchably-old frames (a faster input's frames with
+                    // no counterpart near target), keeping at least one.
+                    for (auto& input : inputs) {
+                        while (input.queue.size() > 1 &&
+                               input.queue.front().deviceTsUs +
+                                       kAlignToleranceUs <
+                                   target_ts) {
+                            input.queue.pop_front();
+                        }
+                    }
+                    // Aligned only if every input's front is within tolerance of
+                    // the target; otherwise wait for a lagging input to catch up.
+                    bool aligned_ready = true;
+                    for (const auto& input : inputs) {
+                        const uint64_t ts = input.queue.front().deviceTsUs;
+                        const uint64_t diff =
+                            ts > target_ts ? ts - target_ts : target_ts - ts;
+                        if (diff > kAlignToleranceUs) {
+                            aligned_ready = false;
+                            break;
+                        }
+                    }
+                    if (aligned_ready) {
+                        std::vector<NormalizedNumericChannelFrame> aligned{};
+                        aligned.reserve(inputs.size());
+                        for (auto& input : inputs) {
+                            aligned.push_back(input.queue.front());
+                            input.queue.pop_front();
+                        }
+                        // One data input (e.g. data+markers "stream"): pass it
+                        // through so the waveform is preserved. Two or more: concat
+                        // into a feature vector (the genuine numeric merge).
+                        outputMessenger->sendMessage(
+                            aligned.size() == 1 ? passThrough(aligned.front())
+                                                : concatenate(aligned));
+                        framesProcessed.fetch_add(1);
+                        lastFrameAtUs.store(nowUs());
+                        made_progress = true;
+                    }
                 }
 
                 if (!made_progress) {
@@ -4827,6 +5584,21 @@ findGraphInternalOutputTopicForStream(uint64_t stream_id)
     return nullptr;
 }
 
+// The in-memory MARKER-topic counterpart of findGraphInternalOutputTopicForStream:
+// a combine "stream"/markers output publishes to Marker/<id> before that topic
+// appears in broker metadata. Resolve it from the worker so a subscriber / a
+// downstream combine can bind it without racing the first forwarded marker.
+std::shared_ptr<nat::core::BasicTopicInformation>
+findGraphInternalMarkerTopicForStream(uint64_t stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_combine_mutex);
+    const auto search = g_combine_workers.find(stream_id);
+    if (search != g_combine_workers.end() && search->second) {
+        return search->second->getMarkerOutputTopicInfo();
+    }
+    return nullptr;
+}
+
 std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
     uint64_t output_stream_id)
 {
@@ -4862,13 +5634,24 @@ struct CreateCombineWorkerResult {
     std::string outputIdentifier{};
     std::string workerId{"natkit-local-combine-worker"};
     std::string threadSlotId{};
+    // The merged output channel (Part B): a DATA topic and/or a MARKER topic,
+    // both sharing outputStreamId. Populated for the caller's node status.
+    std::vector<StreamGraphOutputTopic> outputTopics{};
+};
+
+// One resolved combine input = the upstream channel's topic set + its transport
+// hints. The DATA topic (if any) feeds the numeric merge lane; the MARKER topic
+// (if any) feeds the interleave lane.
+struct CombineWorkerInput {
+    std::vector<StreamGraphOutputTopic> topics{};
+    bool inProcess = false;
+    int64_t startOffset = -1;
 };
 
 CreateCombineWorkerResult createCombineWorker(
     const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
-    const std::vector<uint64_t>& source_stream_ids,
+    const std::vector<CombineWorkerInput>& input_channels,
     const std::string& output_identifier,
-    const std::vector<bool>& input_in_process = {},
     bool output_in_process = false)
 {
     CreateCombineWorkerResult result;
@@ -4878,22 +5661,43 @@ CreateCombineWorkerResult createCombineWorker(
         result.error = "Broker manager not available";
         return result;
     }
-    if (source_stream_ids.size() < 2U) {
+    if (input_channels.size() < 2U) {
         result.error = "combine nodes require at least two connected inputs";
         return result;
     }
 
-    const auto output_topic = createTopicInfo(
-        nat::core::StreamType::DATA,
-        "combine",
-        output_identifier,
+    // Data and marker outputs share the channel id: stableStreamId is keyed on
+    // namespace:identifier ("combine":output_identifier), not the topic type, so
+    // Data/<out> and Marker/<out> collide on id by design — that IS the bundle.
+    const auto data_output_topic = createTopicInfo(
+        nat::core::StreamType::DATA, "combine", output_identifier,
         nat::core::NatSignalFrameDataSchemaV1::name);
-    if (output_topic == nullptr) {
-        result.error = "Failed to create Kafka topic information for combine";
+    const auto marker_output_topic = createTopicInfo(
+        nat::core::StreamType::MARKER, "combine", output_identifier,
+        nat::core::MarkerEventV1::name);
+    if (data_output_topic == nullptr || marker_output_topic == nullptr) {
+        result.error = "Failed to create topic information for combine";
         return result;
     }
-    const uint64_t output_stream_id = output_topic->id;
+    const uint64_t output_stream_id = data_output_topic->id;
     result.outputStreamId = output_stream_id;
+
+    // Reconstruct the output channel from an existing worker (dedup / reuse path).
+    const auto outputTopicsForWorker =
+        [&](const std::shared_ptr<CombineWorker>& worker) {
+            std::vector<StreamGraphOutputTopic> topics{};
+            if (worker->getOutputTopicInfo() != nullptr) {
+                topics.push_back(makeChannelTopic(
+                    nat::core::StreamType::DATA, output_stream_id,
+                    nat::core::NatSignalFrameDataSchemaV1::name));
+            }
+            if (worker->getMarkerOutputTopicInfo() != nullptr) {
+                topics.push_back(makeChannelTopic(
+                    nat::core::StreamType::MARKER, output_stream_id,
+                    nat::core::MarkerEventV1::name));
+            }
+            return topics;
+        };
 
     {
         std::lock_guard<std::mutex> lock(g_combine_mutex);
@@ -4902,51 +5706,131 @@ CreateCombineWorkerResult createCombineWorker(
             result.ok = true;
             result.alreadyExists = true;
             result.threadSlotId = search->second->getThreadSlotId();
+            result.outputTopics = outputTopicsForWorker(search->second);
             return result;
         }
     }
 
-    std::vector<CombineInputState> inputs{};
-    inputs.reserve(source_stream_ids.size());
-    for (size_t input_index = 0; input_index < source_stream_ids.size();
-         ++input_index) {
-        const auto source_stream_id = source_stream_ids[input_index];
-        // Same intra-graph race as createTransformWorker: an upstream node may
-        // exist but not yet have produced to Kafka. resolveGraphSourceTopic falls
-        // back to its deterministic in-process output topic.
-        auto source_topic = nat::tools::resolveGraphSourceTopic(
-            source_stream_id,
-            [&](uint64_t id) {
-                return findTransformSourceTopicForStream(broker_manager, id);
-            },
-            [](uint64_t id) { return findGraphInternalOutputTopicForStream(id); });
-        if (source_topic == nullptr) {
-            result.error =
-                "Could not locate a compatible JSON numeric channel topic for one of combine's source streams";
-            return result;
-        }
-        auto descriptor_maybe =
-            nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
-                source_topic->schemaName);
-        if (!descriptor_maybe.has_value()) {
-            result.error =
-                "No descriptor is available for one of combine's source streams";
-            return result;
-        }
+    // Build a concrete topic from a resolved channel entry (type, id, schema).
+    // Used as the last-resort fallback when neither broker discovery nor the
+    // in-memory worker registry has materialised the topic yet (e.g. an
+    // experiment's marker topic before the first publish) — the topic string is
+    // deterministic, so a consumer can bind ahead of the first record.
+    const auto buildTopicFromParts =
+        [](const std::string& type_str, uint64_t id, const std::string& schema)
+        -> std::shared_ptr<nat::core::BasicTopicInformation> {
+        if (schema.empty()) return nullptr;
+        const std::string topic =
+            type_str + "-" + std::to_string(id) + "-Json-" + schema;
+        auto maybe = nat::core::BasicTopicInformation::create(topic);
+        if (!maybe.has_value()) return nullptr;
+        std::unique_ptr<nat::core::BasicTopicInformation> owned =
+            std::move(maybe.value());
+        return std::shared_ptr<nat::core::BasicTopicInformation>(owned.release());
+    };
 
-        const bool source_in_process =
-            input_index < input_in_process.size() && input_in_process[input_index];
-        CombineInputState input{};
-        input.sourceStreamId = source_stream_id;
-        input.sourceTopic = source_topic;
-        input.sourceMessenger =
-            makeGraphSourceMessenger(broker_manager, source_topic, source_in_process);
-        input.descriptorMaybe = descriptor_maybe.value();
-        inputs.push_back(std::move(input));
+    std::vector<CombineInputState> data_inputs{};
+    std::vector<CombineMarkerInputState> marker_inputs{};
+    for (const auto& channel : input_channels) {
+        for (const auto& topic_ref : channel.topics) {
+            if (topic_ref.type == nat::core::toString(nat::core::StreamType::MARKER)) {
+                // Marker lane: resolve the MARKER topic (Kafka discovery →
+                // in-memory combine worker → deterministic fallback). Markers
+                // always flow over Kafka and read from the beginning.
+                auto marker_topic = findMarkerOrMetaTopicForStreamId(
+                    broker_manager, topic_ref.id);
+                if (marker_topic == nullptr) {
+                    marker_topic =
+                        findGraphInternalMarkerTopicForStream(topic_ref.id);
+                }
+                if (marker_topic == nullptr) {
+                    marker_topic = buildTopicFromParts(
+                        topic_ref.type, topic_ref.id, topic_ref.schemaName);
+                }
+                if (marker_topic == nullptr) {
+                    result.error =
+                        "Could not locate the marker topic for one of combine's inputs";
+                    return result;
+                }
+                CombineMarkerInputState marker_input{};
+                marker_input.sourceStreamId = topic_ref.id;
+                marker_input.sourceTopic = marker_topic;
+                marker_input.sourceMessenger = makeGraphSourceMessenger(
+                    broker_manager, marker_topic, false,
+                    kMarkerConsumerStartOffset);
+                marker_inputs.push_back(std::move(marker_input));
+                continue;
+            }
+            if (topic_ref.type != nat::core::toString(nat::core::StreamType::DATA)) {
+                continue;  // META (etc.) is carried later; ignore for now.
+            }
+            // Data lane: same intra-graph race as createTransformWorker — an
+            // upstream node may exist but not yet have produced to Kafka.
+            auto source_topic = nat::tools::resolveGraphSourceTopic(
+                topic_ref.id,
+                [&](uint64_t id) {
+                    return findTransformSourceTopicForStream(broker_manager, id);
+                },
+                [](uint64_t id) {
+                    return findGraphInternalOutputTopicForStream(id);
+                });
+            if (source_topic == nullptr) {
+                source_topic = buildTopicFromParts(
+                    topic_ref.type, topic_ref.id, topic_ref.schemaName);
+            }
+            if (source_topic == nullptr) {
+                result.error =
+                    "Could not locate a compatible JSON numeric channel topic for one of combine's source streams";
+                return result;
+            }
+            auto descriptor_maybe =
+                nat::core::DataSchemaDescriptorRegistry::getDefault()
+                    .findBySchemaName(source_topic->schemaName);
+            if (!descriptor_maybe.has_value()) {
+                result.error =
+                    "No descriptor is available for one of combine's source streams";
+                return result;
+            }
+            CombineInputState input{};
+            input.sourceStreamId = topic_ref.id;
+            input.sourceTopic = source_topic;
+            input.sourceMessenger = makeGraphSourceMessenger(
+                broker_manager, source_topic, channel.inProcess,
+                channel.startOffset);
+            input.descriptorMaybe = descriptor_maybe.value();
+            data_inputs.push_back(std::move(input));
+        }
     }
 
-    auto output_messenger =
-        makeGraphOutputMessenger(broker_manager, output_topic, output_in_process);
+    if (data_inputs.empty() && marker_inputs.empty()) {
+        result.error = "combine inputs carried no data or marker topics";
+        return result;
+    }
+
+    // Only mint an output messenger for a lane that has inputs (a data-only
+    // combine has no marker output, and vice versa).
+    std::shared_ptr<nat::core::BasicTopicInformation> out_data_topic{};
+    std::unique_ptr<nat::core::TopicMessenger> out_data_messenger{};
+    if (!data_inputs.empty()) {
+        out_data_topic = data_output_topic;
+        out_data_messenger = makeGraphOutputMessenger(
+            broker_manager, data_output_topic, output_in_process);
+        result.outputTopics.push_back(makeChannelTopic(
+            nat::core::StreamType::DATA, output_stream_id,
+            nat::core::NatSignalFrameDataSchemaV1::name));
+    }
+    std::shared_ptr<nat::core::BasicTopicInformation> out_marker_topic{};
+    std::unique_ptr<nat::core::TopicMessenger> out_marker_messenger{};
+    if (!marker_inputs.empty()) {
+        out_marker_topic = marker_output_topic;
+        // Markers always flow over Kafka (meta/marker are never in-process).
+        out_marker_messenger =
+            makeGraphOutputMessenger(broker_manager, marker_output_topic, false);
+        result.outputTopics.push_back(makeChannelTopic(
+            nat::core::StreamType::MARKER, output_stream_id,
+            nat::core::MarkerEventV1::name));
+    }
+
     std::shared_ptr<CombineWorker> worker;
     {
         std::lock_guard<std::mutex> lock(g_combine_mutex);
@@ -4955,6 +5839,7 @@ CreateCombineWorkerResult createCombineWorker(
             result.ok = true;
             result.alreadyExists = true;
             result.threadSlotId = duplicate->second->getThreadSlotId();
+            result.outputTopics = outputTopicsForWorker(duplicate->second);
             return result;
         }
 
@@ -4962,9 +5847,12 @@ CreateCombineWorkerResult createCombineWorker(
         worker = std::make_shared<CombineWorker>(
             output_identifier,
             slot_index,
-            std::move(inputs),
-            output_topic,
-            std::move(output_messenger));
+            std::move(data_inputs),
+            std::move(marker_inputs),
+            out_data_topic,
+            std::move(out_data_messenger),
+            out_marker_topic,
+            std::move(out_marker_messenger));
         g_combine_workers.emplace(output_stream_id, worker);
     }
     worker->start();
@@ -5088,7 +5976,14 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
                     }
                 }
             }
-            handleSubscribe(conn, ctx, stream_ids);
+            // Optional historical start (Phase 3): -1 live tail (default),
+            // -2 OFFSET_BEGINNING, >=0 a concrete offset.
+            const int64_t start_offset =
+                json.value("start_offset", static_cast<int64_t>(-1));
+            handleSubscribe(conn, ctx, stream_ids, start_offset);
+        }
+        else if (action == "query_stream_time") {
+            handleQueryStreamTime(conn, json);
         }
         else if (action == "unsubscribe") {
             std::vector<uint64_t> stream_ids;
@@ -5157,7 +6052,8 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
 
 void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
                                              StreamViewerClientContext* ctx,
-                                             const std::vector<uint64_t>& stream_ids)
+                                             const std::vector<uint64_t>& stream_ids,
+                                             int64_t start_offset)
 {
     if (!broker_manager_) {
         sendError(conn, "Broker manager not available");
@@ -5175,6 +6071,9 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
             if (ctx->subscribed_streams.count(stream_id) > 0) {
                 continue; // Already subscribed
             }
+            // Record the requested start offset so both this immediate bind and
+            // the lazy-bind path start the consumer at the right point.
+            ctx->requested_start_offsets[stream_id] = start_offset;
 
             // Find the stream and create a messenger for its DATA topic.
             std::shared_ptr<nat::core::BasicTopicInformation> dataTopic;
@@ -5195,7 +6094,37 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
                 dataTopic = findGraphInternalOutputTopicForStream(stream_id);
             }
             if (dataTopic != nullptr) {
-                ctx->messengers.push_back(broker_manager_->createMessenger(dataTopic));
+                ctx->messengers.push_back(
+                    broker_manager_->createMessenger(dataTopic, start_offset));
+                ctx->bound_data_ids.insert(stream_id);
+            }
+            // Topic-aware channels (Part A): a channel can bundle a DATA topic
+            // and a MARKER topic under the SAME stream id (a combine "stream"
+            // output = Data/<id> + Marker/<id>). Bind the marker/meta topic in
+            // ADDITION to any data topic so both feeds flow to this client; for a
+            // markers-only stream (e.g. an experiment output) this is the only
+            // topic. Markers read from the beginning — low-volume, want the whole
+            // cue timeline, and the topic only exists after the first publish.
+            auto markerTopic =
+                findMarkerOrMetaTopicForStreamId(broker_manager_, stream_id);
+            if (markerTopic == nullptr) {
+                markerTopic = findGraphInternalMarkerTopicForStream(stream_id);
+            }
+            if (markerTopic != nullptr) {
+                const bool is_marker =
+                    markerTopic->type == nat::core::StreamType::MARKER;
+                const bool distinct =
+                    dataTopic == nullptr ||
+                    markerTopic->toTopicString() != dataTopic->toTopicString();
+                // Bundle a MARKER alongside data (new), OR bind a lone marker/meta
+                // stream when there's no data topic (unchanged behavior). A data
+                // stream's META topic is NOT newly bound — that would stream meta
+                // records to viewers that never saw them before.
+                if (distinct && (dataTopic == nullptr || is_marker)) {
+                    ctx->messengers.push_back(broker_manager_->createMessenger(
+                        markerTopic, kMarkerConsumerStartOffset));
+                    ctx->bound_marker_ids.insert(stream_id);
+                }
             }
 
             // Record the subscription intent regardless of whether the stream
@@ -5230,6 +6159,69 @@ void StreamViewerWebSocket::handleSubscribe(const WebSocketConnectionPtr& conn,
     }
 
     sendStatus(conn, ctx);
+}
+
+void StreamViewerWebSocket::handleQueryStreamTime(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available");
+        return;
+    }
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto stream_id_maybe =
+        json.contains("stream_id") ? parseStreamId(json["stream_id"])
+                                    : std::nullopt;
+    if (!stream_id_maybe.has_value()) {
+        sendError(conn, "query_stream_time requires a valid stream_id");
+        return;
+    }
+    const uint64_t stream_id = stream_id_maybe.value();
+    const int64_t timestamp_us =
+        json.value("timestamp_us", static_cast<int64_t>(-1));
+
+    // Resolve the stream's topic the same way subscribe does: a DATA topic on
+    // the matching stream, else a graph-internal output, else a marker/meta
+    // topic. We need its Kafka topic name to query offsets.
+    std::shared_ptr<nat::core::BasicTopicInformation> topic;
+    auto rawStreams = broker_manager_->getAllStreams();
+    for (const auto& stream : rawStreams) {
+        if (stream && stream->getId() == stream_id) {
+            topic = choosePreferredDataTopic(
+                stream->getTopicsByType(nat::core::StreamType::DATA));
+            break;
+        }
+    }
+    if (topic == nullptr) {
+        topic = findGraphInternalOutputTopicForStream(stream_id);
+    }
+    if (topic == nullptr) {
+        topic = findMarkerOrMetaTopicForStreamId(broker_manager_, stream_id);
+    }
+
+    nlohmann::json response;
+    response["type"] = "stream_time";
+    response["request_id"] = request_id;
+    response["stream_id"] = std::to_string(stream_id);
+    if (topic == nullptr) {
+        response["valid"] = false;
+        response["reason"] = "stream not found or has no readable topic yet";
+        if (conn && conn->connected()) {
+            conn->send(response.dump());
+        }
+        return;
+    }
+
+    const auto extent =
+        broker_manager_->queryStreamTime(topic->toTopicString(), timestamp_us);
+    response["valid"] = extent.valid;
+    response["earliest_offset"] = extent.earliestOffset;
+    response["latest_offset"] = extent.latestOffset;
+    response["offset_for_timestamp"] = extent.offsetForTimestamp;
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
 }
 
 void StreamViewerWebSocket::handlePublishSessionBundle(
@@ -5372,7 +6364,7 @@ void StreamViewerWebSocket::handleCreateTransform(
     if (!config_maybe.has_value()) {
         sendError(
             conn,
-            "transform_kind must be one of: rectify, lowpass_envelope, bandpass_iir, notch_iir, rms_window, sliding_window, highpass_iir, mav, rms, wl, zc, ssc, ar_coeffs, lda_classify");
+            "transform_kind must be one of: rectify, lowpass_envelope, bandpass_iir, notch_iir, rms_window, sliding_window, highpass_iir, mav, rms, wl, zc, ssc, ar_coeffs, lda_classify, emg_gesture_classify, channel_select");
         return;
     }
     const std::string requested_input_mapping_id =
@@ -5670,23 +6662,66 @@ std::unordered_set<std::string> classifyGraphPrivateOutputs(
     return nat::tools::classifyPrivateOutputs(nodes, edges);
 }
 
+// Part A (topic-aware channels): build a node's output channel — the topic set it
+// carries. `channelTopicsFromWorker` reads the just-created transform/combine
+// worker's output topic (its real StreamType + schema).
+std::vector<StreamGraphOutputTopic> channelTopicsFromWorker(uint64_t output_stream_id)
+{
+    std::vector<StreamGraphOutputTopic> topics{};
+    const auto info = findGraphInternalOutputTopicForStream(output_stream_id);
+    if (info != nullptr) {
+        topics.push_back(
+            makeChannelTopic(info->type, info->id, info->schemaName));
+    }
+    // A combine "stream" output also carries a MARKER topic sharing the same id.
+    const auto marker_info =
+        findGraphInternalMarkerTopicForStream(output_stream_id);
+    if (marker_info != nullptr) {
+        topics.push_back(makeChannelTopic(
+            marker_info->type, marker_info->id, marker_info->schemaName));
+    }
+    return topics;
+}
+
 void executeStreamGraphStart(
     std::shared_ptr<nat::kafka::BrokerManager> broker_manager,
     WebSocketConnectionPtr conn,
     std::string request_id,
     StreamGraphDefinition graph,
-    std::string active_run_id)
+    std::string active_run_id,
+    int64_t replay_start_offset = -1)
 {
     std::unordered_map<std::string, const StreamGraphNode*> nodes_by_id;
     std::unordered_map<std::string, StreamGraphNode*> mutable_nodes_by_id;
     std::unordered_map<std::string, uint64_t> resolved_output_stream_ids;
+    // Part A: the full output channel (topic set) each node exposes, so a
+    // downstream combine can merge per-type (data + markers) instead of assuming
+    // one DATA topic. Keyed by node id; parallels resolved_output_stream_ids.
+    std::unordered_map<std::string, std::vector<StreamGraphOutputTopic>>
+        resolved_output_channels;
+    // Root Kafka sources (stream_source nodes). On a replay run (replay_start_
+    // offset >= 0), only these seek to the historical offset; downstream inputs
+    // are graph-internal topics fed live by the re-run chain and stay live-tail.
+    // (Phase 5 — aligned start.)
+    std::set<uint64_t> root_source_stream_ids;
     for (auto& node : graph.nodes) {
         nodes_by_id[node.id] = &node;
         mutable_nodes_by_id[node.id] = &node;
         if (node.kind == "stream_source" && node.streamId.has_value()) {
             resolved_output_stream_ids[node.id] = node.streamId.value();
+            // A raw source is a data-only channel; its schema is resolved later
+            // from the live topic (left empty here — combine discovers it).
+            resolved_output_channels[node.id] = {makeChannelTopic(
+                nat::core::StreamType::DATA, node.streamId.value(),
+                std::string{})};
+            root_source_stream_ids.insert(node.streamId.value());
         }
     }
+    const auto sourceOffsetFor = [&](uint64_t input_stream_id) -> int64_t {
+        return root_source_stream_ids.count(input_stream_id)
+                   ? replay_start_offset
+                   : -1;
+    };
 
     // Transport classification (ADR 005): decide, per producer output, whether the
     // edge is private + colocated (in-process) or published (Kafka). Recomputed on
@@ -5827,23 +6862,62 @@ void executeStreamGraphStart(
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
         }
-        if (node.kind == "session") {
+        if (node.kind == "experiment") {
             // Recording is driven client-side (the browser runs the protocol
             // timeline and publishes the session bundle via
-            // publish_session_bundle). The runtime just marks the node ready;
-            // it consumes its upstream streams but produces no output stream.
+            // publish_session_bundle). The runtime just marks the node ready. An
+            // experiment is source-like: it takes no inputs and its one output
+            // port, `markers`, resolves to the deterministic MarkerEventV1 topic
+            // Marker/<experiment_id> so downstream marker-aware nodes can
+            // subscribe to the resolved output_stream_id (like a source).
+            std::optional<uint64_t> markers_stream_id{};
+            const std::string experiment_id =
+                node.config.is_object()
+                    ? node.config.value("experiment_id", std::string{})
+                    : std::string{};
+            if (isValidTopicIdentifier(experiment_id)) {
+                const auto marker_topic_info = createTopicInfo(
+                    nat::core::StreamType::MARKER,
+                    "session_id",
+                    experiment_id,
+                    nat::core::MarkerEventV1::name);
+                if (marker_topic_info != nullptr) {
+                    markers_stream_id = marker_topic_info->id;
+                }
+            }
             StreamGraphNodeRuntimeStatus status{
                 "running",
-                std::nullopt,
+                markers_stream_id,
                 std::nullopt,
                 std::nullopt,
                 0,
                 0,
                 std::optional<std::string>(
-                    "Session node is ready to record its upstream streams.")};
+                    "Experiment node is ready to record markers.")};
+            if (markers_stream_id.has_value()) {
+                status.outputTopics.push_back(makeChannelTopic(
+                    nat::core::StreamType::MARKER, markers_stream_id.value(),
+                    nat::core::MarkerEventV1::name));
+            }
+            // No worker to register for teardown (recording is client-side), so
+            // pass nullopt as the created-output id. But DO publish the markers
+            // output stream id into resolved_output_stream_ids + the node so a
+            // downstream marker-aware node (e.g. a viewer on the `markers` port)
+            // can resolve its input — without this it was wrongly "blocked:
+            // upstream experiment failed to start."
             if (!commitNodeStatus(node.id, status, std::nullopt)) {
                 aborted = true;
                 break;
+            }
+            if (markers_stream_id.has_value()) {
+                resolved_output_stream_ids[node.id] = markers_stream_id.value();
+                resolved_output_channels[node.id] = status.outputTopics;
+                const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
+                if (mutable_node_search != mutable_nodes_by_id.end() &&
+                    mutable_node_search->second != nullptr) {
+                    mutable_node_search->second->outputStreamId =
+                        markers_stream_id.value();
+                }
             }
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
@@ -5868,38 +6942,74 @@ void executeStreamGraphStart(
             continue;
         }
         if (node.kind == "combine") {
-            std::vector<uint64_t> input_stream_ids{};
-            std::vector<bool> combine_input_in_process{};
+            std::vector<CombineWorkerInput> input_channels{};
             std::optional<std::string> blocking_upstream{};
             bool all_resolved = true;
             for (const auto& edge : graph.edges) {
                 if (edge.targetNodeId != node.id) {
                     continue;
                 }
+                // Resolve the upstream node's full output channel (topic set) so
+                // combine can merge per-type — a data source, an experiment's
+                // markers, or another combine's "stream" all flow in cleanly.
                 const auto upstream_node_search = nodes_by_id.find(edge.sourceNodeId);
+                std::vector<StreamGraphOutputTopic> channel_topics{};
                 std::optional<uint64_t> resolved_stream_id{};
                 if (upstream_node_search != nodes_by_id.end() &&
                     upstream_node_search->second->kind == "stream_source" &&
                     upstream_node_search->second->streamId.has_value()) {
                     resolved_stream_id = upstream_node_search->second->streamId.value();
+                    channel_topics = {makeChannelTopic(
+                        nat::core::StreamType::DATA, resolved_stream_id.value(),
+                        std::string{})};
                 } else {
+                    const auto channel_search =
+                        resolved_output_channels.find(edge.sourceNodeId);
+                    if (channel_search != resolved_output_channels.end()) {
+                        channel_topics = channel_search->second;
+                    }
                     const auto resolved_search =
                         resolved_output_stream_ids.find(edge.sourceNodeId);
                     if (resolved_search != resolved_output_stream_ids.end()) {
                         resolved_stream_id = resolved_search->second;
                     }
+                    // Fallback for an upstream that reported no channel (older
+                    // path): treat its single output id as one DATA topic.
+                    if (channel_topics.empty() && resolved_stream_id.has_value()) {
+                        channel_topics = {makeChannelTopic(
+                            nat::core::StreamType::DATA,
+                            resolved_stream_id.value(), std::string{})};
+                    }
                 }
-                if (!resolved_stream_id.has_value()) {
+                // Honor the per-edge topic filter: drop any topic type the user
+                // hid on this link so combine merges only the enabled part of the
+                // channel (e.g. hide the markers, keep the data).
+                if (!edge.hiddenTopicTypes.empty()) {
+                    std::vector<StreamGraphOutputTopic> filtered{};
+                    for (const auto& topic : channel_topics) {
+                        if (std::find(edge.hiddenTopicTypes.begin(),
+                                      edge.hiddenTopicTypes.end(),
+                                      topic.type) == edge.hiddenTopicTypes.end()) {
+                            filtered.push_back(topic);
+                        }
+                    }
+                    channel_topics = std::move(filtered);
+                }
+                if (channel_topics.empty()) {
                     all_resolved = false;
                     blocking_upstream = edge.sourceNodeId;
                     break;
                 }
-                input_stream_ids.push_back(resolved_stream_id.value());
-                combine_input_in_process.push_back(
-                    outputInProcess(edge.sourceNodeId));
+                CombineWorkerInput channel{};
+                channel.topics = channel_topics;
+                channel.inProcess = outputInProcess(edge.sourceNodeId);
+                channel.startOffset = resolved_stream_id.has_value()
+                    ? sourceOffsetFor(resolved_stream_id.value())
+                    : -1;
+                input_channels.push_back(std::move(channel));
             }
 
-            if (!all_resolved || input_stream_ids.size() < 2U) {
+            if (!all_resolved || input_channels.size() < 2U) {
                 encountered_error = true;
                 const StreamGraphNodeRuntimeStatus status{
                     blocking_upstream.has_value() ? "blocked" : "error",
@@ -5917,8 +7027,8 @@ void executeStreamGraphStart(
             }
 
             const auto create_result = createCombineWorker(
-                broker_manager, input_stream_ids, node.outputIdentifier.value_or(node.id),
-                combine_input_in_process, outputInProcess(node.id));
+                broker_manager, input_channels,
+                node.outputIdentifier.value_or(node.id), outputInProcess(node.id));
             if (!create_result.ok) {
                 encountered_error = true;
                 const StreamGraphNodeRuntimeStatus status{
@@ -5933,7 +7043,7 @@ void executeStreamGraphStart(
             }
 
             created_output_ids.push_back(create_result.outputStreamId);
-            const StreamGraphNodeRuntimeStatus status{
+            StreamGraphNodeRuntimeStatus status{
                 "running",
                 create_result.outputStreamId,
                 create_result.workerId,
@@ -5943,11 +7053,13 @@ void executeStreamGraphStart(
                     ? std::optional<std::string>("Reused existing combine worker.")
                     : std::nullopt,
             };
+            status.outputTopics = create_result.outputTopics;
             if (!commitNodeStatus(node.id, status, create_result.outputStreamId)) {
                 aborted = true;
                 break;
             }
             resolved_output_stream_ids[node.id] = create_result.outputStreamId;
+            resolved_output_channels[node.id] = create_result.outputTopics;
             const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
             if (mutable_node_search != mutable_nodes_by_id.end() &&
                 mutable_node_search->second != nullptr) {
@@ -6010,7 +7122,8 @@ void executeStreamGraphStart(
             active_run_id,
             node.id,
             input_in_process,
-            outputInProcess(node.id));
+            outputInProcess(node.id),
+            sourceOffsetFor(resolved_input.streamId.value()));
         if (!create_result.ok) {
             encountered_error = true;
             const StreamGraphNodeRuntimeStatus status{
@@ -6025,7 +7138,7 @@ void executeStreamGraphStart(
         }
 
         created_output_ids.push_back(create_result.outputStreamId);
-        const StreamGraphNodeRuntimeStatus status{
+        StreamGraphNodeRuntimeStatus status{
             "running",
             create_result.outputStreamId,
             create_result.workerId,
@@ -6036,11 +7149,13 @@ void executeStreamGraphStart(
                 ? std::optional<std::string>("Reused existing transform worker.")
                 : std::nullopt,
         };
+        status.outputTopics = channelTopicsFromWorker(create_result.outputStreamId);
         if (!commitNodeStatus(node.id, status, create_result.outputStreamId)) {
             aborted = true;
             break;
         }
         resolved_output_stream_ids[node.id] = create_result.outputStreamId;
+        resolved_output_channels[node.id] = status.outputTopics;
         const auto mutable_node_search = mutable_nodes_by_id.find(node.id);
         if (mutable_node_search != mutable_nodes_by_id.end() &&
             mutable_node_search->second != nullptr) {
@@ -6235,6 +7350,13 @@ void StreamViewerWebSocket::handleStartStreamGraph(
                 node.streamId.has_value()
                     ? std::optional<std::string>("Source stream is available to downstream nodes.")
                     : std::nullopt};
+            if (node.streamId.has_value()) {
+                // A raw source is a data-only channel (one DATA topic). The
+                // schema is filled in frontend-side from the stream descriptor.
+                runtime.nodeStatuses[node.id].outputTopics.push_back(
+                    makeChannelTopic(nat::core::StreamType::DATA,
+                                     node.streamId.value(), std::string{}));
+            }
         } else if (node.kind == "viewer" || node.kind == "sink") {
             // Seed the resolved upstream stream so the frontend subscribes now.
             runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
@@ -6269,6 +7391,13 @@ void StreamViewerWebSocket::handleStartStreamGraph(
         g_stream_graph_runtime[graph.graphId] = runtime;
     }
 
+    // Optional replay start (Phase 5): -1 live (default), -2 beginning, >=0 a
+    // concrete offset (from a query_stream_time offset_for_timestamp). Only the
+    // graph's root stream_source consumers seek to it; the re-run chain feeds
+    // downstream nodes live.
+    const int64_t replay_start_offset =
+        json.value("start_offset", static_cast<int64_t>(-1));
+
     // Immediate feedback before the (slow) worker creation begins.
     sendStreamGraphStatus(conn, request_id, graph.graphId);
 
@@ -6278,7 +7407,8 @@ void StreamViewerWebSocket::handleStartStreamGraph(
         conn,
         request_id,
         std::move(graph),
-        active_run_id)
+        active_run_id,
+        replay_start_offset)
         .detach();
 }
 
@@ -6448,9 +7578,41 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                 }
             }
         } else if (node.kind == "combine") {
-            std::vector<uint64_t> input_stream_ids;
-            std::vector<bool> combine_input_in_process;
+            std::vector<CombineWorkerInput> input_channels;
             bool all_resolved = true;
+            // The restart path only tracks a single output id per node, so probe
+            // each input id for its DATA and/or MARKER topic to rebuild the
+            // channel (topic-aware combine, Part B).
+            const auto probeChannelTopics =
+                [&](uint64_t id) -> std::vector<StreamGraphOutputTopic> {
+                std::vector<StreamGraphOutputTopic> topics{};
+                auto data_topic = nat::tools::resolveGraphSourceTopic(
+                    id,
+                    [&](uint64_t sid) {
+                        return findTransformSourceTopicForStream(broker_manager_, sid);
+                    },
+                    [](uint64_t sid) {
+                        return findGraphInternalOutputTopicForStream(sid);
+                    });
+                if (data_topic != nullptr) {
+                    topics.push_back(makeChannelTopic(
+                        nat::core::StreamType::DATA, id, data_topic->schemaName));
+                }
+                auto marker_topic =
+                    findMarkerOrMetaTopicForStreamId(broker_manager_, id);
+                if (marker_topic == nullptr) {
+                    marker_topic = findGraphInternalMarkerTopicForStream(id);
+                }
+                if (marker_topic != nullptr) {
+                    topics.push_back(makeChannelTopic(
+                        marker_topic->type, id, marker_topic->schemaName));
+                }
+                if (topics.empty()) {
+                    topics.push_back(makeChannelTopic(
+                        nat::core::StreamType::DATA, id, std::string{}));
+                }
+                return topics;
+            };
             for (const auto& edge : graph.edges) {
                 if (edge.targetNodeId != node.id) {
                     continue;
@@ -6460,18 +7622,37 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                     all_resolved = false;
                     break;
                 }
-                input_stream_ids.push_back(up->second);
-                combine_input_in_process.push_back(
-                    outputInProcess(edge.sourceNodeId));
+                auto channel_topics = probeChannelTopics(up->second);
+                // Honor the per-edge topic filter (same as the start path).
+                if (!edge.hiddenTopicTypes.empty()) {
+                    std::vector<StreamGraphOutputTopic> filtered{};
+                    for (const auto& topic : channel_topics) {
+                        if (std::find(edge.hiddenTopicTypes.begin(),
+                                      edge.hiddenTopicTypes.end(),
+                                      topic.type) == edge.hiddenTopicTypes.end()) {
+                            filtered.push_back(topic);
+                        }
+                    }
+                    channel_topics = std::move(filtered);
+                }
+                if (channel_topics.empty()) {
+                    all_resolved = false;
+                    break;
+                }
+                CombineWorkerInput channel{};
+                channel.topics = std::move(channel_topics);
+                channel.inProcess = outputInProcess(edge.sourceNodeId);
+                channel.startOffset = -1;
+                input_channels.push_back(std::move(channel));
             }
-            if (!all_resolved || input_stream_ids.size() < 2U) {
+            if (!all_resolved || input_channels.size() < 2U) {
                 status = {"blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                           std::optional<std::string>("combine node inputs not resolved.")};
             } else {
                 const auto create_result = createCombineWorker(
-                    broker_manager_, input_stream_ids,
+                    broker_manager_, input_channels,
                     node.outputIdentifier.value_or(node.id),
-                    combine_input_in_process, outputInProcess(node.id));
+                    outputInProcess(node.id));
                 if (!create_result.ok) {
                     status = {"error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                               create_result.error};
@@ -6485,6 +7666,10 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
             }
         } else {
             continue;  // viewer/sink/session/train/source need no worker restart
+        }
+
+        if (new_output_id.has_value()) {
+            status.outputTopics = channelTopicsFromWorker(new_output_id.value());
         }
 
         std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
@@ -6575,7 +7760,8 @@ void StreamViewerWebSocket::handleUnsubscribe(const WebSocketConnectionPtr& conn
 
         for (uint64_t stream_id : stream_ids) {
             ctx->subscribed_streams.erase(stream_id);
-            
+            ctx->requested_start_offsets.erase(stream_id);
+
             // Remove messengers for this stream
             ctx->messengers.erase(
                 std::remove_if(ctx->messengers.begin(), ctx->messengers.end(),
@@ -6678,49 +7864,97 @@ void StreamViewerWebSocket::streamingThreadFunc(const WebSocketConnectionPtr& co
         try {
             std::lock_guard<std::mutex> lock(ctx->mutex);
 
-            // Lazily bind messengers for any subscription whose stream wasn't
+            // Lazily bind messengers for any subscription whose topic wasn't
             // discoverable at subscribe time (e.g. a transform/combine output
             // from a graph that had only just been started). Without this, such
             // a subscription would never deliver data — the "Waiting for
             // EMG data…" that showed up whenever the viewer was opened before
             // the output stream had propagated. Throttled so we don't call
             // getAllStreams() on every 10 ms poll.
-            if (broker_manager_ &&
-                ctx->messengers.size() < ctx->subscribed_streams.size()) {
-                std::set<uint64_t> resolved_ids;
-                for (const auto& messenger : ctx->messengers) {
-                    resolved_ids.insert(messenger->getId());
-                }
+            //
+            // Topic-aware channels: a channel id can carry BOTH a DATA and a
+            // MARKER topic (a combine "stream" output), each materialising at a
+            // different time, so we track and retry the two lanes independently
+            // (a messenger-count check can't tell them apart — both share the id).
+            const bool has_unbound =
+                ctx->bound_data_ids.size() + ctx->bound_marker_ids.size() <
+                ctx->subscribed_streams.size() * 2;
+            if (broker_manager_ && has_unbound) {
                 const uint64_t now_us = nowUs();
                 if (now_us - last_pending_resolve_us > 500000ULL) {
                     last_pending_resolve_us = now_us;
-                    auto rawStreams = broker_manager_->getAllStreams();
+                    // getAllStreams() is only needed to discover a DATA topic; skip
+                    // it when every data lane is already bound (only markers remain
+                    // to probe, which use the cheaper per-id topic lookups).
+                    const bool any_data_unbound =
+                        ctx->bound_data_ids.size() <
+                        ctx->subscribed_streams.size();
+                    std::vector<std::unique_ptr<nat::core::RawStream>> rawStreams;
+                    if (any_data_unbound) {
+                        rawStreams = broker_manager_->getAllStreams();
+                    }
                     for (uint64_t stream_id : ctx->subscribed_streams) {
-                        if (resolved_ids.count(stream_id) > 0) {
-                            continue;
-                        }
-                        std::shared_ptr<nat::core::BasicTopicInformation> dataTopic;
-                        for (const auto& stream : rawStreams) {
-                            if (stream->getId() != stream_id) {
-                                continue;
+                        if (ctx->bound_data_ids.count(stream_id) == 0) {
+                            std::shared_ptr<nat::core::BasicTopicInformation> dataTopic;
+                            for (const auto& stream : rawStreams) {
+                                if (stream->getId() != stream_id) {
+                                    continue;
+                                }
+                                auto dataTopics = stream->getTopicsByType(
+                                    nat::core::StreamType::DATA);
+                                dataTopic = choosePreferredDataTopic(dataTopics);
+                                break;
                             }
-                            auto dataTopics = stream->getTopicsByType(
-                                nat::core::StreamType::DATA);
-                            dataTopic = choosePreferredDataTopic(dataTopics);
-                            break;
+                            // Same in-memory fallback as handleSubscribe for a
+                            // graph output not yet visible in broker metadata.
+                            if (dataTopic == nullptr) {
+                                dataTopic =
+                                    findGraphInternalOutputTopicForStream(stream_id);
+                            }
+                            if (dataTopic != nullptr) {
+                                const int64_t data_offset =
+                                    ctx->requested_start_offsets.count(stream_id)
+                                        ? ctx->requested_start_offsets.at(stream_id)
+                                        : -1;
+                                ctx->messengers.push_back(
+                                    broker_manager_->createMessenger(
+                                        dataTopic, data_offset));
+                                ctx->bound_data_ids.insert(stream_id);
+                                LOG_INFO << "StreamViewer: Lazily bound data "
+                                            "messenger for stream "
+                                         << stream_id;
+                            }
                         }
-                        // Same in-memory fallback as handleSubscribe for a
-                        // graph output not yet visible in broker metadata.
-                        if (dataTopic == nullptr) {
-                            dataTopic =
-                                findGraphInternalOutputTopicForStream(stream_id);
-                        }
-                        if (dataTopic != nullptr) {
-                            ctx->messengers.push_back(
-                                broker_manager_->createMessenger(dataTopic));
-                            LOG_INFO << "StreamViewer: Lazily bound messenger "
-                                        "for stream "
-                                     << stream_id;
+                        // Marker/meta topics (an experiment's `markers` output, or
+                        // a combine "stream" output's Marker/<id>) materialise only
+                        // once the first record is published — retry until then.
+                        if (ctx->bound_marker_ids.count(stream_id) == 0) {
+                            auto markerTopic = findMarkerOrMetaTopicForStreamId(
+                                broker_manager_, stream_id);
+                            if (markerTopic == nullptr) {
+                                markerTopic =
+                                    findGraphInternalMarkerTopicForStream(stream_id);
+                            }
+                            if (markerTopic != nullptr) {
+                                const bool is_marker =
+                                    markerTopic->type ==
+                                    nat::core::StreamType::MARKER;
+                                // Same rule as the immediate bind: bundle a MARKER
+                                // with data, or bind a lone marker/meta stream that
+                                // has no data topic. Don't newly stream a data
+                                // stream's META topic.
+                                if (is_marker ||
+                                    ctx->bound_data_ids.count(stream_id) == 0) {
+                                    ctx->messengers.push_back(
+                                        broker_manager_->createMessenger(
+                                            markerTopic,
+                                            kMarkerConsumerStartOffset));
+                                    ctx->bound_marker_ids.insert(stream_id);
+                                    LOG_INFO << "StreamViewer: Lazily bound marker "
+                                                "messenger for stream "
+                                             << stream_id;
+                                }
+                            }
                         }
                     }
                 }
@@ -6863,6 +8097,28 @@ void StreamViewerWebSocket::streamingThreadFunc(const WebSocketConnectionPtr& co
                             stream_id,
                             encoding_type,
                             encoding_size);
+                        if (conn && conn->connected()) {
+                            conn->send(json.dump());
+                        }
+                        continue;
+                    }
+
+                    // Marker events (Phase 2): forward MarkerEventV1 records so
+                    // the marker renderer can draw cue/session events. Markers
+                    // are published to Marker/<session_id> topics (e.g. an
+                    // experiment node's `markers` output).
+                    nat::core::MarkerEventV1* markerEvent =
+                        dynamic_cast<nat::core::MarkerEventV1*>(message.get());
+                    if (markerEvent != nullptr) {
+                        size_t encoding_size = 0;
+                        std::unique_ptr<std::vector<uint8_t>> encoded =
+                            markerEvent->encodeToBytes(
+                                messenger->getSerializationType());
+                        if (encoded) {
+                            encoding_size = encoded->size();
+                        }
+                        auto json = formatMarkerEventAsJson(
+                            *markerEvent, stream_id, encoding_type, encoding_size);
                         if (conn && conn->connected()) {
                             conn->send(json.dump());
                         }
