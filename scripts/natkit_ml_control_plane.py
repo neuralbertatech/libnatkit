@@ -178,14 +178,22 @@ def selector_for_run(run: dict[str, Any]) -> str:
     return f"{session_id}:{run_index}"
 
 
+def normalize_run_selector(run: Any) -> str:
+    # The UI submits train_runs/eval_runs as "session:run" strings; discovery
+    # helpers produce run dicts. Accept either.
+    if isinstance(run, str):
+        return run
+    return selector_for_run(run)
+
+
 def build_pipeline_namespace(
     base_args: argparse.Namespace,
     payload: dict[str, Any],
     *,
     output_dir: str,
 ) -> argparse.Namespace:
-    train_runs = [selector_for_run(run) for run in payload.get("train_runs") or []]
-    eval_runs = [selector_for_run(run) for run in payload.get("eval_runs") or []]
+    train_runs = [normalize_run_selector(run) for run in payload.get("train_runs") or []]
+    eval_runs = [normalize_run_selector(run) for run in payload.get("eval_runs") or []]
     overrides = {
         "broker": payload.get("broker", base_args.broker),
         "output_dir": output_dir,
