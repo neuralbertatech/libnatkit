@@ -2962,7 +2962,16 @@ class MlControlPlaneServer:
                         )
                     )
                     if payload.get("report") is not None:
-                        job.report = sanitize_pipeline_report(payload.get("report"))
+                        # The worker already persisted artifacts to the shared
+                        # /models and sanitized the report; preserve its durable
+                        # model_path / bundle_path (re-sanitizing without them
+                        # would strip the paths back to ephemeral).
+                        report_in = payload.get("report") or {}
+                        job.report = sanitize_pipeline_report(
+                            report_in,
+                            report_in.get("model_path"),
+                            report_in.get("bundle_path"),
+                        )
                     slot.completed_jobs += 1
                 elif status == "failed":
                     job.status = "failed"

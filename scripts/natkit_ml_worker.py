@@ -34,6 +34,8 @@ from natkit_ml_control_plane import (
     create_job_workspace,
     default_worker_id,
     parse_args as parse_control_plane_args,
+    persist_bundle_artifact,
+    persist_selected_model_artifact,
     resolve_worker_thread_count,
     sanitize_pipeline_report,
 )
@@ -581,6 +583,8 @@ class MlWorkerClient:
 
         loop = asyncio.get_running_loop()
         job_workspace: Path | None = None
+        durable_model_path: str | None = None
+        durable_bundle_path: str | None = None
         try:
             job_workspace = create_job_workspace(self._pipeline_base_args)
             pipeline_args = build_pipeline_namespace(
@@ -620,6 +624,13 @@ class MlWorkerClient:
                 emit_progress,
                 stop_event.is_set,
             )
+            # Persist the model + live-inference bundle into the shared durable
+            # artifacts dir (/models) BEFORE the finally block deletes the scratch
+            # workspace, so the backend can load them. Needs /models mounted rw in
+            # this worker's container (embedded workers share the control plane's
+            # mount; the remote worker mounts it in compose).
+            durable_model_path = persist_selected_model_artifact(report, job_id)
+            durable_bundle_path = persist_bundle_artifact(report, job_id)
         except PipelineCancelledError:
             await self._report_job_state(
                 job_id,
@@ -651,7 +662,9 @@ class MlWorkerClient:
             job_id,
             status="completed",
             message=completion_message,
-            report=sanitize_pipeline_report(report),
+            report=sanitize_pipeline_report(
+                report, durable_model_path, durable_bundle_path
+            ),
         )
 
 
