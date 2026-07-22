@@ -2341,13 +2341,17 @@ class MlControlPlaneServer:
                 request_id=request_id,
             )
             return
-        if not request_payload["train_runs"] or not request_payload["eval_runs"]:
+        if not request_payload["train_runs"]:
             await self._send_error(
                 websocket,
-                "train_runs and eval_runs are required",
+                "train_runs is required",
                 request_id=request_id,
             )
             return
+        # eval_runs is OPTIONAL: the model fits on the training runs alone, and
+        # the pipeline (kafka_train_validate.resolve_train_eval_runs) reports
+        # accuracy/coverage as null when no validation runs are given. Requiring
+        # it here would block the common single-session train-only flow.
 
         priority = int(payload.get("priority", 0))
         self._job_sequence += 1

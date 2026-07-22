@@ -1274,6 +1274,24 @@ nlohmann::json buildTransformCapabilitiesJson()
 //   input_ports / output_ports  typed port templates
 // Transform entries also carry the existing input_mappings / output_schema_name
 // so the create_transform path keeps working unchanged.
+// Provenance ports (lineage/control wiring) are identified purely by an id
+// prefix, matching the frontend (streamGraph.ts PROVENANCE_PORT_PREFIX). They
+// are preserved through port normalization but excluded from data-port rules.
+inline bool isProvenancePortId(const std::string& port_id)
+{
+    return port_id.rfind("prov_", 0) == 0;
+}
+
+// The dedicated provenance stubs each node kind exposes (per the plan: the
+// source end taps its data output; experiment/train/classify get stubs).
+constexpr const char* kProvenancePortSource = "prov_source"; // source->experiment
+constexpr const char* kProvenancePortExperiment =
+    "prov_experiment"; // experiment->train (train input)
+constexpr const char* kProvenancePortModels =
+    "prov_models"; // train->classify (train output)
+constexpr const char* kProvenancePortModel =
+    "prov_model"; // train->classify (classify input)
+
 nlohmann::json buildNodeCatalogJson()
 {
     const auto singleInputPort = []() {
@@ -1283,6 +1301,11 @@ nlohmann::json buildNodeCatalogJson()
     const auto singleOutputPort = []() {
         return nlohmann::json::array(
             {{{"id", "out"}, {"label", "Output"}}});
+    };
+    // Provenance-port advertisement (lineage stubs; kind "provenance" so the
+    // frontend renders/validates them distinctly from data ports).
+    const auto provPort = [](const char* id, const char* label) {
+        return nlohmann::json{{"id", id}, {"label", label}, {"kind", "provenance"}};
     };
 
     nlohmann::json nodes = nlohmann::json::array();
@@ -1315,7 +1338,17 @@ nlohmann::json buildNodeCatalogJson()
         node["input_mappings"] = capability.at("input_mappings");
         node["input_descriptor_paths"] = capability.at("input_descriptor_paths");
         node["output_schema_name"] = capability.at("output_schema_name");
-        node["input_ports"] = singleInputPort();
+        auto input_ports = singleInputPort();
+        // A classifier transform (loads a model bundle) can receive a
+        // train->classify provenance edge — advertise a prov_model input stub.
+        // Detected by a model_path config field.
+        for (const auto& field : capability.at("config_fields")) {
+            if (field.value("id", std::string{}) == "model_path") {
+                input_ports.push_back(provPort(kProvenancePortModel, "Model"));
+                break;
+            }
+        }
+        node["input_ports"] = input_ports;
         node["output_ports"] = singleOutputPort();
         node["variadic_inputs"] = false;
         nodes.push_back(node);
@@ -1389,7 +1422,9 @@ nlohmann::json buildNodeCatalogJson()
           "marker-aware nodes downstream can render or train on. Has no inputs — "
           "the cue timeline is generated independently of any data source."},
          {"config_fields", nlohmann::json::array()},
-         {"input_ports", nlohmann::json::array()},
+         {"input_ports",
+          nlohmann::json::array(
+              {provPort(kProvenancePortSource, "Records")})},
          {"output_ports", markersOutputPort()},
          {"variadic_inputs", false}});
 
@@ -1406,10 +1441,15 @@ nlohmann::json buildNodeCatalogJson()
          {"description",
           "Trains a classifier on a recorded session dataset (model families + "
           "feature windowing), producing a durable model artifact a classify "
-          "node can load."},
+          "node can load. Wire an experiment into it to scope the training runs, "
+          "and its models output into a classify node to serve them."},
          {"config_fields", nlohmann::json::array()},
-         {"input_ports", nlohmann::json::array()},
-         {"output_ports", nlohmann::json::array()},
+         {"input_ports",
+          nlohmann::json::array(
+              {provPort(kProvenancePortExperiment, "Experiment")})},
+         {"output_ports",
+          nlohmann::json::array(
+              {provPort(kProvenancePortModels, "Models")})},
          {"variadic_inputs", false}});
 
     return nodes;
@@ -1453,7 +1493,22 @@ struct StreamGraphEdge {
     // whole channel flows (default). Lets a viewer/combine act on only part of a
     // "stream" channel (e.g. drop the markers, keep the data).
     std::vector<std::string> hiddenTopicTypes{};
+    // Provenance edges (data-lineage / control wiring, e.g. source->experiment,
+    // experiment->train, train->classify) are persisted with the graph but are
+    // EXCLUDED from the executed data-flow: they resolve node configuration at
+    // author/submit time, not at runtime. "data" (default) is a normal streaming
+    // edge; "provenance" is a lineage edge the executor + validation ignore
+    // (mirrors how param nodes are dropped in flattenGraph).
+    std::string edgeKind{"data"};
 };
+
+// A provenance edge carries data lineage, not a stream; the graph executor and
+// data-flow validation must skip it. Centralized so every edge-iteration site
+// filters identically.
+inline bool isProvenanceEdge(const StreamGraphEdge& edge)
+{
+    return edge.edgeKind == "provenance";
+}
 
 struct StreamGraphDefinition {
     int graphVersion = 1;
@@ -1667,6 +1722,9 @@ void to_json(nlohmann::json& json, const StreamGraphEdge& value)
     if (!value.hiddenTopicTypes.empty()) {
         json["hidden_topic_types"] = value.hiddenTopicTypes;
     }
+    if (value.edgeKind != "data") {
+        json["edge_kind"] = value.edgeKind;
+    }
 }
 
 void from_json(const nlohmann::json& json, StreamGraphEdge& value)
@@ -1681,6 +1739,7 @@ void from_json(const nlohmann::json& json, StreamGraphEdge& value)
         value.hiddenTopicTypes =
             json.at("hidden_topic_types").get<std::vector<std::string>>();
     }
+    value.edgeKind = json.value("edge_kind", std::string{"data"});
 }
 
 void to_json(nlohmann::json& json, const StreamGraphDefinition& value)
@@ -1810,43 +1869,82 @@ void addTopLevelGraphDiagnostic(
 
 void normalizeGraphNodePorts(StreamGraphNode& node)
 {
-    if (node.kind == "stream_source") {
-        if (node.outputPortIds.empty()) {
-            node.outputPortIds = {"data"};
+    // Provenance ports (prov_*) carry lineage, not data — they survive
+    // normalization regardless of the kind's data-port rules. Collect the ones
+    // the node already declares so they can be re-appended after the data ports
+    // are reset, then ensure the kind's own dedicated stub is present.
+    const auto collectProvenance = [](const std::vector<std::string>& ports) {
+        std::vector<std::string> kept;
+        for (const auto& port : ports) {
+            if (isProvenancePortId(port)) {
+                kept.push_back(port);
+            }
         }
+        return kept;
+    };
+    const auto ensurePort = [](std::vector<std::string>& ports,
+                               const std::string& id) {
+        if (std::find(ports.begin(), ports.end(), id) == ports.end()) {
+            ports.push_back(id);
+        }
+    };
+    auto provInputs = collectProvenance(node.inputPortIds);
+    auto provOutputs = collectProvenance(node.outputPortIds);
+
+    if (node.kind == "stream_source") {
+        node.outputPortIds = {"data"};
         node.inputPortIds.clear();
     } else if (node.kind == "transform") {
-        if (node.inputPortIds.empty()) {
-            node.inputPortIds = {"input"};
-        }
-        if (node.outputPortIds.empty()) {
-            node.outputPortIds = {"output"};
+        node.inputPortIds = {"input"};
+        node.outputPortIds = {"output"};
+        // A classifier transform (one that loads a model bundle) can be the
+        // target of a train->classify provenance edge, so it gets a prov_model
+        // input stub. Detected by the presence of a model_path config field.
+        if (node.config.is_object() && node.config.contains("model_path")) {
+            ensurePort(provInputs, kProvenancePortModel);
         }
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
         }
     } else if (node.kind == "viewer" || node.kind == "sink") {
-        if (node.inputPortIds.empty()) {
-            node.inputPortIds = {"input"};
-        }
+        node.inputPortIds = {"input"};
         node.outputPortIds.clear();
     } else if (node.kind == "experiment") {
         // An experiment is source-like: it generates a marker timeline from its
-        // protocol independently of any data source, so it has NO inputs and
-        // exposes exactly one output port, `markers` (the MarkerEventV1 stream
-        // for its session_id).
+        // protocol, so it has no DATA inputs and exposes exactly one data output
+        // port, `markers`. It gains a prov_source input stub so a source can be
+        // wired as its recorded stream (source->experiment lineage).
         node.inputPortIds.clear();
         node.outputPortIds = {"markers"};
+        ensurePort(provInputs, kProvenancePortSource);
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
         }
     } else if (node.kind == "train") {
-        // A train node submits a control-plane job (client-driven); it holds a
-        // training spec in config and produces no stream output. Its dataset is
-        // selected in config (run selectors), so inputs are optional.
+        // A train node submits a control-plane job (client-driven); no DATA
+        // stream output. It gains a prov_experiment input stub (experiment->train
+        // lineage: which sessions to train on) and a prov_models output stub
+        // (train->classify lineage: the models it produced).
+        node.inputPortIds.clear();
         node.outputPortIds.clear();
+        ensurePort(provInputs, kProvenancePortExperiment);
+        ensurePort(provOutputs, kProvenancePortModels);
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
+        }
+    }
+
+    // Re-append the preserved/ensured provenance ports after the data ports.
+    for (const auto& port : provInputs) {
+        if (std::find(node.inputPortIds.begin(), node.inputPortIds.end(), port) ==
+            node.inputPortIds.end()) {
+            node.inputPortIds.push_back(port);
+        }
+    }
+    for (const auto& port : provOutputs) {
+        if (std::find(node.outputPortIds.begin(), node.outputPortIds.end(),
+                      port) == node.outputPortIds.end()) {
+            node.outputPortIds.push_back(port);
         }
     }
 }
@@ -2511,12 +2609,22 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     "experiment nodes expose exactly one output port, 'markers'.");
             }
         } else if (node.kind == "train") {
-            if (!node.outputPortIds.empty()) {
+            // A train node produces no DATA stream, but may expose provenance
+            // output stubs (prov_models: the models it trained, for a
+            // train->classify lineage edge). Only a non-provenance output port
+            // is invalid.
+            const bool has_data_output = std::any_of(
+                node.outputPortIds.begin(),
+                node.outputPortIds.end(),
+                [](const std::string& port) {
+                    return !isProvenancePortId(port);
+                });
+            if (has_data_output) {
                 addGraphDiagnostic(
                     result,
                     result.nodeDiagnostics[node.id],
                     "invalid_train_output_ports",
-                    "train nodes do not expose output ports.");
+                    "train nodes do not expose data output ports.");
             }
         }
     }
@@ -2580,6 +2688,12 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                 result.edgeDiagnostics[edge.id],
                 "missing_target_port",
                 "Edge target port does not exist on its node.");
+        }
+        // Provenance edges carry lineage, not data — they never join the data
+        // DAG, so they don't contribute to topo ordering or indegree. (Their
+        // endpoints/ports are still validated above.)
+        if (isProvenanceEdge(edge)) {
+            continue;
         }
         adjacency[edge.sourceNodeId].push_back(edge.targetNodeId);
         indegree[edge.targetNodeId] += 1;
@@ -2662,7 +2776,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                 graph.edges.begin(),
                 graph.edges.end(),
                 [&node](const StreamGraphEdge& edge) {
-                    return edge.targetNodeId == node.id;
+                    return edge.targetNodeId == node.id &&
+                       !isProvenanceEdge(edge);
                 });
             if (input_count < 2) {
                 addGraphDiagnostic(
@@ -2681,7 +2796,7 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             bool has_data_input = false;
             bool has_marker_input = false;
             for (const auto& edge : graph.edges) {
-                if (edge.targetNodeId != node.id) {
+                if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
                     continue;
                 }
                 const auto src_search = nodes_by_id.find(edge.sourceNodeId);
@@ -2732,7 +2847,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     graph.edges.begin(),
                     graph.edges.end(),
                     [&node](const StreamGraphEdge& edge) {
-                        return edge.targetNodeId == node.id;
+                        return edge.targetNodeId == node.id &&
+                       !isProvenanceEdge(edge);
                     });
                 if (input_count == 0) {
                     addGraphDiagnostic(
@@ -2754,7 +2870,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     graph.edges.begin(),
                     graph.edges.end(),
                     [&node](const StreamGraphEdge& edge) {
-                        return edge.targetNodeId == node.id;
+                        return edge.targetNodeId == node.id &&
+                       !isProvenanceEdge(edge);
                     });
                 if (input_count > 0) {
                     addGraphDiagnostic(
@@ -2771,7 +2888,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             graph.edges.begin(),
             graph.edges.end(),
             [&node](const StreamGraphEdge& edge) {
-                return edge.targetNodeId == node.id;
+                return edge.targetNodeId == node.id &&
+                       !isProvenanceEdge(edge);
             });
         if (input_count == 0) {
             addGraphDiagnostic(
@@ -2809,7 +2927,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             graph.edges.begin(),
             graph.edges.end(),
             [&node](const StreamGraphEdge& edge) {
-                return edge.targetNodeId == node.id;
+                return edge.targetNodeId == node.id &&
+                       !isProvenanceEdge(edge);
             });
         if (upstream_edge_search == graph.edges.end()) {
             continue;
@@ -6962,6 +7081,17 @@ void executeStreamGraphStart(
     std::string active_run_id,
     int64_t replay_start_offset = -1)
 {
+    // Provenance edges carry lineage/control, not streaming data — drop them from
+    // the executed graph entirely (mirrors flattenGraph dropping param nodes) so
+    // every downstream edge iteration, transport classification, and input
+    // resolution sees only real data edges. (`graph` is a local copy.)
+    graph.edges.erase(
+        std::remove_if(
+            graph.edges.begin(),
+            graph.edges.end(),
+            [](const StreamGraphEdge& edge) { return isProvenanceEdge(edge); }),
+        graph.edges.end());
+
     std::unordered_map<std::string, const StreamGraphNode*> nodes_by_id;
     std::unordered_map<std::string, StreamGraphNode*> mutable_nodes_by_id;
     std::unordered_map<std::string, uint64_t> resolved_output_stream_ids;
@@ -7013,7 +7143,8 @@ void executeStreamGraphStart(
             graph.edges.begin(),
             graph.edges.end(),
             [&node](const StreamGraphEdge& edge) {
-                return edge.targetNodeId == node.id;
+                return edge.targetNodeId == node.id &&
+                       !isProvenanceEdge(edge);
             });
         if (upstream_edge == graph.edges.end()) {
             return ResolvedInput{std::nullopt, std::nullopt};
@@ -7559,6 +7690,16 @@ void StreamViewerWebSocket::handleStartStreamGraph(
         return;
     }
 
+    // Provenance edges are lineage, not data — drop them now (after validation,
+    // which still inspects them) so the up-front output-id seeding and the
+    // detached executeStreamGraphStart both route only real data edges.
+    graph.edges.erase(
+        std::remove_if(
+            graph.edges.begin(),
+            graph.edges.end(),
+            [](const StreamGraphEdge& edge) { return isProvenanceEdge(edge); }),
+        graph.edges.end());
+
     // Seed a "starting" runtime up front — sources are immediately available,
     // every other node is pending — so a status snapshot reflects the click at
     // once. The slow per-node worker creation then runs on a detached thread
@@ -7719,6 +7860,16 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
         graph = graph_search->second;
         active_run_id = runtime_search->second.activeRunId;
     }
+
+    // Provenance edges are lineage, not data — drop them so the restart's
+    // transport classification, descendant BFS, and input resolution operate on
+    // the pure data graph (matches executeStreamGraphStart).
+    graph.edges.erase(
+        std::remove_if(
+            graph.edges.begin(),
+            graph.edges.end(),
+            [](const StreamGraphEdge& edge) { return isProvenanceEdge(edge); }),
+        graph.edges.end());
 
     // Re-classify transport over the whole (flattened) graph so a restarted node
     // agrees with its still-running upstream about the transport of the shared

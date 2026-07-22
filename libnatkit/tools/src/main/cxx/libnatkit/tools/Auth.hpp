@@ -177,4 +177,8 @@ private:
     std::string bootstrap_mode_;
     std::string bootstrap_password_;
     uint64_t session_ttl_us_ = 24ULL * 60ULL * 60ULL * 1000000ULL;
+    // Dev-only escape hatch (NATKIT_AUTH_DISABLED): when true, authenticateRequest
+    // treats every request as an admin so the web panel needs no login. Never set
+    // this outside a local dev stack.
+    bool auth_disabled_ = false;
 };

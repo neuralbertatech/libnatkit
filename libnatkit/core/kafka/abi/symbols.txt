@@ -1,0 +1,17 @@
+# Exported C ABI symbols of liblibnatkit-kafka (append-only baseline).
+#
+# Companion to lib/libnatkit-core/abi/symbols.txt for the separate Kafka
+# transport ABI (libnatkit-kafka-abi.h). One symbol per line; lines starting
+# with '#' and blank lines are ignored. scripts/check_abi_symbols.sh fails if
+# any symbol listed here is MISSING from the built shared library -- a removed or
+# renamed exported symbol is a breaking ABI change and must instead ship as a
+# new _vN_ symbol alongside the old one. New symbols may be added freely
+# (append-only); add them here in the same commit that introduces them.
+nat_kafka_v1_broker_create
+nat_kafka_v1_broker_destroy
+nat_kafka_v1_broker_list_topics
+nat_kafka_v1_messenger_create
+nat_kafka_v1_messenger_destroy
+nat_kafka_v1_messenger_flush
+nat_kafka_v1_messenger_send
+nat_kafka_v1_messenger_try_recv

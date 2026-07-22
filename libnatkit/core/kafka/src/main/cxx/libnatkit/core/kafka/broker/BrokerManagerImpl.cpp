@@ -133,6 +133,52 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
                                   */
   }
 
+  virtual StreamTimeExtent
+  queryStreamTime(const std::string &topicName,
+                  int64_t timestampUs = -1) const override {
+    StreamTimeExtent extent{};
+    const auto consumer = createConsumer();
+    if (!consumer) {
+      return extent;
+    }
+    constexpr int32_t kPartition = 0;
+    constexpr int kTimeoutMs = 5000;
+
+    int64_t low = -1;
+    int64_t high = -1;
+    const auto err = consumer->query_watermark_offsets(
+        topicName, kPartition, &low, &high, kTimeoutMs);
+    if (err != RdKafka::ERR_NO_ERROR) {
+      std::cerr << "  [Kafka] query_watermark_offsets(" << topicName
+                << ") failed: " << RdKafka::err2str(err) << '\n';
+      return extent;
+    }
+    extent.valid = true;
+    extent.earliestOffset = low;
+    extent.latestOffset = high;
+
+    // Map a timestamp -> offset (offsets_for_times). rdkafka takes the target
+    // timestamp in MILLISECONDS in the TopicPartition offset field and replaces
+    // it with the first offset at/after that time (or OFFSET_END if none).
+    if (timestampUs >= 0) {
+      std::vector<RdKafka::TopicPartition *> parts;
+      auto *tp = RdKafka::TopicPartition::create(topicName, kPartition);
+      tp->set_offset(timestampUs / 1000);  // us -> ms
+      parts.push_back(tp);
+      const auto ofterr = consumer->offsetsForTimes(parts, kTimeoutMs);
+      if (ofterr == RdKafka::ERR_NO_ERROR && !parts.empty()) {
+        extent.offsetForTimestamp = parts[0]->offset();
+      } else if (ofterr != RdKafka::ERR_NO_ERROR) {
+        std::cerr << "  [Kafka] offsetsForTimes(" << topicName
+                  << ") failed: " << RdKafka::err2str(ofterr) << '\n';
+      }
+      for (auto *p : parts) {
+        delete p;
+      }
+    }
+    return extent;
+  }
+
   virtual std::vector<std::string>
   getAllTopicStrings(bool includeHiddenTopics = false) const override {
     const auto consumer = createConsumer();
@@ -199,7 +245,8 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
   }
 
   virtual std::unique_ptr<core::TopicMessenger> createMessenger(
-      const std::shared_ptr<core::BasicTopicInformation> &topicInfo) const override {
+      const std::shared_ptr<core::BasicTopicInformation> &topicInfo,
+      int64_t startOffset = -1) const override {
     const auto topics = getAllTopics();
     bool doesTopicExist = false;
     for (const auto &topic : topics) {
@@ -218,7 +265,8 @@ void rd_kafka_DeleteTopics (rd_kafka_t *rk,
     const auto consumer = createConsumer();
     const auto topicHandle = nat::util::asShared(createTopicHandle(topicInfo->toTopicString(), *consumer));
     auto messagingQueue = std::unique_ptr<core::MessagingQueue>(new BrokerMessagingQueue(
-        topicInfo->toTopicString(), producer, consumer, std::move(topicHandle)));
+        topicInfo->toTopicString(), producer, consumer, std::move(topicHandle), {},
+        startOffset));
     auto translator = std::make_unique<core::TopicTranslator>(topicInfo, registry);
     return std::make_unique<core::TopicMessenger>(std::move(messagingQueue),
                                             std::move(translator));

@@ -75,7 +75,8 @@ BrokerMessagingQueue::BrokerMessagingQueue(
     const std::shared_ptr<RdKafka::Consumer> &consumer,
     const std::shared_ptr<RdKafka::Topic> &topicHandle,
     std::optional<std::function<void(std::unique_ptr<core::message_t> &&)>>
-        onMessageRecievedHandlerMaybe)
+        onMessageRecievedHandlerMaybe,
+    int64_t startOffset)
     : topicName(topicName), producer(producer), consumer(consumer),
       topicHandle(topicHandle) {
   if (onMessageRecievedHandlerMaybe.has_value()) {
@@ -86,7 +87,7 @@ BrokerMessagingQueue::BrokerMessagingQueue(
     };
   }
   consumerCallback = std::make_unique<ConsumerCallback>(*this);
-  startConsumer();
+  startConsumer(startOffset);
   thread = std::jthread{&BrokerMessagingQueue::handleMessages, this};
 }
 
@@ -119,6 +120,27 @@ void BrokerMessagingQueue::clearAllMessages() {
     std::queue<std::shared_ptr<core::message_t>> empty{};
     const std::lock_guard<std::mutex> lock(receivingQueueLock);
     std::swap(receivingQueue, empty);
+}
+
+void BrokerMessagingQueue::flush() {
+  // Wait for the background thread to drain the send queue. Each dequeued
+  // message is produced with a synchronous producer->flush() in sendMessage(),
+  // so once the queue is empty every message has been delivered. Bounded so a
+  // dead broker cannot hang the caller forever.
+  constexpr int kMaxWaitMs = 10000;
+  int waitedMs = 0;
+  while (waitedMs < kMaxWaitMs) {
+    {
+      const std::lock_guard<std::mutex> lock(sendingQueueLock);
+      if (sendingQueue.empty()) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(5ms);
+    waitedMs += 5;
+  }
+  // One more poll cycle so an in-progress send finishes flushing.
+  producer->poll(0);
 }
 
 std::string BrokerMessagingQueue::byteArrayToString(const std::vector<uint8_t> &byteArray) {

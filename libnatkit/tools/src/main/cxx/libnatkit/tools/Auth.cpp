@@ -182,6 +182,14 @@ AuthManager::AuthManager()
         }
     }
 
+    auth_disabled_ = parseEnvBool(std::getenv("NATKIT_AUTH_DISABLED"), false);
+    if (auth_disabled_) {
+        printBootstrapNotice(
+            "*** NATKIT_AUTH_DISABLED is set: authentication is BYPASSED. Every "
+            "request is treated as the admin user and the web panel needs no "
+            "login. This is a DEV-ONLY setting — never enable it in production. ***");
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     initializeDatabaseLocked();
     ensureBootstrapStateLocked();
@@ -212,6 +220,11 @@ std::string AuthManager::cookieName() const
 std::optional<AuthenticatedUser> AuthManager::authenticateRequest(
     const HttpRequestPtr& req)
 {
+    // Dev-only bypass: treat every request as an admin so the web panel needs no
+    // login. Set exclusively via NATKIT_AUTH_DISABLED in the dev compose override.
+    if (auth_disabled_) {
+        return AuthenticatedUser{"admin", "Administrator", true};
+    }
     const auto session_token = extractSessionToken(req);
     if (!session_token.has_value()) {
         return std::nullopt;

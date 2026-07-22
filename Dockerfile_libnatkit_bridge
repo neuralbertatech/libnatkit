@@ -2,6 +2,9 @@ FROM docker.io/library/gcc:14.2-bookworm
 WORKDIR /libnatkit
 
 ARG NATKIT_CMAKE_BUILD_PARALLEL
+# Propagate the job cap to the nested libnatkit-core ExternalProject build so a
+# small Docker VM (macOS) doesn't OOM. Empty => CMake falls back to its default.
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${NATKIT_CMAKE_BUILD_PARALLEL}
 
 RUN apt update
 RUN apt install cmake netcat-openbsd -y
@@ -11,7 +14,7 @@ RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 RUN sh -lc 'jobs="${NATKIT_CMAKE_BUILD_PARALLEL:-}"; \
     if [ -z "$jobs" ]; then \
       detected="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)"; \
-      jobs=$((detected > 2 ? detected - 2 : 1)); \
+      jobs=$((detected > 2 ? detected - 4 : 1)); \
     fi; \
     cmake --build build --parallel "$jobs"'
 

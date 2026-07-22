@@ -10,6 +10,15 @@ if (NOT DEFINED BUILD_NATKIT_BACKEND)
   set(BUILD_NATKIT_BACKEND OFF CACHE BOOL "Build the backend for natKit")
 endif()
 
+# When ON, build only what the Kafka C ABI shim (liblibnatkit-kafka.so) needs --
+# libnatkit-util-cxx, libnatkit-core-kafka-cxx, librdkafka and the shim itself --
+# and skip the mosquitto/mqtt/bridge/tools subtrees. Used by
+# Dockerfile_natkit_ml_control_plane to package the Kafka ABI without pulling the
+# full backend build into the image.
+if (NOT DEFINED BUILD_KAFKA_ABI_ONLY)
+  set(BUILD_KAFKA_ABI_ONLY OFF CACHE BOOL "Build only the Kafka C ABI shim and its deps")
+endif()
+
 # Set default build type if not specified
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   message(STATUS "Setting build type to 'Debug' as none was specified.")
@@ -81,7 +90,16 @@ include(ExternalProject)
 #find_program(MEMORYCHECK_COMMAND valgrind)
 #set(MEMORYCHECK_COMMAND_OPTIONS "--leak-check=full --error-exitcode=1")
 if(NOT LIBNATKIT_ESP_BUILD)
-  include(CTest)
+  if(BUILD_KAFKA_ABI_ONLY)
+    # The lean Kafka-ABI build skips the mosquitto/gtest subtrees that would
+    # otherwise pull these in: include GNUInstallDirs so the util install() rules
+    # resolve, and disable testing so subdir `if(BUILD_TESTING)` gtest blocks
+    # (which need AddGoogleTest, also skipped) do not fire.
+    include(GNUInstallDirs)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  else()
+    include(CTest)
+  endif()
 endif()
 
 if(UNIX)
@@ -184,7 +202,16 @@ endif()
 set(LIBNATKITCORE_INCLUDE ${LIBNATKITCORE_SRC_DIR}/include)
 
 message("Configuring libnatkit-core with: ${CMAKE_COMMAND} -S ${LIBNATKITCORE_SRC_DIR} -B ${LIBNATKITCORE_BUILD_DIR} -DSTANDARD_BUILD=ON -DCMAKE_INSTALL_PREFIX=${LIBNATKIT_BUILD_ROOT}")
-message("Building libnakit-core with: ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel ${CMAKE_BUILD_PARALLEL_LEVEL}")
+# Parallelism for the nested libnatkit-core build. Defaults to 16 (historical
+# behavior on RAM-rich hosts). Honor CMAKE_BUILD_PARALLEL_LEVEL from the
+# environment when set so memory-constrained builds (e.g. Docker Desktop on
+# macOS, which runs a small Linux VM) can dial it down and avoid OOM-killing
+# cc1plus. The natKit Docker images export this from NATKIT_CMAKE_BUILD_PARALLEL.
+set(_libnatkitcore_build_parallel 16)
+if(NOT "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}" STREQUAL "")
+  set(_libnatkitcore_build_parallel "$ENV{CMAKE_BUILD_PARALLEL_LEVEL}")
+endif()
+message("Building libnakit-core with: ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel ${_libnatkitcore_build_parallel}")
 ExternalProject_Add(libnatkit-core-project
   #GIT_REPOSITORY    https://github.com/neuralbertatech/libnatkit-core
   #GIT_TAG           trunk
@@ -193,7 +220,7 @@ ExternalProject_Add(libnatkit-core-project
   BINARY_DIR        ${LIBNATKITCORE_BUILD_DIR}
   DOWNLOAD_COMMAND  ""
   CONFIGURE_COMMAND ${CMAKE_COMMAND} -S ${LIBNATKITCORE_SRC_DIR} -B ${LIBNATKITCORE_BUILD_DIR} -DSTANDARD_BUILD=ON -DCMAKE_INSTALL_PREFIX=${LIBNATKIT_BUILD_ROOT}
-  BUILD_COMMAND     ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel 16
+  BUILD_COMMAND     ${CMAKE_COMMAND} --build ${LIBNATKITCORE_BUILD_DIR} --parallel ${_libnatkitcore_build_parallel}
   #INSTALL_COMMAND   ""
   TEST_COMMAND      ""
   BYPRODUCTS        ${LIBNATKITCORE_INCLUDE}/libnatkit-core.hpp
@@ -227,7 +254,7 @@ else()
   set_target_properties(libnatkit-core PROPERTIES IMPORTED_LOCATION ${LIBNATKITCORE_LIBRARY})
 endif()
 
-if(NOT LIBNATKIT_ESP_BUILD)
+if(NOT LIBNATKIT_ESP_BUILD AND NOT BUILD_KAFKA_ABI_ONLY)
   include(AddMosquitto)
 
   if(BUILD_TESTING)
