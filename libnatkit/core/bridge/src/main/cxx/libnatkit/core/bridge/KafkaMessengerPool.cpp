@@ -23,6 +23,7 @@ KafkaMessengerPool::~KafkaMessengerPool() { running = false; }
 void KafkaMessengerPool::sendMessage(const std::string &topicName,
                  std::unique_ptr<core::message_t> &&msg) {
   //std::cout << "% Kafka attempting to send message to: " << topicName << '\n';
+  const std::lock_guard<std::mutex> lock(messengersLock);
   if (auto it = messengers.find(topicName); it != messengers.end()) {
     it->second->enqueueMessageToSend(std::move(msg));
   } else {
@@ -47,6 +48,10 @@ void KafkaMessengerPool::monitorTopics() {
 
 void KafkaMessengerPool::searchForNewKafakTopics() {
   const auto allTopicStrings = kafkaManager->getAllTopicStrings();
+  const std::set<std::string> existingTopics(allTopicStrings.begin(),
+                                             allTopicStrings.end());
+
+  const std::lock_guard<std::mutex> lock(messengersLock);
   for (const auto &topicString : allTopicStrings) {
     if (!monitoredTopics.contains(topicString)) {
       const auto topicInfoMaybe =
@@ -55,6 +60,33 @@ void KafkaMessengerPool::searchForNewKafakTopics() {
         createNewMessenger(topicInfoMaybe.value());
       }
     }
+  }
+  dropVanishedTopics(existingTopics);
+}
+
+// A topic can DISAPPEAR, and this pool used to be insert-only: monitoredTopics never
+// shrank, so a deleted topic left a consumer polling a partition that no longer
+// exists, logging "Consume failed: topic does not exist" for the lifetime of the
+// process. The ghosts accumulate -- one per deleted topic -- and the only cure was a
+// bridge restart.
+//
+// That went from "rare" to "routine" when instance replay landed: every replay
+// creates a scratch Marker/<replay-id> topic and deletes it when the replay ends, so
+// each replay used to leak one permanently-failing consumer.
+void KafkaMessengerPool::dropVanishedTopics(
+    const std::set<std::string> &existingTopics) {
+  for (auto iterator = monitoredTopics.begin();
+       iterator != monitoredTopics.end();) {
+    if (existingTopics.contains(*iterator)) {
+      ++iterator;
+      continue;
+    }
+    std::cout << "% Topic no longer exists; dropping its messenger: " << *iterator
+              << '\n';
+    // ~BrokerMessagingQueue clears its `running` flag and joins its consumer
+    // thread, so this both stops the polling and releases the client handles.
+    messengers.erase(*iterator);
+    iterator = monitoredTopics.erase(iterator);
   }
 }
 

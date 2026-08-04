@@ -3,6 +3,8 @@
 #include "GraphTopicResolution.hpp"
 #include "GraphTransportPlan.hpp"
 #include "InProcessTransport.hpp"
+#include "ParquetExport.hpp"
+#include "ReplaySource.hpp"
 
 #include <chrono>
 #include <algorithm>
@@ -20,6 +22,8 @@
 #include <deque>
 #include <unordered_map>
 #include <unordered_set>
+
+#include <openssl/evp.h>
 #include <vector>
 
 using namespace drogon;
@@ -555,7 +559,27 @@ getAlternateTransformInputMappings()
                 {"TP9", "eeg.tp9"},
                 {"AF7", "eeg.af7"},
                 {"AF8", "eeg.af8"},
-                {"TP10", "eeg.tp10"}}}};
+                {"TP10", "eeg.tp10"}}},
+        // IMU accel/gyro as filterable channels. The bulk frame is sample-major
+        // on the wire; NatImuBulkDataSchemaDescriptor projects it into the per-axis
+        // sample arrays referenced here. sample_rate_hz comes from the frame
+        // envelope (real path, not a fixed value). Quaternion is intentionally
+        // excluded — a unit rotation isn't a meaningful per-channel filter target.
+        TransformInputMappingDefinition{
+            "natimu_motion_v1",
+            "IMU accel/gyro",
+            nat::core::NatImuBulkDataSchema::name,
+            "seq_no",
+            "device_ts_us",
+            "sample_rate_hz",
+            std::nullopt,
+            std::vector<TransformInputChannelMappingDefinition>{
+                {"Accel X", "accel_x"},
+                {"Accel Y", "accel_y"},
+                {"Accel Z", "accel_z"},
+                {"Gyro X", "gyro_x"},
+                {"Gyro Y", "gyro_y"},
+                {"Gyro Z", "gyro_z"}}}};
     return mappings;
 }
 
@@ -1282,11 +1306,15 @@ inline bool isProvenancePortId(const std::string& port_id)
     return port_id.rfind("prov_", 0) == 0;
 }
 
-// The dedicated provenance stubs each node kind exposes (per the plan: the
-// source end taps its data output; experiment/train/classify get stubs).
-constexpr const char* kProvenancePortSource = "prov_source"; // source->experiment
-constexpr const char* kProvenancePortExperiment =
-    "prov_experiment"; // experiment->train (train input)
+// The dedicated provenance stubs each node kind exposes.
+//
+// `prov_source` (source->experiment) and `prov_experiment` (experiment->train)
+// are RETIRED (experiment-history-snapshots-plan): the experiment now owns the
+// whole graph, so every source in it is a recorded source and that lineage is
+// implicit. A train node points at instances -- concrete datasets with
+// materialized files -- instead of at an experiment node. Only the
+// train->classify pair survives, because a model artifact is a real handoff
+// between two nodes that nothing else expresses.
 constexpr const char* kProvenancePortModels =
     "prov_models"; // train->classify (train output)
 constexpr const char* kProvenancePortModel =
@@ -1399,34 +1427,62 @@ nlohmann::json buildNodeCatalogJson()
          {"output_ports", nlohmann::json::array()},
          {"variadic_inputs", false}});
 
-    // Experiment — a SOURCE of timestamped cue/session markers. It runs a
-    // structured protocol (ordered cues + labels) and emits a `markers` stream
-    // (MarkerEventV1 for its session_id); it has NO inputs — the marker timeline
-    // is generated independently of any data source (the raw data already lives
-    // in Kafka), so an experiment is source-like, not a processing node.
-    // Downstream marker-aware nodes (a marker viewer, a train node) consume the
-    // cue timeline. Its protocol config lives on the node.
+    // Markers — a config-less SOURCE of the bound experiment's cue/session
+    // marker timeline (MarkerEventV1 on Marker/<experiment_id>).
+    //
+    // This is what is left on the canvas after the experiment became a
+    // first-class object (experiment-history-snapshots-plan): markers are WIRED
+    // data -- the marker viewer overlay, topic-aware combine's marker lane and
+    // the export node's label join all consume them -- so the wiring stays, but
+    // the protocol authoring, participant, notes and the Record button move to
+    // experiment-level UI. The node has nothing to configure: it resolves its
+    // topic from the graph's bound experiment_id, so it is correct by
+    // construction rather than by the author retyping an id.
+    //
+    // The retired `experiment` kind is still PARSED (see from_json) so old
+    // boards load, but it is no longer advertised here -- there is nothing to
+    // author on it any more.
     const auto markersOutputPort = []() {
         return nlohmann::json::array(
             {{{"id", "markers"}, {"label", "Markers"}}});
     };
     nodes.push_back(
-        {{"node_type", "experiment"},
-         {"kind", "experiment"},
+        {{"node_type", "markers"},
+         {"kind", "markers"},
          {"category", "source"},
-         {"runner", "frontend"},
-         {"label", "Experiment"},
+         {"runner", "kafka_source"},
+         {"label", "Markers"},
          {"description",
-          "A source of timestamped markers: runs a structured protocol (ordered "
-          "cues + labels) and emits a `markers` stream (cue/session events) that "
-          "marker-aware nodes downstream can render or train on. Has no inputs — "
-          "the cue timeline is generated independently of any data source."},
+          "The bound experiment's marker timeline (cue + session events) as a "
+          "stream. Wire it into a viewer to see cues on the trace, into combine "
+          "to carry markers alongside data, or into export to label each row. "
+          "Nothing to configure — it follows whichever experiment owns this "
+          "board; bind one from the board header."},
          {"config_fields", nlohmann::json::array()},
-         {"input_ports",
-          nlohmann::json::array(
-              {provPort(kProvenancePortSource, "Records")})},
+         {"input_ports", nlohmann::json::array()},
          {"output_ports", markersOutputPort()},
          {"variadic_inputs", false}});
+
+    // Export — writes its inputs to a durable dataset file (Parquet) via a
+    // control-plane job submitted client-side. Terminal like a sink, but
+    // topic-aware and variadic: data inputs become the exported rows and a
+    // `markers` input supplies both the session window and the cue label joined
+    // onto each row. No stream output — its artifact is a file.
+    nodes.push_back(
+        {{"node_type", "export"},
+         {"kind", "export"},
+         {"category", "export"},
+         {"runner", "control_plane"},
+         {"label", "Export"},
+         {"description",
+          "Writes a labeled dataset file (Parquet) from its inputs. Wire a data "
+          "stream in for the rows and a markers node in to scope the "
+          "session window and label each row with the active cue. Run the export "
+          "from the inspector; artifacts land in the server's export directory."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", singleInputPort()},
+         {"output_ports", nlohmann::json::array()},
+         {"variadic_inputs", true}});
 
     // Train — submits a control-plane train_validate job from a labeled dataset
     // (client-driven via the ML proxy); its output is a durable model artifact,
@@ -1441,12 +1497,10 @@ nlohmann::json buildNodeCatalogJson()
          {"description",
           "Trains a classifier on a recorded session dataset (model families + "
           "feature windowing), producing a durable model artifact a classify "
-          "node can load. Wire an experiment into it to scope the training runs, "
-          "and its models output into a classify node to serve them."},
+          "node can load. Pick the recorded runs in the inspector, and wire its "
+          "models output into a classify node to serve them."},
          {"config_fields", nlohmann::json::array()},
-         {"input_ports",
-          nlohmann::json::array(
-              {provPort(kProvenancePortExperiment, "Experiment")})},
+         {"input_ports", nlohmann::json::array()},
          {"output_ports",
           nlohmann::json::array(
               {provPort(kProvenancePortModels, "Models")})},
@@ -1510,6 +1564,17 @@ inline bool isProvenanceEdge(const StreamGraphEdge& edge)
     return edge.edgeKind == "provenance";
 }
 
+// A node kind whose output channel carries MARKER events rather than data
+// frames. Topic-aware consumers (combine's marker lane, export's label join)
+// classify their inputs by this, so it is centralized: the retired `experiment`
+// kind is still a marker source on boards that predate the split, and a site
+// that checked only one of the two names would silently treat the other's
+// markers as an unresolvable data input.
+inline bool isMarkerSourceKind(const std::string& kind)
+{
+    return kind == "markers" || kind == "experiment";
+}
+
 struct StreamGraphDefinition {
     int graphVersion = 1;
     std::string graphId{};
@@ -1527,6 +1592,24 @@ struct StreamGraphDefinition {
     // a saved composite graph reloads from the backend alone; the executed graph
     // is still the flattened `nodes`/`edges` above.
     nlohmann::json editorMetadata = nlohmann::json(nullptr);
+
+    // --- Experiment history (experiment-history-snapshots-plan) --------------
+    // A graph is one of three things:
+    //   live graph  : experimentId set, instanceId empty            (editable)
+    //   recording   : instanceId set, immutable=true, origin=recording
+    //   fork        : instanceId set, immutable=false, origin=fork, forkedFrom set
+    // A fork is a recording that happens to be editable -- same record shape,
+    // same place in the tree, and it INHERITS `recording` so it points at the
+    // very same materialized artifacts. Forking never copies data.
+    std::string experimentId{};
+    std::string instanceId{};
+    bool immutable = false;
+    std::string origin{};       // "recording" | "fork" | "" (live graph)
+    std::string forkedFrom{};   // parent instance_id, for fork-of-fork nesting
+    // The captured session: session_id, window, recorded streams, artifact refs,
+    // status. Opaque here -- the backend stores and returns it verbatim in this
+    // phase; materialization interprets it later.
+    nlohmann::json recording = nlohmann::json(nullptr);
 };
 
 struct StreamGraphDiagnostic {
@@ -1585,6 +1668,11 @@ struct StreamGraphRuntimeState {
     std::string runState{"stopped"};
     std::unordered_map<std::string, StreamGraphNodeRuntimeStatus> nodeStatuses{};
     std::vector<uint64_t> outputStreamIds{};
+    // Set when this run's sources were repointed at a replay's scratch topics. The
+    // replay stops the run it owns when it ends, and this is how it recognises it:
+    // by then the user may have stopped the run and started a live one, which must
+    // be left alone.
+    std::string boundReplayId{};
 };
 
 struct LiveTransformWorkerSnapshot {
@@ -1764,6 +1852,23 @@ void to_json(nlohmann::json& json, const StreamGraphDefinition& value)
     if (!value.editorMetadata.is_null()) {
         json["editor_metadata"] = value.editorMetadata;
     }
+    // Emitted only when set, so a plain board's JSON is unchanged.
+    if (!value.experimentId.empty()) {
+        json["experiment_id"] = value.experimentId;
+    }
+    if (!value.instanceId.empty()) {
+        json["instance_id"] = value.instanceId;
+        json["immutable"] = value.immutable;
+    }
+    if (!value.origin.empty()) {
+        json["origin"] = value.origin;
+    }
+    if (!value.forkedFrom.empty()) {
+        json["forked_from"] = value.forkedFrom;
+    }
+    if (!value.recording.is_null()) {
+        json["recording"] = value.recording;
+    }
 }
 
 void from_json(const nlohmann::json& json, StreamGraphDefinition& value)
@@ -1776,8 +1881,44 @@ void from_json(const nlohmann::json& json, StreamGraphDefinition& value)
     value.updatedAtUs = json.value("updated_at_us", static_cast<uint64_t>(0));
     value.nodes = json.at("nodes").get<std::vector<StreamGraphNode>>();
     value.edges = json.value("edges", std::vector<StreamGraphEdge>{});
+    // Migration: drop the retired provenance ports (prov_source,
+    // prov_experiment) and every edge that referenced them. Both halves matter.
+    // Without the edge half an old board loads with edges pointing at ports that
+    // no longer exist and goes invalid on a diagnostic the author can't fix;
+    // without the port half the stored port list still lists them, so a legacy
+    // board keeps RENDERING a dead lineage port until something happens to
+    // re-save it. Doing it here, at the parse boundary, means neither the
+    // executor nor the editor ever sees them.
+    const auto isRetiredPort = [](const std::string& port) {
+        return port == "prov_source" || port == "prov_experiment";
+    };
+    value.edges.erase(
+        std::remove_if(
+            value.edges.begin(),
+            value.edges.end(),
+            [&isRetiredPort](const StreamGraphEdge& edge) {
+                return isRetiredPort(edge.sourcePort) ||
+                       isRetiredPort(edge.targetPort);
+            }),
+        value.edges.end());
+    for (auto& node : value.nodes) {
+        node.inputPortIds.erase(
+            std::remove_if(node.inputPortIds.begin(), node.inputPortIds.end(),
+                           isRetiredPort),
+            node.inputPortIds.end());
+        node.outputPortIds.erase(
+            std::remove_if(node.outputPortIds.begin(), node.outputPortIds.end(),
+                           isRetiredPort),
+            node.outputPortIds.end());
+    }
     value.notes = json.value("notes", std::vector<std::string>{});
     value.editorMetadata = json.value("editor_metadata", nlohmann::json(nullptr));
+    value.experimentId = json.value("experiment_id", std::string{});
+    value.instanceId = json.value("instance_id", std::string{});
+    value.immutable = json.value("immutable", false);
+    value.origin = json.value("origin", std::string{});
+    value.forkedFrom = json.value("forked_from", std::string{});
+    value.recording = json.value("recording", nlohmann::json(nullptr));
     if (json.contains("ui") && json["ui"].is_object()) {
         const auto& ui = json["ui"];
         if (ui.contains("viewport")) {
@@ -1873,10 +2014,15 @@ void normalizeGraphNodePorts(StreamGraphNode& node)
     // normalization regardless of the kind's data-port rules. Collect the ones
     // the node already declares so they can be re-appended after the data ports
     // are reset, then ensure the kind's own dedicated stub is present.
+    // Retired provenance ports are dropped rather than preserved: an old board
+    // that still declares prov_source / prov_experiment loses those ports (and
+    // with them the edges that targeted them) on its first normalization, which
+    // is what retiring them means.
     const auto collectProvenance = [](const std::vector<std::string>& ports) {
         std::vector<std::string> kept;
         for (const auto& port : ports) {
-            if (isProvenancePortId(port)) {
+            if (isProvenancePortId(port) && port != "prov_source" &&
+                port != "prov_experiment") {
                 kept.push_back(port);
             }
         }
@@ -1909,25 +2055,49 @@ void normalizeGraphNodePorts(StreamGraphNode& node)
     } else if (node.kind == "viewer" || node.kind == "sink") {
         node.inputPortIds = {"input"};
         node.outputPortIds.clear();
-    } else if (node.kind == "experiment") {
-        // An experiment is source-like: it generates a marker timeline from its
-        // protocol, so it has no DATA inputs and exposes exactly one data output
-        // port, `markers`. It gains a prov_source input stub so a source can be
-        // wired as its recorded stream (source->experiment lineage).
+    } else if (node.kind == "markers" || node.kind == "experiment") {
+        // A markers node is source-like: it republishes the bound experiment's
+        // marker timeline, so it has no inputs and exposes exactly one output
+        // port, `markers`. The retired `experiment` kind normalizes identically
+        // (its protocol config is ignored; the experiment record owns it now), so
+        // an old board keeps the same port shape and its edges stay valid.
         node.inputPortIds.clear();
         node.outputPortIds = {"markers"};
-        ensurePort(provInputs, kProvenancePortSource);
+        if (node.config.is_null()) {
+            node.config = nlohmann::json::object();
+        }
+    } else if (node.kind == "export") {
+        // An export node is terminal and variadic: it fans in one or more data
+        // inputs (the exported rows) plus optional experiment `markers` inputs
+        // (session window + cue labels), and produces a file, not a stream. Keep
+        // whatever data inputs the author wired (defaulting to one) and clear the
+        // outputs, like a sink.
+        if (node.inputPortIds.empty()) {
+            node.inputPortIds = {"input"};
+        } else {
+            // Drop provenance ids from the data-port list; they are re-appended
+            // below with the other preserved provenance ports.
+            std::vector<std::string> dataInputs;
+            for (const auto& port : node.inputPortIds) {
+                if (!isProvenancePortId(port)) {
+                    dataInputs.push_back(port);
+                }
+            }
+            node.inputPortIds =
+                dataInputs.empty() ? std::vector<std::string>{"input"} : dataInputs;
+        }
+        node.outputPortIds.clear();
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
         }
     } else if (node.kind == "train") {
         // A train node submits a control-plane job (client-driven); no DATA
-        // stream output. It gains a prov_experiment input stub (experiment->train
-        // lineage: which sessions to train on) and a prov_models output stub
-        // (train->classify lineage: the models it produced).
+        // stream output. It keeps a prov_models output stub (train->classify
+        // lineage: the models it produced). The retired prov_experiment input is
+        // dropped here, so an old board's experiment->train edge falls away with
+        // the port it targeted.
         node.inputPortIds.clear();
         node.outputPortIds.clear();
-        ensurePort(provInputs, kProvenancePortExperiment);
         ensurePort(provOutputs, kProvenancePortModels);
         if (node.config.is_null()) {
             node.config = nlohmann::json::object();
@@ -2436,9 +2606,450 @@ bool persistProfileStoreLocked(std::string& error)
     return true;
 }
 
+// --- Experiments (experiment-history-snapshots-plan, Phase 1) ---------------
+//
+// An experiment stops being a NODE on the canvas and becomes a first-class
+// stored object that OWNS a graph and (from Phase 2) a history of instances.
+// What lived in the experiment node's config -- the protocol, participant and
+// notes -- lives here instead; the canvas keeps only a config-less `markers`
+// source node that resolves Marker/<experiment_id> from the graph's bound
+// experiment.
+//
+// `protocol` is opaque json for the same reason `editor_metadata` is: the
+// protocol shape (classes / repetitions / hold+rest timings) is authored and
+// consumed entirely by the frontend, which already round-trips it through the
+// node's generic config. Storing it verbatim keeps one owner of that shape.
+//
+// The binding to a board is 1:1 and lives on BOTH sides: the experiment names
+// its `live_graph_id`, and that graph carries `experiment_id`. save_experiment
+// is the sole writer of the pair (handleSaveStreamGraph deliberately re-pins
+// experiment_id from the stored record), so the two can't drift.
+struct Experiment {
+    std::string experimentId;
+    std::string label;
+    nlohmann::json protocol = nlohmann::json(nullptr);
+    std::string participantId;
+    std::string notes;
+    std::string liveGraphId;  // the editable board this experiment records with
+    uint64_t createdAtUs = 0;
+    uint64_t updatedAtUs = 0;
+};
+
+void to_json(nlohmann::json& json, const Experiment& value)
+{
+    json = {
+        {"experiment_id", value.experimentId},
+        {"label", value.label},
+        {"participant_id", value.participantId},
+        {"notes", value.notes},
+        {"live_graph_id", value.liveGraphId},
+        {"created_at_us", value.createdAtUs},
+        {"updated_at_us", value.updatedAtUs},
+    };
+    json["protocol"] = value.protocol;
+}
+
+void from_json(const nlohmann::json& json, Experiment& value)
+{
+    value.experimentId = json.at("experiment_id").get<std::string>();
+    value.label = json.value("label", std::string{});
+    value.protocol = json.value("protocol", nlohmann::json(nullptr));
+    value.participantId = json.value("participant_id", std::string{});
+    value.notes = json.value("notes", std::string{});
+    value.liveGraphId = json.value("live_graph_id", std::string{});
+    value.createdAtUs = json.value("created_at_us", static_cast<uint64_t>(0));
+    value.updatedAtUs = json.value("updated_at_us", static_cast<uint64_t>(0));
+}
+
+std::filesystem::path resolveExperimentStorePath()
+{
+    const char* store_path = std::getenv("NATKIT_EXPERIMENT_STORE");
+    if (store_path != nullptr && store_path[0] != '\0') {
+        return std::filesystem::path(store_path);
+    }
+    // The fallback is relative to the working directory, which in a container is
+    // the ephemeral image layer -- fine for a local run, but it means an
+    // experiment (and the history it owns) would not survive a container
+    // recreate. Every compose file therefore points NATKIT_EXPERIMENT_STORE at
+    // the same durable volume as the graph store.
+    return std::filesystem::path("./data/experiments.json");
+}
+
+std::unordered_map<std::string, Experiment> g_experiments;
+std::mutex g_experiment_mutex;
+bool g_experiment_store_loaded = false;
+std::string g_experiment_store_error{};
+
+void ensureExperimentStoreLoadedLocked()
+{
+    if (g_experiment_store_loaded) {
+        return;
+    }
+    g_experiment_store_loaded = true;
+    g_experiment_store_error.clear();
+    g_experiments.clear();
+    const auto store_path = resolveExperimentStorePath();
+    if (!std::filesystem::exists(store_path)) {
+        return;
+    }
+    std::ifstream input(store_path);
+    if (!input) {
+        g_experiment_store_error =
+            "Failed to open experiment store at " + store_path.string();
+        return;
+    }
+    try {
+        nlohmann::json json = nlohmann::json::parse(input);
+        if (json.value("store_version", 0) != 1 || !json["experiments"].is_array()) {
+            throw std::runtime_error(
+                "Experiment store must contain store_version=1 and an experiments array");
+        }
+        for (const auto& experiment_json : json["experiments"]) {
+            Experiment experiment = experiment_json.get<Experiment>();
+            g_experiments[experiment.experimentId] = std::move(experiment);
+        }
+    } catch (const std::exception& exception) {
+        g_experiments.clear();
+        g_experiment_store_error =
+            "Failed to parse experiment store: " + std::string(exception.what());
+    }
+}
+
+// Apply the graph side of the 1:1 experiment<->board binding: stamp
+// `experiment_id` onto the bound board and clear it from any OTHER live board
+// that pointed at this experiment. Instances are left alone -- they belong to
+// this experiment's history permanently, and re-binding the live board must not
+// disown them.
+//
+// Called with g_experiment_mutex held and takes g_stream_graph_mutex, so the
+// lock order is always experiment -> graph. Nothing acquires them the other way
+// round (the graph handlers never touch the experiment store).
+bool applyExperimentGraphBindingLocked(
+    const std::string& experiment_id,
+    const std::string& live_graph_id,
+    std::string& error)
+{
+    std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+    ensureStreamGraphStoreLoadedLocked();
+    if (!g_stream_graph_store_error.empty()) {
+        error = g_stream_graph_store_error;
+        return false;
+    }
+    if (!live_graph_id.empty()) {
+        const auto target = g_stream_graphs.find(live_graph_id);
+        if (target == g_stream_graphs.end()) {
+            error = "Unknown graph: " + live_graph_id;
+            return false;
+        }
+        if (!target->second.instanceId.empty()) {
+            error = "Graph '" + live_graph_id +
+                    "' is instance " + target->second.instanceId +
+                    ", not a live board. An experiment records with an editable "
+                    "board; fork the instance if you want to edit it.";
+            return false;
+        }
+    }
+
+    bool changed = false;
+    for (auto& entry : g_stream_graphs) {
+        auto& graph = entry.second;
+        if (!graph.instanceId.empty()) {
+            continue;  // history: never re-parented by a binding change
+        }
+        const bool should_be_bound = !live_graph_id.empty() && entry.first == live_graph_id;
+        if (should_be_bound && graph.experimentId != experiment_id) {
+            graph.experimentId = experiment_id;
+            graph.updatedAtUs = nowUs();
+            changed = true;
+        } else if (!should_be_bound && graph.experimentId == experiment_id) {
+            graph.experimentId.clear();
+            graph.updatedAtUs = nowUs();
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return true;
+    }
+    return persistStreamGraphStoreLocked(error);
+}
+
+bool persistExperimentStoreLocked(std::string& error)
+{
+    const auto store_path = resolveExperimentStorePath();
+    if (store_path.has_parent_path()) {
+        std::filesystem::create_directories(store_path.parent_path());
+    }
+    nlohmann::json store_json;
+    store_json["store_version"] = 1;
+    store_json["experiments"] = nlohmann::json::array();
+    for (const auto& entry : g_experiments) {
+        store_json["experiments"].push_back(entry.second);
+    }
+    const auto temp_path = store_path.string() + ".tmp";
+    {
+        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            error = "Failed to open temporary experiment store file for write";
+            return false;
+        }
+        output << store_json.dump(2);
+        if (!output.good()) {
+            error = "Failed while writing experiment store";
+            return false;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temp_path, store_path, rename_error);
+    if (rename_error) {
+        std::filesystem::remove(store_path, rename_error);
+        rename_error.clear();
+        std::filesystem::rename(temp_path, store_path, rename_error);
+    }
+    if (rename_error) {
+        error =
+            "Failed to atomically replace experiment store: " + rename_error.message();
+        return false;
+    }
+    return true;
+}
+
+// --- Instance artifacts (experiment-history-snapshots-plan, Phase 3) --------
+//
+// An instance is only "permanent" once its data has LEFT Kafka. The broker here
+// keeps 168h of retention and its log dir is a container volume, so a snapshot
+// backed by topics silently becomes an empty snapshot. Materialization writes
+// Parquet (plus the markers sidecar) into this store, checksums it, and marks it
+// read-only.
+//
+// Be clear about what each of those buys: the read-only mode bits stop an
+// ACCIDENT (a stray write, a re-run pointed at the same path). They are not a
+// guarantee -- this backend runs as root in its container, and root ignores mode
+// bits entirely. The sha256 is the part that actually makes corruption
+// detectable, which is why it is recorded per artifact and why
+// verify_experiment_instance exists to check it.
+std::filesystem::path resolveInstanceStorePath()
+{
+    const char* store_path = std::getenv("NATKIT_INSTANCE_STORE");
+    if (store_path != nullptr && store_path[0] != '\0') {
+        return std::filesystem::path(store_path);
+    }
+    return std::filesystem::path("./data/instances");
+}
+
+// <store>/<experiment_id>/<instance_id>/ — one directory per instance, so an
+// instance's artifacts can be listed, checksummed and removed as a unit.
+std::filesystem::path instanceArtifactDir(
+    const std::string& experimentId, const std::string& instanceId)
+{
+    return resolveInstanceStorePath() / experimentId / instanceId;
+}
+
+// SHA-256 of a file, lowercase hex. Recorded per artifact so truncation or
+// tampering is detectable at review time rather than at training time.
+std::string sha256OfFile(const std::filesystem::path& path, std::string& error)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        error = "Failed to open for checksum: " + path.string();
+        return {};
+    }
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(
+        EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+    if (context == nullptr ||
+        EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+        error = "Failed to initialize SHA-256";
+        return {};
+    }
+    std::vector<char> buffer(1 << 16);
+    while (input.good()) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto read = input.gcount();
+        if (read > 0 &&
+            EVP_DigestUpdate(context.get(), buffer.data(),
+                             static_cast<size_t>(read)) != 1) {
+            error = "Failed while hashing " + path.string();
+            return {};
+        }
+    }
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_length = 0;
+    if (EVP_DigestFinal_ex(context.get(), digest, &digest_length) != 1) {
+        error = "Failed to finalize SHA-256";
+        return {};
+    }
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0');
+    for (unsigned int index = 0; index < digest_length; ++index) {
+        hex << std::setw(2) << static_cast<int>(digest[index]);
+    }
+    return hex.str();
+}
+
+// Make an artifact read-only. An accident guard, not a security boundary (see
+// above): root bypasses it, so the checksum is the real integrity record.
+void markArtifactReadOnly(const std::filesystem::path& path)
+{
+    std::error_code error;
+    std::filesystem::permissions(
+        path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::group_read |
+            std::filesystem::perms::others_read,
+        std::filesystem::perm_options::replace,
+        error);
+}
+
+// The next recording instance id for an experiment: run-0001, run-0002, ...
+// Forks then suffix these (run-0001-a) via nextForkInstanceIdLocked, so an id
+// reads as its own lineage. Caller holds g_stream_graph_mutex.
+std::string nextRecordingInstanceIdLocked(const std::string& experimentId)
+{
+    int highest = 0;
+    for (const auto& entry : g_stream_graphs) {
+        const auto& graph = entry.second;
+        if (graph.experimentId != experimentId || graph.instanceId.empty()) {
+            continue;
+        }
+        // Only plain run-NNNN ids count; a fork's run-0001-a must not bump the
+        // recording counter.
+        if (graph.instanceId.rfind("run-", 0) != 0) {
+            continue;
+        }
+        const auto suffix = graph.instanceId.substr(4);
+        if (suffix.empty() ||
+            !std::all_of(suffix.begin(), suffix.end(),
+                         [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            continue;
+        }
+        highest = std::max(highest, std::stoi(suffix));
+    }
+    std::ostringstream id;
+    id << "run-" << std::setw(4) << std::setfill('0') << (highest + 1);
+    return id.str();
+}
+
+}  // namespace (reopened below)
+
+// --- Active replays (experiment-history-snapshots-plan, Phase 5) ------------
+//
+// A replay streams an instance's Parquet back onto a SCRATCH Kafka topic, so
+// everything downstream (transform workers, viewers, combine, the marker overlay)
+// works unchanged — from the graph's point of view it is just another live stream.
+// The registry exists so a replay can be stopped and its scratch topics deleted:
+// they are ephemeral by construction, and leaking one per replay would accrete
+// topics on a broker whose storage we now care about.
+struct ActiveReplay {
+    std::string replayId;
+    std::string graphId;
+    natkit::tools::ReplayPlan plan;
+    std::shared_ptr<std::atomic<bool>> cancelled;
+    natkit::tools::ReplayProgress progress{};
+    bool paced = true;
+    double speed = 1.0;
+};
+
+std::unordered_map<std::string, ActiveReplay> g_active_replays;
+std::mutex g_replay_mutex;
+
+std::string sanitizeTopicIdentifier(const std::string& value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (const char character : value) {
+        const bool allowed = (character >= 'A' && character <= 'Z') ||
+                             (character >= 'a' && character <= 'z') ||
+                             (character >= '0' && character <= '9') ||
+                             character == '-' || character == '_';
+        out.push_back(allowed ? character : '-');
+    }
+    if (out.empty() || !std::isalnum(static_cast<unsigned char>(out.front()))) {
+        out.insert(out.begin(), 'r');
+    }
+    return out;
+}
+
+// One shape for a replay's state, used by the reply, the broadcasts and the list.
+nlohmann::json makeReplayStateJson(const std::string& replayId,
+                                   const std::string& graphId,
+                                   const natkit::tools::ReplayPlan& plan,
+                                   const natkit::tools::ReplayProgress& progress,
+                                   const std::string& state)
+{
+    nlohmann::json bindings = nlohmann::json::array();
+    for (const auto& binding : plan.bindings) {
+        bindings.push_back({
+            // The client maps "the source node that read stream X" to the scratch
+            // topic, and start_stream_graph does the same server-side.
+            {"original_stream_id", std::to_string(binding.originalStreamId)},
+            {"replay_stream_id", std::to_string(binding.replayStreamId)},
+            {"topic", binding.topic},
+            {"frame_count", binding.frameCount},
+            {"channel_labels", binding.channelLabels},
+        });
+    }
+    nlohmann::json json;
+    json["replay_id"] = replayId;
+    json["graph_id"] = graphId;
+    json["state"] = state;
+    json["bindings"] = std::move(bindings);
+    json["marker_stream_id"] = std::to_string(plan.markerStreamId);
+    json["marker_count"] = plan.markerCount;
+    json["total_frames"] = plan.totalFrames;
+    json["first_ts_us"] = plan.firstTsUs;
+    json["last_ts_us"] = plan.lastTsUs;
+    json["frames_published"] = progress.framesPublished;
+    json["markers_published"] = progress.markersPublished;
+    json["last_published_ts_us"] = progress.lastTsUs;
+    if (!progress.error.empty()) {
+        json["error"] = progress.error;
+    }
+    return json;
+}
+
+// Artifact lookup for the download endpoint. Defined outside the anonymous
+// namespace so NatKitBackend can call it; it reads the same store everything else
+// does, under the same lock.
+bool natkitLookupInstanceArtifact(const std::string& graphId,
+                                  const std::string& artifactName,
+                                  std::string& directoryOut,
+                                  bool& listedOut)
+{
+    listedOut = false;
+    std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+    ensureStreamGraphStoreLoadedLocked();
+    const auto stored = g_stream_graphs.find(graphId);
+    if (stored == g_stream_graphs.end() || stored->second.instanceId.empty()) {
+        return false;
+    }
+    const auto artifacts =
+        stored->second.recording.value("artifacts", nlohmann::json::object());
+    directoryOut = artifacts.value(
+        "directory",
+        instanceArtifactDir(stored->second.experimentId,
+                            stored->second.instanceId).string());
+    for (const auto& data : artifacts.value("data", nlohmann::json::array())) {
+        if (data.value("path", std::string{}) == artifactName) {
+            listedOut = true;
+            return true;
+        }
+    }
+    if (artifacts.value("markers", std::string{}) == artifactName) {
+        listedOut = true;
+    }
+    return true;
+}
+
+namespace {
+
 StreamGraphValidationResult validateStreamGraphDefinition(
     const StreamGraphDefinition& graph,
-    std::shared_ptr<nat::kafka::BrokerManager> broker_manager)
+    std::shared_ptr<nat::kafka::BrokerManager> broker_manager,
+    // Stream ids that are known-good WITHOUT asking the broker. Replay binds a
+    // source to a scratch topic the replay itself owns and is about to publish to;
+    // the broker may not have observed that topic yet (auto-creation happens on
+    // first produce, and metadata takes a moment to propagate), so asking it
+    // "does this topic exist?" fails a graph that is perfectly well formed. The
+    // replay plan is the authority for those ids, not the broker.
+    const std::unordered_set<uint64_t>& assumed_source_streams = {})
 {
     StreamGraphValidationResult result;
     if (graph.graphVersion != 1) {
@@ -2487,8 +3098,9 @@ StreamGraphValidationResult validateStreamGraphDefinition(
 
         if (node.kind != "stream_source" && node.kind != "transform" &&
             node.kind != "viewer" && node.kind != "sink" &&
-            node.kind != "combine" && node.kind != "experiment" &&
-            node.kind != "train") {
+            node.kind != "combine" && node.kind != "markers" &&
+            node.kind != "experiment" && node.kind != "train" &&
+            node.kind != "export") {
             addGraphDiagnostic(
                 result,
                 result.nodeDiagnostics[node.id],
@@ -2596,17 +3208,57 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     "invalid_combine_output_ports",
                     "combine nodes must expose exactly one output port in V1.");
             }
-        } else if (node.kind == "experiment") {
-            // An experiment node records its upstream sensor streams and exposes
-            // exactly one output port, `markers` (the MarkerEventV1 stream for
-            // its session_id). Any other output-port shape is invalid.
+        } else if (node.kind == "markers" || node.kind == "experiment") {
+            // A markers node exposes exactly one output port, `markers` (the
+            // MarkerEventV1 stream for the bound experiment). Any other
+            // output-port shape is invalid.
             if (node.outputPortIds.size() != 1U ||
                 node.outputPortIds.front() != "markers") {
                 addGraphDiagnostic(
                     result,
                     result.nodeDiagnostics[node.id],
-                    "invalid_experiment_output_ports",
-                    "experiment nodes expose exactly one output port, 'markers'.");
+                    "invalid_markers_output_ports",
+                    "markers nodes expose exactly one output port, 'markers'.");
+            }
+            // The topic comes from the graph's bound experiment, not from the
+            // node, so an unbound board has nothing for this node to republish.
+            // A warning, not an error: the board is still startable and every
+            // other branch runs -- binding an experiment is a header action, and
+            // blocking the whole graph on it would be out of proportion.
+            //
+            // A legacy `experiment` node still resolves from its own config, so it
+            // is only unbound when THAT is empty too -- warning about it otherwise
+            // would flag a board that works.
+            const bool node_carries_own_id =
+                node.kind == "experiment" && node.config.is_object() &&
+                isValidTopicIdentifier(
+                    node.config.value("experiment_id", std::string{}));
+            if (graph.experimentId.empty() && !node_carries_own_id) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "unbound_experiment",
+                    "No experiment is bound to this board, so there is no marker "
+                    "timeline to republish. Bind one from the board header.",
+                    "warning");
+            }
+        } else if (node.kind == "export") {
+            // An export node is terminal: its artifact is a file, so a data
+            // output port is invalid (provenance stubs are fine). Input count is
+            // checked in the descriptor pass below, where marker inputs can be
+            // told apart from data inputs.
+            const bool export_has_data_output = std::any_of(
+                node.outputPortIds.begin(),
+                node.outputPortIds.end(),
+                [](const std::string& port) {
+                    return !isProvenancePortId(port);
+                });
+            if (export_has_data_output) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "invalid_export_output_ports",
+                    "export nodes do not expose data output ports.");
             }
         } else if (node.kind == "train") {
             // A train node produces no DATA stream, but may expose provenance
@@ -2745,6 +3397,20 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             if (!broker_manager || !node.streamId.has_value()) {
                 continue;
             }
+            // A replay-bound source resolves from the replay, not the broker: its
+            // topic carries the canonical channel frame by construction.
+            if (assumed_source_streams.count(node.streamId.value()) > 0) {
+                auto assumed_descriptor =
+                    nat::core::DataSchemaDescriptorRegistry::getDefault()
+                        .findBySchemaName(
+                            nat::core::NatSignalFrameDataSchemaV1::name);
+                if (assumed_descriptor.has_value()) {
+                    resolved_output_descriptors[node.id] = assumed_descriptor.value();
+                    node_output_schema_names[node.id] =
+                        std::string(nat::core::NatSignalFrameDataSchemaV1::name);
+                }
+                continue;
+            }
             const auto source_topic =
                 findTransformSourceTopicForStream(broker_manager, node.streamId.value());
             if (source_topic == nullptr) {
@@ -2803,7 +3469,7 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                 const bool source_is_marker =
                     src_search != nodes_by_id.end() &&
                     src_search->second != nullptr &&
-                    src_search->second->kind == "experiment";
+                    isMarkerSourceKind(src_search->second->kind);
                 if (source_is_marker) {
                     has_marker_input = true;
                     continue;
@@ -2863,9 +3529,45 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                         "too_many_inputs",
                         node.kind + " nodes support exactly one input in V1.");
                 }
-            } else if (node.kind == "experiment") {
-                // An experiment is source-like: it generates markers from its
-                // protocol and takes no inputs. Any inbound edge is invalid.
+            } else if (node.kind == "export") {
+                // An export node is variadic and topic-aware: it needs at least
+                // one connected input, and at least one of those must be a DATA
+                // input (the exported rows). A markers-only export would have
+                // nothing to write.
+                bool export_has_data_input = false;
+                std::size_t export_input_count = 0;
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                        continue;
+                    }
+                    ++export_input_count;
+                    const auto src_search = nodes_by_id.find(edge.sourceNodeId);
+                    const bool source_is_marker =
+                        src_search != nodes_by_id.end() &&
+                        src_search->second != nullptr &&
+                        isMarkerSourceKind(src_search->second->kind);
+                    if (!source_is_marker) {
+                        export_has_data_input = true;
+                    }
+                }
+                if (export_input_count == 0) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "missing_input",
+                        "export node input is not connected.");
+                } else if (!export_has_data_input) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "missing_export_data_input",
+                        "export nodes require at least one data input; wire a "
+                        "stream in alongside the experiment markers.");
+                }
+            } else if (node.kind == "markers" || node.kind == "experiment") {
+                // A markers node is source-like: it republishes the bound
+                // experiment's marker timeline and takes no inputs. Any inbound
+                // edge is invalid.
                 const auto input_count = std::count_if(
                     graph.edges.begin(),
                     graph.edges.end(),
@@ -2877,8 +3579,9 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     addGraphDiagnostic(
                         result,
                         result.nodeDiagnostics[node.id],
-                        "invalid_experiment_input",
-                        "experiment nodes take no inputs (they generate markers).");
+                        "invalid_markers_input",
+                        "markers nodes take no inputs (they are a source of the "
+                        "experiment's marker timeline).");
                 }
             }
             continue;
@@ -3817,8 +4520,13 @@ std::shared_ptr<nat::core::BasicTopicInformation> findTransformSourceTopicForStr
         std::shared_ptr<nat::core::BasicTopicInformation> best_topic = nullptr;
         int best_priority = -1;
         for (const auto& topic : data_topics) {
+            // Accept JSON or Binary data topics as transform sources. (The IMU
+            // stream is binary; the backend decodes it via the registered decoder
+            // and the descriptor-compatibility check below still gates whether the
+            // topic can actually feed a transform.)
             if (!topic ||
-                topic->serializationType != nat::core::SerializationType::Json) {
+                (topic->serializationType != nat::core::SerializationType::Json &&
+                 topic->serializationType != nat::core::SerializationType::Binary)) {
                 continue;
             }
             auto descriptor_maybe =
@@ -6175,6 +6883,50 @@ bool stopGraphWorkerByOutputStreamId(uint64_t output_stream_id)
 
 } // namespace
 
+std::optional<NatKitChannelFrameProjection> projectRecordToChannelFrame(
+    const nat::core::Schema& record, uint64_t sourceStreamId)
+{
+    const auto descriptor_maybe =
+        nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
+            record.getName());
+    if (!descriptor_maybe.has_value() || descriptor_maybe.value() == nullptr) {
+        return std::nullopt;
+    }
+    const auto& descriptor = *descriptor_maybe.value();
+
+    const auto toProjection = [](const NormalizedNumericChannelFrame& frame) {
+        NatKitChannelFrameProjection projection;
+        projection.deviceId = frame.deviceId;
+        projection.seqNo = frame.seqNo;
+        projection.deviceTsUs = frame.deviceTsUs;
+        projection.sampleRateHz = frame.sampleRateHz;
+        projection.channelLabels = frame.channelLabels;
+        projection.samples = frame.samples;
+        projection.samplesPerChannel = frame.samplesPerChannel;
+        return projection;
+    };
+
+    // 1. The canonical contract (channels[].samples), if the schema publishes it.
+    if (const auto canonical = tryNormalizeNumericChannelFrame(record, descriptor);
+        canonical.has_value()) {
+        return toProjection(canonical.value());
+    }
+
+    // 2. Otherwise an alternate input mapping — the same list that makes IMU and
+    //    Muse filterable. Without this, export would reject exactly the sensors
+    //    the transform path happily accepts.
+    if (const auto mapping = findCompatibleAlternateInputMapping(descriptor);
+        mapping.has_value()) {
+        if (const auto mapped = tryNormalizeNumericChannelFrame(
+                record, descriptor, mapping.value(), sourceStreamId);
+            mapped.has_value()) {
+            return toProjection(mapped.value());
+        }
+    }
+
+    return std::nullopt;
+}
+
 void StreamViewerWebSocket::handleNewConnection(const HttpRequestPtr& req,
                                                  const WebSocketConnectionPtr& conn)
 {
@@ -6308,6 +7060,9 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "save_stream_graph") {
             handleSaveStreamGraph(conn, json);
         }
+        else if (action == "fork_stream_graph") {
+            handleForkStreamGraph(conn, json);
+        }
         else if (action == "validate_stream_graph") {
             handleValidateStreamGraph(conn, json);
         }
@@ -6331,6 +7086,36 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         }
         else if (action == "delete_profile") {
             handleDeleteProfile(conn, json);
+        }
+        else if (action == "list_experiments") {
+            handleListExperiments(conn, json);
+        }
+        else if (action == "save_experiment") {
+            handleSaveExperiment(conn, json);
+        }
+        else if (action == "delete_experiment") {
+            handleDeleteExperiment(conn, json);
+        }
+        else if (action == "start_experiment_instance") {
+            handleStartExperimentInstance(conn, json);
+        }
+        else if (action == "finish_experiment_instance") {
+            handleFinishExperimentInstance(conn, json);
+        }
+        else if (action == "start_instance_replay") {
+            handleStartInstanceReplay(conn, json);
+        }
+        else if (action == "stop_instance_replay") {
+            handleStopInstanceReplay(conn, json);
+        }
+        else if (action == "list_instance_replays") {
+            handleListInstanceReplays(conn, json);
+        }
+        else if (action == "verify_experiment_instance") {
+            handleVerifyExperimentInstance(conn, json);
+        }
+        else if (action == "delete_stream_graph") {
+            handleDeleteStreamGraph(conn, json);
         }
         else {
             sendError(conn, "Unknown action: " + action);
@@ -6743,6 +7528,110 @@ void StreamViewerWebSocket::handleListStreamGraphs(
     sendStreamGraphList(conn, request_id);
 }
 
+// Derive the next free fork id under a parent instance: <parent>-a, -b, ... then
+// -aa. Suffixing rather than renumbering keeps the lineage readable in the tree
+// (run-0001-a-1 is plainly a fork of a fork of recording 1).
+std::string nextForkInstanceIdLocked(const std::string& parentInstanceId)
+{
+    const auto taken = [](const std::string& candidate) {
+        for (const auto& entry : g_stream_graphs) {
+            if (entry.second.instanceId == candidate) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (int width = 1; width <= 2; ++width) {
+        for (char first = 'a'; first <= 'z'; ++first) {
+            if (width == 1) {
+                const auto candidate = parentInstanceId + "-" + std::string(1, first);
+                if (!taken(candidate)) {
+                    return candidate;
+                }
+                continue;
+            }
+            for (char second = 'a'; second <= 'z'; ++second) {
+                const auto candidate =
+                    parentInstanceId + "-" + std::string(1, first) + std::string(1, second);
+                if (!taken(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+    }
+    return parentInstanceId + "-" + std::to_string(nowUs());
+}
+
+void StreamViewerWebSocket::handleForkStreamGraph(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const auto source_graph_id = json.value("source_graph_id", std::string{});
+    if (source_graph_id.empty()) {
+        sendError(conn, "fork_stream_graph requires source_graph_id",
+                  json.value("request_id", std::string{}));
+        return;
+    }
+
+    StreamGraphDefinition fork;
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        if (!g_stream_graph_store_error.empty()) {
+            sendError(conn, g_stream_graph_store_error);
+            return;
+        }
+        const auto source = g_stream_graphs.find(source_graph_id);
+        if (source == g_stream_graphs.end()) {
+            sendError(conn, "Unknown graph: " + source_graph_id,
+                  json.value("request_id", std::string{}));
+            return;
+        }
+        if (source->second.instanceId.empty()) {
+            sendError(
+                conn,
+                "Only an instance can be forked. Graph '" + source_graph_id +
+                    "' is a live board with no recorded data behind it.",
+                json.value("request_id", std::string{}));
+            return;
+        }
+
+        // Copy the pipeline, inherit the data.
+        fork = source->second;
+        fork.graphId = source_graph_id + "-fork-" + std::to_string(nowUs());
+        fork.instanceId = nextForkInstanceIdLocked(source->second.instanceId);
+        fork.immutable = false;                       // the whole point
+        fork.origin = "fork";
+        fork.forkedFrom = source->second.instanceId;  // nests under its parent
+        fork.experimentId = source->second.experimentId;
+        fork.recording = source->second.recording;    // SAME artifacts, not a copy
+        const auto requested_label = json.value("label", std::string{});
+        fork.label = requested_label.empty()
+                         ? source->second.label + " (fork)"
+                         : requested_label;
+        fork.createdAtUs = nowUs();
+        fork.updatedAtUs = fork.createdAtUs;
+
+        g_stream_graphs[fork.graphId] = fork;
+        if (!persistStreamGraphStoreLocked(persist_error)) {
+            sendError(conn, persist_error);
+            return;
+        }
+    }
+
+    LOG_INFO << "Forked instance " << fork.forkedFrom << " -> " << fork.instanceId
+             << " (graph " << fork.graphId << ")";
+
+    nlohmann::json response;
+    response["type"] = "stream_graph_forked";
+    response["request_id"] = json.value("request_id", std::string{});
+    response["graph"] = fork;
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
+}
+
 void StreamViewerWebSocket::handleSaveStreamGraph(
     const WebSocketConnectionPtr& conn,
     const nlohmann::json& json)
@@ -6777,6 +7666,33 @@ void StreamViewerWebSocket::handleSaveStreamGraph(
         if (!g_stream_graph_store_error.empty()) {
             sendError(conn, g_stream_graph_store_error);
             return;
+        }
+        // Immutability backstop. A recorded instance is a historical fact: the
+        // graph as it was when the data was captured. Reject the write here
+        // rather than trusting the editor's read-only mode -- the WS protocol is
+        // a public surface, and the reactive auto-save (Phase 7) fires on a
+        // debounce, so a stray edit would otherwise silently rewrite history.
+        const auto existing = g_stream_graphs.find(graph.graphId);
+        if (existing != g_stream_graphs.end() && existing->second.immutable) {
+            sendError(
+                conn,
+                "Cannot save over immutable instance '" + graph.graphId +
+                    "': it is the recorded snapshot for instance " +
+                    existing->second.instanceId +
+                    ". Fork it (fork_stream_graph) to get an editable copy.",
+                json.value("request_id", std::string{}));
+            return;
+        }
+        // Provenance is owned by the backend, not the client: a save must not be
+        // able to launder a fork into a recording, re-parent it, or repoint it at
+        // another session's artifacts.
+        if (existing != g_stream_graphs.end()) {
+            graph.experimentId = existing->second.experimentId;
+            graph.instanceId = existing->second.instanceId;
+            graph.immutable = existing->second.immutable;
+            graph.origin = existing->second.origin;
+            graph.forkedFrom = existing->second.forkedFrom;
+            graph.recording = existing->second.recording;
         }
         g_stream_graphs[graph.graphId] = graph;
         if (!persistStreamGraphStoreLocked(persist_error)) {
@@ -6888,6 +7804,1066 @@ void StreamViewerWebSocket::handleDeleteProfile(
 
     sendProfileDeleted(
         conn, json.value("request_id", std::string{}), participant_id);
+}
+
+void StreamViewerWebSocket::handleStartExperimentInstance(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto experiment_id = json.value("experiment_id", std::string{});
+    if (experiment_id.empty()) {
+        sendError(conn, "start_experiment_instance requires experiment_id", request_id);
+        return;
+    }
+
+    StreamGraphDefinition instance;
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> experiment_lock(g_experiment_mutex);
+        ensureExperimentStoreLoadedLocked();
+        if (!g_experiment_store_error.empty()) {
+            sendError(conn, g_experiment_store_error, request_id);
+            return;
+        }
+        const auto experiment = g_experiments.find(experiment_id);
+        if (experiment == g_experiments.end()) {
+            sendError(conn, "Unknown experiment: " + experiment_id, request_id);
+            return;
+        }
+        const auto live_graph_id = experiment->second.liveGraphId;
+        if (live_graph_id.empty()) {
+            sendError(conn,
+                      "Experiment '" + experiment_id +
+                          "' has no board bound, so there is no graph to snapshot.",
+                      request_id);
+            return;
+        }
+
+        std::lock_guard<std::mutex> graph_lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        if (!g_stream_graph_store_error.empty()) {
+            sendError(conn, g_stream_graph_store_error, request_id);
+            return;
+        }
+        const auto live = g_stream_graphs.find(live_graph_id);
+        if (live == g_stream_graphs.end()) {
+            sendError(conn, "Unknown graph: " + live_graph_id, request_id);
+            return;
+        }
+
+        // THE SNAPSHOT. Copy the live board wholesale -- nodes, edges and the
+        // opaque editor_metadata (the unflattened composite tree), because an
+        // instance has to reopen as the board it was, not as a flattened
+        // approximation of it.
+        instance = live->second;
+        instance.instanceId = nextRecordingInstanceIdLocked(experiment_id);
+        instance.graphId = experiment_id + "-" + instance.instanceId;
+        instance.label = live->second.label + " · " + instance.instanceId;
+        instance.experimentId = experiment_id;
+        instance.origin = "recording";
+        instance.forkedFrom.clear();
+        // Sealed only when materialization succeeds. Immutable from the start
+        // would be self-defeating: the status transitions below are writes.
+        instance.immutable = false;
+        instance.createdAtUs = nowUs();
+        instance.updatedAtUs = instance.createdAtUs;
+
+        // Recorded streams: RAW SOURCES ONLY (decided in the plan). Snapshotting
+        // derived streams would bloat the instance and let a fork silently read
+        // stale derived data instead of recomputing -- which is the entire point
+        // of forking.
+        nlohmann::json streams = nlohmann::json::array();
+        for (const auto& node : instance.nodes) {
+            if (node.kind != "stream_source" || !node.streamId.has_value()) {
+                continue;
+            }
+            nlohmann::json entry;
+            entry["stream_id"] = std::to_string(node.streamId.value());
+            entry["schema_name"] = node.schemaName.value_or("");
+            entry["role"] = "source";
+            entry["node_id"] = node.id;
+            streams.push_back(std::move(entry));
+        }
+
+        nlohmann::json recording;
+        // One marker topic per experiment (Marker/<experiment_id>), so every run
+        // shares a session id and is delimited by its own window.
+        recording["session_id"] = experiment_id;
+        recording["window_start_us"] =
+            json.value("window_start_us", static_cast<uint64_t>(nowUs()));
+        recording["window_end_us"] = nullptr;
+        recording["streams"] = std::move(streams);
+        recording["artifacts"] = nlohmann::json::object();
+        recording["status"] = "recording";
+        instance.recording = std::move(recording);
+
+        g_stream_graphs[instance.graphId] = instance;
+        if (!persistStreamGraphStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+    }
+
+    LOG_INFO << "Recording instance " << instance.instanceId << " for experiment "
+             << experiment_id << " (graph " << instance.graphId << ", "
+             << instance.recording.value("streams", nlohmann::json::array()).size()
+             << " recorded source(s))";
+    sendExperimentInstance(conn, request_id, instance);
+}
+
+void StreamViewerWebSocket::handleFinishExperimentInstance(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto graph_id = json.value("graph_id", std::string{});
+    if (graph_id.empty()) {
+        sendError(conn, "finish_experiment_instance requires graph_id", request_id);
+        return;
+    }
+
+    StreamGraphDefinition instance;
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        if (!g_stream_graph_store_error.empty()) {
+            sendError(conn, g_stream_graph_store_error, request_id);
+            return;
+        }
+        const auto stored = g_stream_graphs.find(graph_id);
+        if (stored == g_stream_graphs.end()) {
+            sendError(conn, "Unknown graph: " + graph_id, request_id);
+            return;
+        }
+        if (stored->second.instanceId.empty() ||
+            stored->second.origin != "recording") {
+            sendError(conn,
+                      "Graph '" + graph_id + "' is not a recording instance.",
+                      request_id);
+            return;
+        }
+        if (stored->second.recording.value("status", std::string{}) != "recording") {
+            sendError(conn,
+                      "Instance " + stored->second.instanceId + " is already " +
+                          stored->second.recording.value("status", std::string{}) +
+                          ".",
+                      request_id);
+            return;
+        }
+        stored->second.recording["window_end_us"] =
+            json.value("window_end_us", static_cast<uint64_t>(nowUs()));
+        stored->second.recording["status"] = "materializing";
+        stored->second.updatedAtUs = nowUs();
+        if (!json.value("completed", true)) {
+            stored->second.recording["message"] =
+                "Recording was stopped early; the window is a partial run.";
+        }
+        instance = stored->second;
+        if (!persistStreamGraphStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+    }
+
+    sendExperimentInstance(conn, request_id, instance);
+
+    // Materialize off the WS thread: draining a topic per recorded source takes
+    // tens of seconds, and pinning a drogon worker for that would stall every
+    // other client. Status updates are broadcast as they land.
+    std::thread([this, graph_id]() { materializeInstance(graph_id); }).detach();
+}
+
+void StreamViewerWebSocket::materializeInstance(const std::string& graph_id)
+{
+    std::string experiment_id;
+    std::string instance_id;
+    std::vector<std::pair<uint64_t, std::string>> sources;  // id, schema_name
+    int64_t window_start = 0;
+    int64_t window_end = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto stored = g_stream_graphs.find(graph_id);
+        if (stored == g_stream_graphs.end()) {
+            return;
+        }
+        experiment_id = stored->second.experimentId;
+        instance_id = stored->second.instanceId;
+        const auto& recording = stored->second.recording;
+        window_start = recording.value("window_start_us", static_cast<int64_t>(0));
+        window_end = recording.value("window_end_us", static_cast<int64_t>(0));
+        for (const auto& entry : recording.value("streams", nlohmann::json::array())) {
+            const auto id_text = entry.value("stream_id", std::string{});
+            try {
+                sources.emplace_back(std::stoull(id_text),
+                                     entry.value("schema_name", std::string{}));
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+    }
+
+    const auto finish = [this, &graph_id](const std::string& status,
+                                         const std::string& message,
+                                         const nlohmann::json& artifacts) {
+        StreamGraphDefinition updated;
+        std::string persist_error;
+        {
+            std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+            const auto stored = g_stream_graphs.find(graph_id);
+            if (stored == g_stream_graphs.end()) {
+                return;
+            }
+            stored->second.recording["status"] = status;
+            if (!message.empty()) {
+                stored->second.recording["message"] = message;
+            }
+            if (!artifacts.is_null()) {
+                stored->second.recording["artifacts"] = artifacts;
+            }
+            // Seal it. A completed instance is a historical fact: the graph as it
+            // was when the data was captured, welded to files that exist. A FAILED
+            // one stays mutable so it can be retried or deleted -- sealing an
+            // empty snapshot is exactly the failure mode the plan warns about.
+            stored->second.immutable = (status == "complete");
+            stored->second.updatedAtUs = nowUs();
+            updated = stored->second;
+            persistStreamGraphStoreLocked(persist_error);
+        }
+        if (!persist_error.empty()) {
+            LOG_ERROR << "Failed to persist instance status: " << persist_error;
+        }
+        LOG_INFO << "Instance " << updated.instanceId << " -> " << status
+                 << (message.empty() ? "" : (": " + message));
+        broadcastExperimentInstance(updated);
+    };
+
+    if (!natkit::tools::parquetExportAvailable()) {
+        finish("failed",
+               "This backend was built without Parquet support, so a recording "
+               "cannot be materialized. Rebuild the image with libparquet-dev.",
+               nlohmann::json(nullptr));
+        return;
+    }
+    if (sources.empty()) {
+        finish("failed",
+               "The recorded board has no stream_source nodes, so there is no raw "
+               "data to materialize.",
+               nlohmann::json(nullptr));
+        return;
+    }
+
+    const auto directory = instanceArtifactDir(experiment_id, instance_id);
+    std::error_code dir_error;
+    std::filesystem::create_directories(directory, dir_error);
+    if (dir_error) {
+        finish("failed",
+               "Could not create the instance directory " + directory.string() +
+                   ": " + dir_error.message(),
+               nlohmann::json(nullptr));
+        return;
+    }
+
+    // The experiment's marker topic supplies both the cue labels joined onto each
+    // row and the sidecar timeline.
+    uint64_t marker_stream_id = 0;
+    if (isValidTopicIdentifier(experiment_id)) {
+        const auto marker_topic = createTopicInfo(
+            nat::core::StreamType::MARKER, "session_id", experiment_id,
+            nat::core::MarkerEventV1::name);
+        if (marker_topic != nullptr) {
+            marker_stream_id = marker_topic->id;
+        }
+    }
+
+    nlohmann::json artifacts;
+    artifacts["data"] = nlohmann::json::array();
+    size_t total_rows = 0;
+    bool markers_written = false;
+    std::vector<std::string> failures;
+
+    for (const auto& [stream_id, schema_name] : sources) {
+        natkit::tools::ParquetExportRequest request;
+        request.streamId = stream_id;
+        request.markerStreamId = marker_stream_id;
+        request.startUs = window_start > 0 ? std::optional<int64_t>(window_start)
+                                          : std::nullopt;
+        request.endUs = window_end > 0 ? std::optional<int64_t>(window_end)
+                                       : std::nullopt;
+        // Only the first source writes the sidecar: the marker timeline belongs to
+        // the instance, not to a stream, and re-draining it per source would
+        // multiply the cost for identical content.
+        if (!markers_written) {
+            request.markersSidecarPath = (directory / "markers.jsonl").string();
+        }
+
+        const auto exported = natkit::tools::exportStreamToParquet(
+            broker_manager_, request, directory.string());
+        if (!exported.ok) {
+            failures.push_back("stream " + std::to_string(stream_id) + ": " +
+                               exported.error);
+            continue;
+        }
+        // MUST verify it captured something. A recording that ran against a
+        // wedged bridge produces a session with zero data frames, and sealing
+        // that as an immutable snapshot of nothing is worse than failing.
+        if (exported.frameCount == 0) {
+            failures.push_back(
+                "stream " + std::to_string(stream_id) +
+                ": no data frames in the recorded window — nothing was flowing "
+                "(check the bridge/device), so there is nothing to snapshot.");
+            std::error_code remove_error;
+            std::filesystem::remove(exported.filePath, remove_error);
+            continue;
+        }
+        if (exported.markersSidecarWritten) {
+            markers_written = true;
+        }
+
+        // Stable name inside the instance directory (the exporter writes a
+        // download-shaped temp name).
+        const auto final_path = directory / (std::to_string(stream_id) + ".parquet");
+        std::error_code rename_error;
+        std::filesystem::rename(exported.filePath, final_path, rename_error);
+        if (rename_error) {
+            failures.push_back("stream " + std::to_string(stream_id) +
+                               ": could not place the artifact: " +
+                               rename_error.message());
+            continue;
+        }
+
+        std::string checksum_error;
+        const auto checksum = sha256OfFile(final_path, checksum_error);
+        markArtifactReadOnly(final_path);
+
+        nlohmann::json entry;
+        entry["stream_id"] = std::to_string(stream_id);
+        entry["schema_name"] =
+            exported.schemaName.empty() ? schema_name : exported.schemaName;
+        entry["path"] = final_path.filename().string();
+        entry["rows"] = exported.frameCount;
+        entry["labelled_rows"] = exported.labelledFrameCount;
+        // Per-class row counts: the difference between "this instance recorded
+        // 400k rows" and "this instance is usable" (one class may never have
+        // fired). Empty key = rows inside the window but between cues.
+        nlohmann::json label_counts = nlohmann::json::object();
+        for (const auto& [label, count] : exported.labelCounts) {
+            label_counts[label.empty() ? "(unlabelled)" : label] = count;
+        }
+        entry["label_counts"] = std::move(label_counts);
+        entry["sha256"] = checksum;
+        if (!checksum_error.empty()) {
+            entry["checksum_error"] = checksum_error;
+        }
+        // Truncation is never silent: the file is a prefix of the stream.
+        if (exported.truncated) {
+            entry["truncated"] = true;
+        }
+        artifacts["data"].push_back(std::move(entry));
+        total_rows += exported.frameCount;
+    }
+
+    if (markers_written) {
+        const auto markers_path = directory / "markers.jsonl";
+        std::string checksum_error;
+        artifacts["markers"] = "markers.jsonl";
+        artifacts["markers_sha256"] = sha256OfFile(markers_path, checksum_error);
+        markArtifactReadOnly(markers_path);
+    }
+    artifacts["directory"] = directory.string();
+    artifacts["total_rows"] = total_rows;
+
+    if (artifacts["data"].empty()) {
+        // Nothing usable was captured, so keep no half-written files. The markers
+        // sidecar is written before the (much longer) data drain, so a failure here
+        // otherwise leaves an orphan file that is on disk but not in the manifest.
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(directory, cleanup_error);
+        finish("failed",
+               failures.empty() ? "Materialization produced no artifacts."
+                                : ("Materialization captured nothing. " +
+                                   [&failures]() {
+                                       std::string joined;
+                                       for (const auto& failure : failures) {
+                                           if (!joined.empty()) joined += " | ";
+                                           joined += failure;
+                                       }
+                                       return joined;
+                                   }()),
+               artifacts);
+        return;
+    }
+
+    std::string message = "Materialized " +
+                          std::to_string(artifacts["data"].size()) + " stream(s), " +
+                          std::to_string(total_rows) + " rows.";
+    if (!failures.empty()) {
+        // Partial success is still a success, but say exactly what is missing --
+        // a snapshot the operator believes is complete is worse than a loud gap.
+        message += " Some streams failed: ";
+        for (size_t index = 0; index < failures.size(); ++index) {
+            message += (index > 0 ? " | " : "") + failures[index];
+        }
+    }
+    finish("complete", message, artifacts);
+}
+
+// Tear down every worker belonging to a graph's active run and mark the runtime
+// stopped. Shared by the explicit stop_stream_graph action and by the replay-end
+// cleanup, which must stop the run BEFORE its scratch topics are deleted.
+//
+// `expected_replay_id`, when non-empty, makes this a no-op unless the run is still
+// the one bound to that replay — otherwise a replay ending would stop a live run
+// the user started in the meantime.
+void stopStreamGraphRuntimeById(const std::string& graph_id,
+                               const std::string& expected_replay_id = std::string{})
+{
+    StreamGraphRuntimeState runtime;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        const auto search = g_stream_graph_runtime.find(graph_id);
+        if (search == g_stream_graph_runtime.end()) {
+            return;
+        }
+        if (!expected_replay_id.empty() &&
+            search->second.boundReplayId != expected_replay_id) {
+            return;
+        }
+        runtime = search->second;
+    }
+
+    for (const auto output_stream_id : runtime.outputStreamIds) {
+        stopGraphWorkerByOutputStreamId(output_stream_id);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        auto& active_runtime = g_stream_graph_runtime[graph_id];
+        active_runtime.runState = "stopped";
+        active_runtime.boundReplayId.clear();
+        for (auto& entry : active_runtime.nodeStatuses) {
+            if (entry.second.state == "running" || entry.second.state == "stalled" ||
+                entry.second.state == "starting" || entry.second.state == "blocked" ||
+                entry.second.state == "error") {
+                entry.second.state = entry.second.outputStreamId.has_value()
+                                         ? "stopped"
+                                         : entry.second.state;
+            }
+        }
+    }
+}
+
+void StreamViewerWebSocket::handleStartInstanceReplay(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto graph_id = json.value("graph_id", std::string{});
+    if (graph_id.empty()) {
+        sendError(conn, "start_instance_replay requires graph_id", request_id);
+        return;
+    }
+    if (!natkit::tools::replayAvailable()) {
+        sendError(conn,
+                  "This backend was built without Parquet support, so an instance "
+                  "cannot be replayed. Rebuild the image with libparquet-dev.",
+                  request_id);
+        return;
+    }
+
+    // Review = paced from the original timestamp deltas (watch it back like a
+    // video). Recompute = unpaced, for running a fork's changed pipeline or
+    // training, where nobody is watching frames go by.
+    const auto mode = json.value("mode", std::string{"review"});
+    natkit::tools::ReplayRequest request;
+    request.paced = (mode != "recompute");
+    request.speed = std::clamp(json.value("speed", 1.0), 0.25, 8.0);
+
+    std::string instance_id;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        const auto stored = g_stream_graphs.find(graph_id);
+        if (stored == g_stream_graphs.end()) {
+            sendError(conn, "Unknown graph: " + graph_id, request_id);
+            return;
+        }
+        if (stored->second.instanceId.empty()) {
+            sendError(conn,
+                      "Only an instance can be replayed; '" + graph_id +
+                          "' is a live board (its data is still on the broker).",
+                      request_id);
+            return;
+        }
+        instance_id = stored->second.instanceId;
+        const auto artifacts =
+            stored->second.recording.value("artifacts", nlohmann::json::object());
+        const auto directory = std::filesystem::path(artifacts.value(
+            "directory",
+            instanceArtifactDir(stored->second.experimentId, instance_id).string()));
+        for (const auto& data : artifacts.value("data", nlohmann::json::array())) {
+            natkit::tools::ReplaySourceSpec spec;
+            try {
+                spec.originalStreamId =
+                    std::stoull(data.value("stream_id", std::string{"0"}));
+            } catch (const std::exception&) {
+                continue;
+            }
+            spec.parquetPath =
+                (directory / data.value("path", std::string{})).string();
+            request.sources.push_back(std::move(spec));
+        }
+        if (artifacts.contains("markers")) {
+            request.markersPath =
+                (directory / artifacts.value("markers", std::string{})).string();
+        }
+        if (request.sources.empty()) {
+            sendError(conn,
+                      "Instance " + instance_id +
+                          " has no materialized artifacts to replay.",
+                      request_id);
+            return;
+        }
+    }
+
+    // A fresh identifier per replay session keeps two replays of the same instance
+    // (or a replay and a live board) on separate topics.
+    const auto nonce = std::to_string(nowUs());
+    request.replayIdentifier =
+        "replay-" + sanitizeTopicIdentifier(instance_id) + "-" + nonce;
+
+    const auto plan = natkit::tools::planReplay(broker_manager_, request);
+    if (!plan.ok) {
+        sendError(conn, plan.error, request_id);
+        return;
+    }
+
+    ActiveReplay active;
+    active.replayId = request.replayIdentifier;
+    active.graphId = graph_id;
+    active.plan = plan;
+    active.cancelled = std::make_shared<std::atomic<bool>>(false);
+    active.paced = request.paced;
+    active.speed = request.speed;
+    {
+        std::lock_guard<std::mutex> lock(g_replay_mutex);
+        g_active_replays[active.replayId] = active;
+    }
+
+    const auto replay_id = active.replayId;
+    const auto cancelled = active.cancelled;
+    std::thread([this, request, plan, replay_id, graph_id, cancelled]() {
+        natkit::tools::runReplay(
+            broker_manager_, request, plan, *cancelled,
+            [this, replay_id, graph_id, &plan](
+                const natkit::tools::ReplayProgress& progress) {
+                {
+                    std::lock_guard<std::mutex> lock(g_replay_mutex);
+                    const auto search = g_active_replays.find(replay_id);
+                    if (search != g_active_replays.end()) {
+                        search->second.progress = progress;
+                    }
+                }
+                if (progress.finished) {
+                    broadcastInstanceReplayState(
+                        replay_id, graph_id, plan, progress,
+                        progress.cancelled ? "stopped"
+                                           : (progress.error.empty() ? "finished"
+                                                                     : "failed"));
+                } else {
+                    broadcastInstanceReplayState(replay_id, graph_id, plan, progress,
+                                                "running");
+                }
+            });
+        // Stop the run this replay owns BEFORE its topics go away. Two reasons:
+        // workers left consuming a deleted topic spam the bridge with "topic does
+        // not exist", and a runtime left in "running" makes the next Replay fail
+        // with "Graph is already running; stop it before starting again" — so
+        // replay worked once and then refused until the user pressed Stop.
+        stopStreamGraphRuntimeById(graph_id, replay_id);
+
+        // The scratch topics die with the replay.
+        natkit::tools::deleteReplayTopics(broker_manager_, plan);
+        {
+            std::lock_guard<std::mutex> lock(g_replay_mutex);
+            g_active_replays.erase(replay_id);
+        }
+        LOG_INFO << "Replay " << replay_id << " ended; scratch topics removed";
+    }).detach();
+
+    // Reply once the first record is actually on the topic.
+    //
+    // A Kafka topic is auto-created on first PRODUCE, so replying immediately would
+    // hand the client scratch stream ids for topics that do not exist yet — and a
+    // transform worker resolves its source topic against the broker, so it would
+    // fail to start with "could not locate a compatible DATA topic". Losing the
+    // first few frames from a viewer's perspective is invisible; a transform that
+    // refuses to start is not. Bounded so a failing replay still answers.
+    for (int attempt = 0; attempt < 60; ++attempt) {
+        bool published = false;
+        bool gone = false;
+        {
+            std::lock_guard<std::mutex> lock(g_replay_mutex);
+            const auto search = g_active_replays.find(replay_id);
+            if (search == g_active_replays.end()) {
+                gone = true;  // finished or failed already
+            } else {
+                published = search->second.progress.framesPublished > 0 ||
+                            search->second.progress.markersPublished > 0;
+            }
+        }
+        if (published || gone) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    natkit::tools::ReplayProgress observed;
+    {
+        std::lock_guard<std::mutex> lock(g_replay_mutex);
+        const auto search = g_active_replays.find(replay_id);
+        if (search != g_active_replays.end()) {
+            observed = search->second.progress;
+        }
+    }
+    sendInstanceReplayState(conn, request_id, replay_id, graph_id, plan, observed,
+                            "started");
+}
+
+void StreamViewerWebSocket::handleStopInstanceReplay(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto replay_id = json.value("replay_id", std::string{});
+    if (replay_id.empty()) {
+        sendError(conn, "stop_instance_replay requires replay_id", request_id);
+        return;
+    }
+    std::string graph_id;
+    natkit::tools::ReplayPlan plan;
+    natkit::tools::ReplayProgress progress;
+    {
+        std::lock_guard<std::mutex> lock(g_replay_mutex);
+        const auto search = g_active_replays.find(replay_id);
+        if (search == g_active_replays.end()) {
+            sendError(conn, "No active replay with id " + replay_id, request_id);
+            return;
+        }
+        search->second.cancelled->store(true);
+        graph_id = search->second.graphId;
+        plan = search->second.plan;
+        progress = search->second.progress;
+    }
+    // The replay thread does the topic cleanup and broadcasts the final state; this
+    // just acknowledges the request.
+    sendInstanceReplayState(conn, request_id, replay_id, graph_id, plan, progress,
+                            "stopping");
+}
+
+void StreamViewerWebSocket::handleListInstanceReplays(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    nlohmann::json response;
+    response["type"] = "instance_replay_list";
+    response["request_id"] = json.value("request_id", std::string{});
+    response["replays"] = nlohmann::json::array();
+    std::lock_guard<std::mutex> lock(g_replay_mutex);
+    for (const auto& entry : g_active_replays) {
+        response["replays"].push_back(
+            makeReplayStateJson(entry.first, entry.second.graphId,
+                                entry.second.plan, entry.second.progress,
+                                "running"));
+    }
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
+}
+
+void StreamViewerWebSocket::handleVerifyExperimentInstance(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto graph_id = json.value("graph_id", std::string{});
+    if (graph_id.empty()) {
+        sendError(conn, "verify_experiment_instance requires graph_id", request_id);
+        return;
+    }
+
+    std::string experiment_id;
+    std::string instance_id;
+    nlohmann::json artifacts;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        const auto stored = g_stream_graphs.find(graph_id);
+        if (stored == g_stream_graphs.end()) {
+            sendError(conn, "Unknown graph: " + graph_id, request_id);
+            return;
+        }
+        if (stored->second.instanceId.empty()) {
+            sendError(conn, "Graph '" + graph_id + "' is not an instance.", request_id);
+            return;
+        }
+        experiment_id = stored->second.experimentId;
+        instance_id = stored->second.instanceId;
+        artifacts = stored->second.recording.value("artifacts", nlohmann::json::object());
+    }
+
+    // A fork inherits its ancestor's artifacts verbatim, so it verifies the very
+    // same files -- which is the point: a fork depending on corrupted data should
+    // report it too.
+    const auto directory = artifacts.contains("directory")
+                               ? std::filesystem::path(
+                                     artifacts.value("directory", std::string{}))
+                               : instanceArtifactDir(experiment_id, instance_id);
+
+    nlohmann::json report = nlohmann::json::array();
+    bool all_ok = true;
+    const auto verify = [&](const std::string& relative_path,
+                            const std::string& expected) {
+        nlohmann::json entry;
+        entry["path"] = relative_path;
+        const auto full = directory / relative_path;
+        if (!std::filesystem::exists(full)) {
+            entry["ok"] = false;
+            entry["problem"] = "missing";
+            all_ok = false;
+            report.push_back(std::move(entry));
+            return;
+        }
+        std::error_code size_error;
+        entry["size"] = static_cast<uint64_t>(
+            std::filesystem::file_size(full, size_error));
+        if (expected.empty()) {
+            // Nothing to compare against: say so rather than implying a pass.
+            entry["ok"] = false;
+            entry["problem"] = "no recorded checksum";
+            all_ok = false;
+            report.push_back(std::move(entry));
+            return;
+        }
+        std::string checksum_error;
+        const auto actual = sha256OfFile(full, checksum_error);
+        entry["expected_sha256"] = expected;
+        entry["actual_sha256"] = actual;
+        if (!checksum_error.empty()) {
+            entry["ok"] = false;
+            entry["problem"] = checksum_error;
+            all_ok = false;
+        } else if (actual != expected) {
+            entry["ok"] = false;
+            entry["problem"] = "checksum mismatch — the file changed since it was "
+                               "materialized (truncated, rewritten or corrupted)";
+            all_ok = false;
+        } else {
+            entry["ok"] = true;
+        }
+        report.push_back(std::move(entry));
+    };
+
+    for (const auto& data : artifacts.value("data", nlohmann::json::array())) {
+        verify(data.value("path", std::string{}),
+               data.value("sha256", std::string{}));
+    }
+    if (artifacts.contains("markers")) {
+        verify(artifacts.value("markers", std::string{}),
+               artifacts.value("markers_sha256", std::string{}));
+    }
+    if (report.empty()) {
+        all_ok = false;
+    }
+
+    nlohmann::json response;
+    response["type"] = "experiment_instance_verification";
+    response["request_id"] = request_id;
+    response["graph_id"] = graph_id;
+    response["instance_id"] = instance_id;
+    response["ok"] = all_ok;
+    response["artifacts"] = std::move(report);
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
+}
+
+void StreamViewerWebSocket::handleDeleteStreamGraph(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const auto graph_id = json.value("graph_id", std::string{});
+    if (graph_id.empty()) {
+        sendError(conn, "delete_stream_graph requires graph_id", request_id);
+        return;
+    }
+    const bool force = json.value("force", false);
+
+    std::string experiment_to_unbind;
+    std::filesystem::path artifacts_to_remove;
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        if (!g_stream_graph_store_error.empty()) {
+            sendError(conn, g_stream_graph_store_error, request_id);
+            return;
+        }
+        const auto stored = g_stream_graphs.find(graph_id);
+        if (stored == g_stream_graphs.end()) {
+            sendError(conn, "Unknown graph: " + graph_id, request_id);
+            return;
+        }
+        // Deleting a graph out from under its running workers would leave them
+        // orphaned with no record to stop them by.
+        const auto runtime = g_stream_graph_runtime.find(graph_id);
+        if (runtime != g_stream_graph_runtime.end() &&
+            (runtime->second.runState == "running" ||
+             runtime->second.runState == "starting" ||
+             runtime->second.runState == "stalled")) {
+            sendError(conn,
+                      "Graph '" + graph_id + "' is " + runtime->second.runState +
+                          "; stop it before deleting.",
+                      request_id);
+            return;
+        }
+        // A sealed instance is permanent BY DEFAULT. It is still deletable, but
+        // only deliberately: `force` says the operator means to destroy recorded
+        // history, not that they mis-clicked a board.
+        if (stored->second.immutable && !force) {
+            sendError(conn,
+                      "Instance " + stored->second.instanceId +
+                          " is an immutable recorded snapshot. Deleting it destroys "
+                          "the recording permanently; pass force=true if that is "
+                          "what you mean.",
+                      request_id);
+            return;
+        }
+        if (!stored->second.instanceId.empty() &&
+            !stored->second.experimentId.empty()) {
+            artifacts_to_remove = instanceArtifactDir(stored->second.experimentId,
+                                                      stored->second.instanceId);
+        }
+        experiment_to_unbind = stored->second.experimentId;
+        g_stream_graphs.erase(stored);
+        g_stream_graph_runtime.erase(graph_id);
+        if (!persistStreamGraphStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+    }
+
+    // Only an instance owns a directory, and only its own: a live board shares
+    // nothing, so this never touches another instance's artifacts.
+    if (!artifacts_to_remove.empty()) {
+        std::error_code remove_error;
+        // Read-only artifacts still need clearing before removal.
+        for (std::filesystem::recursive_directory_iterator
+                 iterator(artifacts_to_remove, remove_error), end;
+             !remove_error && iterator != end; ++iterator) {
+            std::error_code permission_error;
+            std::filesystem::permissions(
+                iterator->path(), std::filesystem::perms::owner_all,
+                std::filesystem::perm_options::add, permission_error);
+        }
+        remove_error.clear();
+        const auto removed = std::filesystem::remove_all(artifacts_to_remove,
+                                                         remove_error);
+        if (remove_error) {
+            LOG_ERROR << "Deleted graph " << graph_id
+                      << " but could not remove its artifacts at "
+                      << artifacts_to_remove << ": " << remove_error.message();
+        } else if (removed > 0) {
+            LOG_INFO << "Removed " << removed << " artifact file(s) for " << graph_id;
+        }
+        // Prune the now-empty per-experiment parent so the store doesn't accrete a
+        // directory per experiment forever. remove() only succeeds on an empty
+        // directory, so a sibling instance's artifacts are never at risk.
+        std::error_code prune_error;
+        std::filesystem::remove(artifacts_to_remove.parent_path(), prune_error);
+    }
+
+    // A live board that an experiment pointed at must not leave the experiment
+    // bound to a graph that no longer exists.
+    if (!experiment_to_unbind.empty()) {
+        std::lock_guard<std::mutex> lock(g_experiment_mutex);
+        ensureExperimentStoreLoadedLocked();
+        const auto experiment = g_experiments.find(experiment_to_unbind);
+        if (experiment != g_experiments.end() &&
+            experiment->second.liveGraphId == graph_id) {
+            experiment->second.liveGraphId.clear();
+            experiment->second.updatedAtUs = nowUs();
+            std::string experiment_persist_error;
+            if (!persistExperimentStoreLocked(experiment_persist_error)) {
+                LOG_ERROR << "Failed to unbind experiment after graph delete: "
+                          << experiment_persist_error;
+            }
+        }
+    }
+
+    nlohmann::json response;
+    response["type"] = "stream_graph_deleted";
+    response["request_id"] = request_id;
+    response["graph_id"] = graph_id;
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
+}
+
+void StreamViewerWebSocket::handleListExperiments(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    {
+        std::lock_guard<std::mutex> lock(g_experiment_mutex);
+        ensureExperimentStoreLoadedLocked();
+        if (!g_experiment_store_error.empty()) {
+            sendError(conn, g_experiment_store_error, request_id);
+            return;
+        }
+    }
+    sendExperimentList(conn, request_id);
+}
+
+void StreamViewerWebSocket::handleSaveExperiment(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    if (!json.contains("experiment")) {
+        sendError(conn, "save_experiment requires an experiment payload", request_id);
+        return;
+    }
+
+    Experiment experiment;
+    try {
+        experiment = json.at("experiment").get<Experiment>();
+    } catch (const std::exception& exception) {
+        sendError(
+            conn,
+            std::string("Failed to parse experiment payload: ") + exception.what(),
+            request_id);
+        return;
+    }
+    // The experiment_id is a Kafka topic key: markers publish to and the
+    // `markers` node subscribes to Marker/<experiment_id>, so an id that can't
+    // be a topic identifier would produce an experiment that silently records
+    // nowhere.
+    if (!isValidTopicIdentifier(experiment.experimentId)) {
+        sendError(
+            conn,
+            "save_experiment requires an experiment_id matching "
+            "^[A-Za-z0-9][A-Za-z0-9_-]*$ (it keys the Marker/<experiment_id> topic)",
+            request_id);
+        return;
+    }
+
+    if (experiment.createdAtUs == 0) {
+        experiment.createdAtUs = nowUs();
+    }
+    experiment.updatedAtUs = nowUs();
+
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_experiment_mutex);
+        ensureExperimentStoreLoadedLocked();
+        if (!g_experiment_store_error.empty()) {
+            sendError(conn, g_experiment_store_error, request_id);
+            return;
+        }
+        // Preserve the original creation timestamp on update.
+        const auto existing = g_experiments.find(experiment.experimentId);
+        if (existing != g_experiments.end() && existing->second.createdAtUs != 0) {
+            experiment.createdAtUs = existing->second.createdAtUs;
+        }
+        // Bind the board FIRST: if the graph side is rejected (unknown graph, or
+        // an immutable instance) the experiment record is left untouched rather
+        // than saved with a binding that was refused.
+        if (!applyExperimentGraphBindingLocked(
+                experiment.experimentId, experiment.liveGraphId, persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+        g_experiments[experiment.experimentId] = experiment;
+        if (!persistExperimentStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+    }
+
+    sendExperimentSaved(conn, request_id, experiment);
+}
+
+void StreamViewerWebSocket::handleDeleteExperiment(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const std::string experiment_id = json.value("experiment_id", std::string{});
+    if (experiment_id.empty()) {
+        sendError(conn, "delete_experiment requires an experiment_id", request_id);
+        return;
+    }
+
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_experiment_mutex);
+        ensureExperimentStoreLoadedLocked();
+        if (!g_experiment_store_error.empty()) {
+            sendError(conn, g_experiment_store_error, request_id);
+            return;
+        }
+        if (g_experiments.find(experiment_id) == g_experiments.end()) {
+            sendError(conn, "No experiment found for experiment_id " + experiment_id,
+                      request_id);
+            return;
+        }
+        // An experiment with history can't be deleted: its instances are
+        // immutable snapshots that are only reachable through it, so removing
+        // the experiment would orphan them.
+        {
+            std::lock_guard<std::mutex> graph_lock(g_stream_graph_mutex);
+            ensureStreamGraphStoreLoadedLocked();
+            if (!g_stream_graph_store_error.empty()) {
+                sendError(conn, g_stream_graph_store_error, request_id);
+                return;
+            }
+            std::size_t instance_count = 0;
+            for (const auto& entry : g_stream_graphs) {
+                if (entry.second.experimentId == experiment_id &&
+                    !entry.second.instanceId.empty()) {
+                    ++instance_count;
+                }
+            }
+            if (instance_count > 0) {
+                sendError(
+                    conn,
+                    "Experiment '" + experiment_id + "' has " +
+                        std::to_string(instance_count) +
+                        " recorded instance(s); they are permanent history and "
+                        "would be orphaned. Delete the instances first.",
+                    request_id);
+                return;
+            }
+        }
+        // Unbind the live board before dropping the record, so no graph is left
+        // pointing at an experiment that no longer exists.
+        if (!applyExperimentGraphBindingLocked(experiment_id, std::string{},
+                                               persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+        g_experiments.erase(experiment_id);
+        if (!persistExperimentStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+    }
+
+    sendExperimentDeleted(conn, request_id, experiment_id);
 }
 
 void StreamViewerWebSocket::handleValidateStreamGraph(
@@ -7079,7 +9055,11 @@ void executeStreamGraphStart(
     std::string request_id,
     StreamGraphDefinition graph,
     std::string active_run_id,
-    int64_t replay_start_offset = -1)
+    int64_t replay_start_offset = -1,
+    // Non-zero when this run is bound to a replay: the replay republishes the
+    // recording's marker timeline onto its own scratch MARKER topic, so a markers
+    // node must resolve to THAT instead of the experiment's live marker topic.
+    uint64_t replay_marker_stream_id = 0)
 {
     // Provenance edges carry lineage/control, not streaming data — drop them from
     // the executed graph entirely (mirrors flattenGraph dropping param nodes) so
@@ -7264,19 +9244,24 @@ void executeStreamGraphStart(
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
         }
-        if (node.kind == "experiment") {
+        if (isMarkerSourceKind(node.kind)) {
             // Recording is driven client-side (the browser runs the protocol
             // timeline and publishes the session bundle via
-            // publish_session_bundle). The runtime just marks the node ready. An
-            // experiment is source-like: it takes no inputs and its one output
+            // publish_session_bundle). The runtime just marks the node ready. A
+            // markers node is source-like: it takes no inputs and its one output
             // port, `markers`, resolves to the deterministic MarkerEventV1 topic
             // Marker/<experiment_id> so downstream marker-aware nodes can
             // subscribe to the resolved output_stream_id (like a source).
+            //
+            // The id comes from the GRAPH's bound experiment. A legacy
+            // `experiment` node's own config is the fallback, so a board that
+            // predates the split still resolves its original marker topic and its
+            // recorded data stays reachable.
             std::optional<uint64_t> markers_stream_id{};
-            const std::string experiment_id =
-                node.config.is_object()
-                    ? node.config.value("experiment_id", std::string{})
-                    : std::string{};
+            std::string experiment_id = graph.experimentId;
+            if (experiment_id.empty() && node.config.is_object()) {
+                experiment_id = node.config.value("experiment_id", std::string{});
+            }
             if (isValidTopicIdentifier(experiment_id)) {
                 const auto marker_topic_info = createTopicInfo(
                     nat::core::StreamType::MARKER,
@@ -7287,6 +9272,15 @@ void executeStreamGraphStart(
                     markers_stream_id = marker_topic_info->id;
                 }
             }
+            // Replay-bound run: the recording's markers are being republished to
+            // the replay's scratch MARKER topic, and nothing is writing to the
+            // experiment's live marker topic. Point the node (and therefore every
+            // marker-aware viewer downstream of it) at the replayed timeline —
+            // otherwise the viewer subscribes to a topic that stays silent for the
+            // whole replay and just reports "Waiting for data on this stream…".
+            if (replay_marker_stream_id != 0) {
+                markers_stream_id = replay_marker_stream_id;
+            }
             StreamGraphNodeRuntimeStatus status{
                 "running",
                 markers_stream_id,
@@ -7294,8 +9288,13 @@ void executeStreamGraphStart(
                 std::nullopt,
                 0,
                 0,
-                std::optional<std::string>(
-                    "Experiment node is ready to record markers.")};
+                markers_stream_id.has_value()
+                    ? std::optional<std::string>(
+                          "Republishing the marker timeline for experiment '" +
+                          experiment_id + "'.")
+                    : std::optional<std::string>(
+                          "No experiment is bound to this board, so there is no "
+                          "marker timeline to republish.")};
             if (markers_stream_id.has_value()) {
                 status.outputTopics.push_back(makeChannelTopic(
                     nat::core::StreamType::MARKER, markers_stream_id.value(),
@@ -7320,6 +9319,26 @@ void executeStreamGraphStart(
                     mutable_node_search->second->outputStreamId =
                         markers_stream_id.value();
                 }
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+        if (node.kind == "export") {
+            // Export runs as a control-plane job submitted client-side through
+            // the ML proxy (like train); the graph runtime just marks the node
+            // ready. Nothing is written until the operator runs the export.
+            StreamGraphNodeRuntimeStatus status{
+                "running",
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                0,
+                0,
+                std::optional<std::string>(
+                    "Export node is ready; run the export from the inspector.")};
+            if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                aborted = true;
+                break;
             }
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
@@ -7613,12 +9632,20 @@ void executeStreamGraphStart(
                 ? "error"
                 : (has_running_node ? "running" : "stopped");
 
-            g_stream_graphs[graph.graphId] = graph;
-            std::string persist_error;
-            if (!persistStreamGraphStoreLocked(persist_error)) {
-                LOG_ERROR << "Failed to persist stream graph runtime outputs for "
-                          << graph.graphId << ": " << persist_error;
-            }
+            // Deliberately NOT written back to g_stream_graphs. `graph` is a local
+            // copy taken when the start was requested and nothing here mutates it,
+            // so persisting it saves nothing — but it does actively cause harm:
+            //
+            //  - On a replay-bound run, handleStartStreamGraph has rewritten every
+            //    replayed source to its SCRATCH stream id. Persisting that welds a
+            //    sealed instance to a topic that is deleted when the replay ends,
+            //    so the next replay finds no source matching its bindings and fails
+            //    with "no bindings matching this graph's sources" — replay worked
+            //    exactly once per instance, and the recorded provenance was lost.
+            //  - It clobbers any save another client made after this start began.
+            //
+            // Runtime facts (output stream ids, node states) belong to `runtime`,
+            // which is where they already live.
         }
     }
 
@@ -7656,6 +9683,7 @@ void StreamViewerWebSocket::handleStartStreamGraph(
     }
 
     StreamGraphDefinition graph;
+    bool clear_failed_run = false;
     {
         std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
         ensureStreamGraphStoreLoadedLocked();
@@ -7669,15 +9697,105 @@ void StreamViewerWebSocket::handleStartStreamGraph(
             return;
         }
         const auto runtime_search = g_stream_graph_runtime.find(graph_id);
-        if (runtime_search != g_stream_graph_runtime.end() &&
-            runtime_search->second.runState != "stopped") {
-            sendError(conn, "Graph is already running; stop it before starting again");
-            return;
+        if (runtime_search != g_stream_graph_runtime.end()) {
+            const auto& run_state = runtime_search->second.runState;
+            // "error" is a REPORT of a start that failed, not a live run: by the
+            // time it is set, executeStreamGraphStart has already stopped every
+            // worker it managed to create and cleared outputStreamIds. Treating it
+            // as busy stranded such a graph permanently — the only way out was an
+            // explicit stop, which the UI gives the user no reason to press.
+            //
+            // "starting" still blocks: a start is genuinely in flight and racing it
+            // would build a second set of workers for the same nodes. "stalled"
+            // blocks too — a stalled node IS running, just idle (a classifier
+            // waiting for a model), and restarting the graph is not the fix.
+            if (run_state != "stopped" && run_state != "error") {
+                sendError(conn,
+                          "Graph is " + run_state + "; stop it before starting again",
+                          request_id);
+                return;
+            }
+            clear_failed_run = (run_state == "error");
         }
         graph = search->second;
     }
 
-    const auto validation = validateStreamGraphDefinition(graph, broker_manager_);
+    // Belt and braces before reusing a failed run's slot: the teardown on failure is
+    // believed complete, but a straggler would silently double-produce onto a node
+    // output. Deliberately called OUTSIDE the block above — it takes
+    // g_stream_graph_mutex itself, which is not recursive.
+    if (clear_failed_run) {
+        stopStreamGraphRuntimeById(graph_id);
+    }
+
+    // Replay binding (Phase 5). When a replay id is supplied, every stream_source
+    // whose recorded stream matches a replay binding is repointed at that replay's
+    // SCRATCH topic for this run. The rewrite happens on the local copy only: the
+    // stored instance keeps the stream ids it actually recorded from, because that
+    // is provenance, not configuration.
+    //
+    // Doing it here — before validation, topo sort and worker creation — means the
+    // whole downstream chain (transform inputs, viewer subscriptions, combine
+    // lanes) resolves against the replayed stream with no other code change. That
+    // is the entire reason replay publishes to Kafka instead of an in-process
+    // channel.
+    const auto replay_id = json.value("replay_id", std::string{});
+    std::unordered_set<uint64_t> replay_source_streams;
+    uint64_t replay_marker_stream_id = 0;
+    if (!replay_id.empty()) {
+        std::unordered_map<uint64_t, uint64_t> replay_bindings;
+        {
+            std::lock_guard<std::mutex> lock(g_replay_mutex);
+            const auto search = g_active_replays.find(replay_id);
+            if (search == g_active_replays.end()) {
+                sendError(conn,
+                          "No active replay with id " + replay_id +
+                              " — start the replay before starting the graph "
+                              "against it.",
+                          request_id);
+                return;
+            }
+            for (const auto& binding : search->second.plan.bindings) {
+                replay_bindings[binding.originalStreamId] = binding.replayStreamId;
+            }
+            replay_marker_stream_id = search->second.plan.markerStreamId;
+        }
+        size_t rebound = 0;
+        for (auto& node : graph.nodes) {
+            if (node.kind != "stream_source" || !node.streamId.has_value()) {
+                continue;
+            }
+            const auto binding = replay_bindings.find(node.streamId.value());
+            if (binding != replay_bindings.end()) {
+                node.streamId = binding->second;
+                // The replayed stream is ALWAYS the canonical channel frame — the
+                // Parquet is that projection — whatever the sensor originally
+                // published. So a fork's transforms bind directly, with none of the
+                // alternate input mappings a live IMU board needs.
+                node.schemaName = nat::core::NatSignalFrameDataSchemaV1::name;
+                ++rebound;
+            }
+        }
+        if (rebound == 0) {
+            sendError(conn,
+                      "Replay " + replay_id +
+                          " has no bindings matching this graph's sources, so "
+                          "starting it would read live topics instead of the "
+                          "recording.",
+                      request_id);
+            return;
+        }
+        LOG_INFO << "Starting graph " << graph.graphId << " against replay "
+                 << replay_id << " (" << rebound << " source(s) rebound)";
+        for (const auto& node : graph.nodes) {
+            if (node.kind == "stream_source" && node.streamId.has_value()) {
+                replay_source_streams.insert(node.streamId.value());
+            }
+        }
+    }
+
+    const auto validation =
+        validateStreamGraphDefinition(graph, broker_manager_, replay_source_streams);
     if (!validation.valid) {
         sendStreamGraphValidation(
             conn,
@@ -7750,6 +9868,9 @@ void StreamViewerWebSocket::handleStartStreamGraph(
     runtime.graphId = graph.graphId;
     runtime.activeRunId = graph.graphId + ":" + std::to_string(nowUs());
     runtime.runState = "starting";
+    // Remember the replay this run is bound to, so the replay can stop the run it
+    // owns when it ends instead of leaving it wedged on deleted scratch topics.
+    runtime.boundReplayId = replay_id;
     for (const auto& node : graph.nodes) {
         if (node.kind == "stream_source") {
             runtime.nodeStatuses[node.id] = StreamGraphNodeRuntimeStatus{
@@ -7820,7 +9941,8 @@ void StreamViewerWebSocket::handleStartStreamGraph(
         request_id,
         std::move(graph),
         active_run_id,
-        replay_start_offset)
+        replay_start_offset,
+        replay_marker_stream_id)
         .detach();
 }
 
@@ -8139,34 +10261,17 @@ void StreamViewerWebSocket::handleStopStreamGraph(
         return;
     }
 
-    StreamGraphRuntimeState runtime;
     {
         std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
-        const auto search = g_stream_graph_runtime.find(graph_id);
-        if (search == g_stream_graph_runtime.end()) {
+        if (!g_stream_graph_runtime.contains(graph_id)) {
             sendError(conn, "No active graph runtime exists for graph_id");
             return;
         }
-        runtime = search->second;
     }
 
-    for (const auto output_stream_id : runtime.outputStreamIds) {
-        stopGraphWorkerByOutputStreamId(output_stream_id);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
-        auto& active_runtime = g_stream_graph_runtime[graph_id];
-        active_runtime.runState = "stopped";
-        for (auto& entry : active_runtime.nodeStatuses) {
-            if (entry.second.state == "running" || entry.second.state == "stalled" ||
-                entry.second.state == "starting" || entry.second.state == "blocked" ||
-                entry.second.state == "error") {
-                entry.second.state =
-                    entry.second.outputStreamId.has_value() ? "stopped" : entry.second.state;
-            }
-        }
-    }
+    // Same teardown the replay-end cleanup uses; no expected replay id, because an
+    // explicit stop applies to whatever run is currently active.
+    stopStreamGraphRuntimeById(graph_id);
 
     sendStreamGraphStopped(conn, request_id, graph_id);
     broadcastTransformList();
@@ -8640,6 +10745,12 @@ nlohmann::json StreamViewerWebSocket::formatBulkDataAsJson(const nat::core::NatI
     json["stream_id"] = std::to_string(stream_id);
     json["encoding"]["type"] = encoding_type;
     json["encoding"]["size"] = encoding_size;
+    // Frame envelope (populated for framed payloads; zero for legacy frames).
+    json["schema_version"] = bulk.getSchemaVersion();
+    json["seq_no"] = bulk.getSeqNo();
+    json["device_ts_us"] = bulk.getDeviceTsUs();
+    json["sample_rate_hz"] = bulk.getSampleRateHz();
+    json["sample_count"] = bulk.getSampleCount();
     json["samples"] = nlohmann::json::array();
 
     auto records = bulk.createImuRecords();
@@ -8894,11 +11005,16 @@ nlohmann::json StreamViewerWebSocket::formatTransformProvenanceAsJson(
     return json;
 }
 
-void StreamViewerWebSocket::sendError(const WebSocketConnectionPtr& conn, const std::string& message)
+void StreamViewerWebSocket::sendError(const WebSocketConnectionPtr& conn,
+                                     const std::string& message,
+                                     const std::string& requestId)
 {
     nlohmann::json json;
     json["type"] = "error";
     json["message"] = message;
+    if (!requestId.empty()) {
+        json["request_id"] = requestId;
+    }
     conn->send(json.dump());
 }
 
@@ -9129,6 +11245,137 @@ void StreamViewerWebSocket::sendProfileDeleted(
     conn->send(response.dump());
 }
 
+void StreamViewerWebSocket::sendInstanceReplayState(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const std::string& replay_id,
+    const std::string& graph_id,
+    const natkit::tools::ReplayPlan& plan,
+    const natkit::tools::ReplayProgress& progress,
+    const std::string& state)
+{
+    nlohmann::json response =
+        makeReplayStateJson(replay_id, graph_id, plan, progress, state);
+    response["type"] = "instance_replay";
+    response["request_id"] = request_id;
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
+}
+
+// Progress arrives from the replay thread, long after the request; broadcast it.
+void StreamViewerWebSocket::broadcastInstanceReplayState(
+    const std::string& replay_id,
+    const std::string& graph_id,
+    const natkit::tools::ReplayPlan& plan,
+    const natkit::tools::ReplayProgress& progress,
+    const std::string& state)
+{
+    nlohmann::json response =
+        makeReplayStateJson(replay_id, graph_id, plan, progress, state);
+    response["type"] = "instance_replay";
+    response["request_id"] = "";
+    const auto payload = response.dump();
+    std::vector<WebSocketConnectionPtr> connections;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        connections.reserve(clients_.size());
+        for (const auto& entry : clients_) {
+            connections.push_back(entry.first);
+        }
+    }
+    for (const auto& conn : connections) {
+        if (conn && conn->connected()) {
+            conn->send(payload);
+        }
+    }
+}
+
+void StreamViewerWebSocket::sendExperimentInstance(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const nlohmann::json& instance_json)
+{
+    nlohmann::json response;
+    response["type"] = "experiment_instance";
+    response["request_id"] = request_id;
+    response["graph"] = instance_json;
+    response["graph_id"] = instance_json.value("graph_id", std::string{});
+    response["instance_id"] = instance_json.value("instance_id", std::string{});
+    if (conn && conn->connected()) {
+        conn->send(response.dump());
+    }
+}
+
+// Materialization runs on its own thread and can finish long after the request
+// that started it, so its outcome goes to EVERY client rather than back down the
+// originating connection (which may be gone).
+void StreamViewerWebSocket::broadcastExperimentInstance(
+    const nlohmann::json& instance_json)
+{
+    nlohmann::json response;
+    response["type"] = "experiment_instance";
+    response["request_id"] = "";
+    response["graph"] = instance_json;
+    response["graph_id"] = instance_json.value("graph_id", std::string{});
+    response["instance_id"] = instance_json.value("instance_id", std::string{});
+    const auto payload = response.dump();
+
+    std::vector<WebSocketConnectionPtr> connections;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        connections.reserve(clients_.size());
+        for (const auto& entry : clients_) {
+            connections.push_back(entry.first);
+        }
+    }
+    for (const auto& conn : connections) {
+        if (conn && conn->connected()) {
+            conn->send(payload);
+        }
+    }
+}
+
+void StreamViewerWebSocket::sendExperimentList(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id)
+{
+    nlohmann::json response;
+    response["type"] = "experiment_list";
+    response["request_id"] = request_id;
+    response["experiments"] = nlohmann::json::array();
+    std::lock_guard<std::mutex> lock(g_experiment_mutex);
+    for (const auto& entry : g_experiments) {
+        response["experiments"].push_back(entry.second);
+    }
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendExperimentSaved(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const nlohmann::json& experiment_json)
+{
+    nlohmann::json response;
+    response["type"] = "experiment_saved";
+    response["request_id"] = request_id;
+    response["experiment"] = experiment_json;
+    response["experiment_id"] = experiment_json.value("experiment_id", std::string{});
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendExperimentDeleted(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const std::string& experiment_id)
+{
+    nlohmann::json response;
+    response["type"] = "experiment_deleted";
+    response["request_id"] = request_id;
+    response["experiment_id"] = experiment_id;
+    conn->send(response.dump());
+}
+
 void StreamViewerWebSocket::sendStreamGraphValidation(
     const WebSocketConnectionPtr& conn,
     const std::string& request_id,
@@ -9268,6 +11515,19 @@ void StreamViewerWebSocket::broadcastMlControlPlaneMessage(
 
 void StreamViewerWebSocket::ensureMlControlPlaneClient()
 {
+    // The lock is held ONLY while inspecting/updating the client state. It must not
+    // still be held when connectToServer() is called below:
+    // WebSocketClient::connectToServer invokes its completion callback SYNCHRONOUSLY
+    // when the connection fails outright (an unreachable control plane), and that
+    // callback re-locks this same non-recursive mutex. Holding it across the call
+    // self-deadlocked the thread, and because every ml_proxy action starts by calling
+    // this function, the deadlock then consumed each drogon event loop in turn until
+    // the whole backend stopped answering -- HTTP included. Restarting the control
+    // plane container was enough to trigger it.
+    std::string url;
+    std::string service_user;
+    drogon::WebSocketClientPtr client;
+    {
     std::lock_guard<std::mutex> lock(ml_client_mutex_);
     if (ml_client_ && ml_client_->getConnection() &&
         ml_client_->getConnection()->connected()) {
@@ -9279,26 +11539,27 @@ void StreamViewerWebSocket::ensureMlControlPlaneClient()
     ml_client_connecting_ = true;
 
     const char* url_env = std::getenv("NATKIT_ML_CONTROL_PLANE_URL");
-    const std::string url =
-        (url_env != nullptr && std::string(url_env).size() > 0)
-            ? std::string(url_env)
-            : std::string("ws://127.0.0.1:8786");
+    url = (url_env != nullptr && std::string(url_env).size() > 0)
+              ? std::string(url_env)
+              : std::string("ws://127.0.0.1:8786");
     const char* user_env = std::getenv("NATKIT_ML_PROXY_USERNAME");
-    const std::string service_user =
+    service_user =
         (user_env != nullptr && std::string(user_env).size() > 0)
             ? std::string(user_env)
             : std::string("admin");
+
+    client = drogon::WebSocketClient::newWebSocketClient(url);
+    ml_client_ = client;
+    }  // ml_client_mutex_ released before any callback can fire
 
     const auto token = AuthManager::instance().createServiceSession(service_user);
     if (!token.has_value()) {
         LOG_ERROR << "ML proxy: could not mint a service session for '"
                   << service_user << "'; control-plane proxy unavailable.";
+        std::lock_guard<std::mutex> lock(ml_client_mutex_);
         ml_client_connecting_ = false;
         return;
     }
-
-    auto client = drogon::WebSocketClient::newWebSocketClient(url);
-    ml_client_ = client;
 
     client->setMessageHandler(
         [this](std::string&& message,
@@ -9376,5 +11637,116 @@ void StreamViewerWebSocket::handleMlProxyAction(
         conn->send(envelope.dump());
         return;
     }
-    client->getConnection()->send(json["message"].dump());
+    // Instance-backed training (Phase 6): the browser names INSTANCES by graph id;
+    // the backend swaps them for their materialized artifact paths before the job
+    // leaves. It does that here because the backend owns the instance store — the
+    // browser has no business knowing container paths, and the control plane has no
+    // business reading the graph store.
+    nlohmann::json message = json["message"];
+    if (message.value("action", std::string{}) == "start_train_validate_job") {
+        std::string resolve_error;
+        if (!resolveTrainInstanceDatasets(message, resolve_error)) {
+            sendError(conn, resolve_error,
+                      message.value("request_id", std::string{}));
+            return;
+        }
+    }
+    client->getConnection()->send(message.dump());
+}
+
+// Replace `train_instances`/`eval_instances` entries (instance graph ids) with the
+// concrete dataset the trainer needs: the Parquet + markers paths, plus the
+// provenance that makes an instance a better training input than a run selector.
+//
+// Refuses rather than silently degrading: a job that quietly trains on nothing, or
+// on a different recording than the operator picked, is worse than one that fails.
+bool StreamViewerWebSocket::resolveTrainInstanceDatasets(
+    nlohmann::json& message, std::string& error)
+{
+    const auto resolveList = [&](const char* key) -> bool {
+        if (!message.contains(key) || !message[key].is_array()) {
+            return true;
+        }
+        nlohmann::json resolved = nlohmann::json::array();
+        for (const auto& entry : message[key]) {
+            // Already-resolved entries (an object with a parquet path) pass through.
+            if (entry.is_object() && entry.contains("parquet")) {
+                resolved.push_back(entry);
+                continue;
+            }
+            const auto graph_id = entry.is_string()
+                                      ? entry.get<std::string>()
+                                      : entry.value("graph_id", std::string{});
+            if (graph_id.empty()) {
+                error = "train_instances entries must be an instance graph_id";
+                return false;
+            }
+
+            std::string experiment_id;
+            std::string instance_id;
+            nlohmann::json recording;
+            {
+                std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+                ensureStreamGraphStoreLoadedLocked();
+                const auto stored = g_stream_graphs.find(graph_id);
+                if (stored == g_stream_graphs.end()) {
+                    error = "Unknown instance: " + graph_id;
+                    return false;
+                }
+                if (stored->second.instanceId.empty()) {
+                    error = "'" + graph_id +
+                            "' is a live board, not a recorded instance — there are "
+                            "no materialized files to train on.";
+                    return false;
+                }
+                experiment_id = stored->second.experimentId;
+                instance_id = stored->second.instanceId;
+                recording = stored->second.recording;
+            }
+
+            const auto status = recording.value("status", std::string{});
+            if (status != "complete") {
+                error = "Instance " + instance_id + " is '" + status +
+                        "', not complete — it has no verified artifacts to train on.";
+                return false;
+            }
+            const auto artifacts =
+                recording.value("artifacts", nlohmann::json::object());
+            const auto directory = std::filesystem::path(artifacts.value(
+                "directory",
+                instanceArtifactDir(experiment_id, instance_id).string()));
+            const auto data = artifacts.value("data", nlohmann::json::array());
+            if (data.empty()) {
+                error = "Instance " + instance_id + " lists no data artifacts.";
+                return false;
+            }
+            // One entry per recorded source: a multi-sensor recording trains on all
+            // of them, which is what recording them together was for.
+            for (const auto& artifact : data) {
+                nlohmann::json dataset;
+                dataset["session_id"] = recording.value("session_id", experiment_id);
+                dataset["instance_id"] = instance_id;
+                dataset["graph_id"] = graph_id;
+                dataset["run_index"] = static_cast<int>(resolved.size() + 1);
+                dataset["parquet"] =
+                    (directory / artifact.value("path", std::string{})).string();
+                if (artifacts.contains("markers")) {
+                    dataset["markers"] =
+                        (directory / artifacts.value("markers", std::string{}))
+                            .string();
+                }
+                dataset["window_start_us"] =
+                    recording.value("window_start_us", static_cast<int64_t>(0));
+                dataset["window_end_us"] =
+                    recording.value("window_end_us", static_cast<int64_t>(0));
+                dataset["device_id"] = artifact.value("stream_id", std::string{});
+                dataset["rows"] = artifact.value("rows", 0);
+                dataset["sha256"] = artifact.value("sha256", std::string{});
+                resolved.push_back(std::move(dataset));
+            }
+        }
+        message[key] = std::move(resolved);
+        return true;
+    };
+    return resolveList("train_instances") && resolveList("eval_instances");
 }

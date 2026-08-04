@@ -61,12 +61,43 @@ target_link_libraries(libnatkit-natkit-menu PRIVATE
 )
 
 if(BUILD_NATKIT_BACKEND)
+  # Parquet export (GET /api/streams/{id}/parquet) needs Arrow's Parquet C++
+  # writer. Optional so a build without libparquet-dev still works: when it is
+  # absent the endpoint compiles to a clear 501 instead of failing the build.
+  find_package(Parquet QUIET)
+  if(NOT Parquet_FOUND)
+    find_library(PARQUET_LIBRARY NAMES parquet)
+    find_library(ARROW_LIBRARY NAMES arrow)
+    find_path(PARQUET_INCLUDE_DIR NAMES parquet/api/writer.h)
+    if(PARQUET_LIBRARY AND ARROW_LIBRARY AND PARQUET_INCLUDE_DIR)
+      set(NATKIT_HAVE_PARQUET ON)
+    endif()
+  else()
+    set(NATKIT_HAVE_PARQUET ON)
+  endif()
+
   add_executable(libnatkit-natkit-backend
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/Auth.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/ParquetExport.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/ReplaySource.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/StreamViewerWebSocket.cpp
   )
+
+  if(NATKIT_HAVE_PARQUET)
+    message(STATUS "natkit-backend: Parquet export ENABLED")
+    target_compile_definitions(libnatkit-natkit-backend PRIVATE NATKIT_HAVE_PARQUET=1)
+    if(Parquet_FOUND)
+      target_link_libraries(libnatkit-natkit-backend PRIVATE Parquet::parquet_shared)
+    else()
+      target_include_directories(libnatkit-natkit-backend PRIVATE ${PARQUET_INCLUDE_DIR})
+      target_link_libraries(libnatkit-natkit-backend PRIVATE ${PARQUET_LIBRARY} ${ARROW_LIBRARY})
+    endif()
+  else()
+    message(STATUS "natkit-backend: Parquet export DISABLED (libparquet-dev not found)")
+  endif()
+
   target_link_libraries(libnatkit-natkit-backend PRIVATE
     libnatkit-core-kafka-cxx
     nlohmann
@@ -83,6 +114,22 @@ if(BUILD_NATKIT_BACKEND)
     uuid
     brotlienc
   )
+
+  # c-ares, if the vendored trantor was built against it. trantor compiles its
+  # AresResolver (async DNS) only when the c-ares headers are present at ITS
+  # configure time, and then libtrantor.a carries undefined ares_* symbols that
+  # this hardcoded link list must satisfy. Whether those headers exist is an
+  # ambient property of the image, not something this project asked for --
+  # installing libparquet-dev pulls libc-ares-dev in transitively (via
+  # libgrpc/arrow-flight), which is exactly how the backend link started failing
+  # when Parquet support was added. Linking it when present keeps the build
+  # correct either way. Appended AFTER trantor above: static-archive symbol
+  # resolution is order-sensitive.
+  find_library(CARES_LIBRARY NAMES cares)
+  if(CARES_LIBRARY)
+    message(STATUS "natkit-backend: linking c-ares (${CARES_LIBRARY}) for trantor's AresResolver")
+    target_link_libraries(libnatkit-natkit-backend PRIVATE ${CARES_LIBRARY})
+  endif()
 endif()
 
 if(BUILD_TESTING)

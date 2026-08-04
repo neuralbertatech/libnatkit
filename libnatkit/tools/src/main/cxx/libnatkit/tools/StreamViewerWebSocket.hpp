@@ -14,6 +14,50 @@
 #include <memory>
 
 #include "Auth.hpp"
+#include "ReplaySource.hpp"
+
+// A record projected onto the canonical numeric channel-frame shape.
+//
+// Shared so the Parquet exporter runs the SAME projection as the transform and
+// viewer paths rather than reimplementing it. That matters beyond tidiness: a
+// sensor whose descriptor doesn't literally match the contract (the IMU bulk
+// frame exposes flat accel_x/gyro_z arrays, Muse nests under eeg.*) is only
+// filterable/plottable because of an alternate input mapping, and export has to
+// honour those same mappings or it silently supports a narrower set of sensors
+// than the rest of the system.
+struct NatKitChannelFrameProjection {
+    std::string deviceId;
+    uint64_t seqNo = 0;
+    uint64_t deviceTsUs = 0;
+    uint32_t sampleRateHz = 0;
+    std::vector<std::string> channelLabels;
+    // Channel-major: channelLabels.size() runs of samplesPerChannel floats.
+    std::vector<float> samples;
+    uint32_t samplesPerChannel = 0;
+};
+
+// Project a record to channel frames via the canonical contract, falling back
+// to any registered alternate input mapping for its schema. nullopt when the
+// record isn't a numeric channel frame under either.
+// sourceStreamId is used to synthesize a device id for schemas that carry no
+// device_id field of their own (the IMU bulk frame is one), so pass the real
+// stream id -- it ends up in the exported rows and the download filename.
+std::optional<NatKitChannelFrameProjection> projectRecordToChannelFrame(
+    const nat::core::Schema& record, uint64_t sourceStreamId = 0);
+
+// Resolve an instance artifact for download: given an instance's graph id and an
+// artifact name, return the directory holding it and whether that name is actually
+// listed in the instance's manifest.
+//
+// The name is CHECKED AGAINST THE MANIFEST rather than joined onto the directory by
+// the caller, because a client-supplied path would otherwise be a directory
+// traversal straight out of the instance volume. Lives here because the graph store
+// (and therefore the instance record) does.
+// Returns false when the graph id is not an instance.
+bool natkitLookupInstanceArtifact(const std::string& graphId,
+                                  const std::string& artifactName,
+                                  std::string& directoryOut,
+                                  bool& listedOut);
 
 // Client context for tracking subscriptions and streaming thread
 struct StreamViewerClientContext {
@@ -90,6 +134,12 @@ private:
     // Forward a browser-originated control-plane action up to the control plane.
     void handleMlProxyAction(const drogon::WebSocketConnectionPtr& conn,
                              const nlohmann::json& json);
+    // Swap instance graph ids in a train job for their materialized artifact paths
+    // (Phase 6). The backend owns the instance store, so it is the only component
+    // that can map an instance to files — the browser must not know container paths,
+    // and the control plane must not read the graph store.
+    bool resolveTrainInstanceDatasets(nlohmann::json& message, std::string& error);
+
     // Re-broadcast a raw control-plane message to all /ws/stream_viewer clients.
     void broadcastMlControlPlaneMessage(const std::string& raw_message);
 
@@ -142,6 +192,13 @@ private:
     void handleSaveStreamGraph(const drogon::WebSocketConnectionPtr& conn,
                                const nlohmann::json& json);
 
+    // Fork a graph into a new EDITABLE instance nested under the same experiment.
+    // A fork is an instance that happens to be mutable: it inherits the source's
+    // `recording` verbatim, so it points at the same materialized artifacts and
+    // forking is free regardless of how large the recording was.
+    void handleForkStreamGraph(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
+
     void handleValidateStreamGraph(const drogon::WebSocketConnectionPtr& conn,
                                    const nlohmann::json& json);
 
@@ -166,6 +223,51 @@ private:
                            const nlohmann::json& json);
     void handleDeleteProfile(const drogon::WebSocketConnectionPtr& conn,
                              const nlohmann::json& json);
+
+    // Experiments (experiment-history-snapshots-plan, Phase 1): the experiment is
+    // a stored entity that owns a board and (later) its recorded instances, so the
+    // protocol/participant/notes leave the canvas. save_experiment is also the
+    // sole writer of the 1:1 experiment<->board binding.
+    void handleListExperiments(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
+    void handleSaveExperiment(const drogon::WebSocketConnectionPtr& conn,
+                              const nlohmann::json& json);
+    void handleDeleteExperiment(const drogon::WebSocketConnectionPtr& conn,
+                                const nlohmann::json& json);
+
+    // Recording mints an INSTANCE: an immutable snapshot of the board welded to
+    // the data captured during that run (experiment-history-snapshots-plan,
+    // Phases 2 + 3). start_ snapshots the live board and opens the window;
+    // finish_ closes it and materializes the raw sources to Parquet.
+    void handleStartExperimentInstance(const drogon::WebSocketConnectionPtr& conn,
+                                       const nlohmann::json& json);
+    void handleFinishExperimentInstance(const drogon::WebSocketConnectionPtr& conn,
+                                        const nlohmann::json& json);
+    // Drain each recorded source to Parquet + write the markers sidecar, verify it
+    // captured something, checksum, seal. Runs on a detached thread (it takes tens
+    // of seconds per stream) and broadcasts the outcome.
+    void materializeInstance(const std::string& graph_id);
+
+    // Replay (Phase 5): stream an instance's Parquet back onto a scratch Kafka
+    // topic so the whole downstream graph works unchanged. Review mode is paced
+    // from the original device_ts_us deltas; recompute mode is unpaced.
+    void handleStartInstanceReplay(const drogon::WebSocketConnectionPtr& conn,
+                                   const nlohmann::json& json);
+    void handleStopInstanceReplay(const drogon::WebSocketConnectionPtr& conn,
+                                  const nlohmann::json& json);
+    void handleListInstanceReplays(const drogon::WebSocketConnectionPtr& conn,
+                                   const nlohmann::json& json);
+
+    // Re-check an instance's artifacts against their recorded sha256. A checksum
+    // nobody verifies is decoration; this is what makes "detectable at review time"
+    // true rather than aspirational.
+    void handleVerifyExperimentInstance(const drogon::WebSocketConnectionPtr& conn,
+                                        const nlohmann::json& json);
+
+    // Delete a board, a fork, or (deliberately, with force) a sealed instance and
+    // its artifacts.
+    void handleDeleteStreamGraph(const drogon::WebSocketConnectionPtr& conn,
+                                 const nlohmann::json& json);
 
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
@@ -224,7 +326,13 @@ private:
         size_t encoding_size);
 
     // Send error message to client
-    void sendError(const drogon::WebSocketConnectionPtr& conn, const std::string& message);
+    // requestId echoes the originating request so a client can tell WHICH call
+    // failed. Errors used to be uncorrelatable, which matters as soon as a
+    // rejection is expected in normal operation (e.g. saving an immutable
+    // instance) rather than being a fatal surprise.
+    void sendError(const drogon::WebSocketConnectionPtr& conn,
+                   const std::string& message,
+                   const std::string& requestId = std::string{});
 
     // Send status update to client
     void sendStatus(const drogon::WebSocketConnectionPtr& conn, StreamViewerClientContext* ctx);
@@ -276,6 +384,32 @@ private:
     void sendProfileDeleted(const drogon::WebSocketConnectionPtr& conn,
                             const std::string& request_id,
                             const std::string& participant_id);
+
+    void sendExperimentList(const drogon::WebSocketConnectionPtr& conn,
+                            const std::string& request_id);
+    void sendExperimentInstance(const drogon::WebSocketConnectionPtr& conn,
+                                const std::string& request_id,
+                                const nlohmann::json& instance_json);
+    void broadcastExperimentInstance(const nlohmann::json& instance_json);
+
+    void sendInstanceReplayState(const drogon::WebSocketConnectionPtr& conn,
+                                 const std::string& request_id,
+                                 const std::string& replay_id,
+                                 const std::string& graph_id,
+                                 const natkit::tools::ReplayPlan& plan,
+                                 const natkit::tools::ReplayProgress& progress,
+                                 const std::string& state);
+    void broadcastInstanceReplayState(const std::string& replay_id,
+                                      const std::string& graph_id,
+                                      const natkit::tools::ReplayPlan& plan,
+                                      const natkit::tools::ReplayProgress& progress,
+                                      const std::string& state);
+    void sendExperimentSaved(const drogon::WebSocketConnectionPtr& conn,
+                             const std::string& request_id,
+                             const nlohmann::json& experiment_json);
+    void sendExperimentDeleted(const drogon::WebSocketConnectionPtr& conn,
+                               const std::string& request_id,
+                               const std::string& experiment_id);
 
     void sendStreamGraphValidation(
         const drogon::WebSocketConnectionPtr& conn,

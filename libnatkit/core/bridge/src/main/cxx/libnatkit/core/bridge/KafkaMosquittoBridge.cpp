@@ -2,6 +2,9 @@
 
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
+#include <set>
 
 #include <libnatkit/util/Casting.hpp>
 #include <libnatkit/util/Strings.hpp>
@@ -234,9 +237,47 @@ std::string format_message_for_logging(const std::string& topic_name,
   return "<binary payload, " + std::to_string(message.size()) + " bytes>";
 }
 
+// Per-message tracing is OFF by default. It ran on every frame in both
+// directions and printed the FULLY DECODED payload, which for a bulk IMU frame
+// is ~100 lines -- it drowned every other service's output in `compose logs`
+// and burned real CPU decoding records purely to throw the string away.
+// Opt back in with NATKIT_BRIDGE_LOG_MESSAGES=1 when debugging the wire.
+bool bridge_message_logging_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("NATKIT_BRIDGE_LOG_MESSAGES");
+    if (raw == nullptr) {
+      return false;
+    }
+    const std::string value(raw);
+    return value == "1" || value == "true" || value == "TRUE" || value == "yes";
+  }();
+  return enabled;
+}
+
+// Complain about an unroutable MQTT topic the first time we see it, then stay
+// quiet about that topic.
+void warn_unrecognized_topic_once(const std::string& topic) {
+  static std::mutex seen_lock;
+  static std::set<std::string> seen;
+  {
+    const std::lock_guard<std::mutex> lock(seen_lock);
+    if (!seen.insert(topic).second) {
+      return;
+    }
+  }
+  std::cout << "[Bridge] Ignoring unrecognized MQTT topic: " << topic
+            << " (further messages on this topic are silent)\n";
+}
+
 void log_bridge_message(const char* direction, const std::string& topic_name,
                         const nat::core::message_t& message,
                         const nat::core::Registry* registry) {
+  // Check the flag BEFORE formatting: format_message_for_logging decodes the
+  // whole record, so doing it unconditionally would keep the cost even with
+  // logging off.
+  if (!bridge_message_logging_enabled()) {
+    return;
+  }
   std::cout << "[Bridge][" << direction << "] topic=" << topic_name
             << " payload=" << format_message_for_logging(topic_name, message, registry)
             << "\n";
@@ -356,8 +397,10 @@ void KafkaMosquittoBridge::onMosquittoMessageReceived(mosquitto::MosquittoClient
       std::make_unique<core::message_t>(message.begin(), message.end());
   const auto topicName = map_mqtt_topic_to_kafka_topic(topic, *encodedMessage);
   if (topicName.empty()) {
-    std::cout << "Error: Mosquitto recieved unrecognized topic " << topic
-              << '\n';
+    // Once per distinct topic: an unrecognized topic is usually a misconfigured
+    // publisher streaming at full rate, so logging per message would flood just
+    // as badly as the payload tracing did.
+    warn_unrecognized_topic_once(topic);
     return;
   }
   log_bridge_message("MQTT->Kafka", topicName, *encodedMessage, registry.get());

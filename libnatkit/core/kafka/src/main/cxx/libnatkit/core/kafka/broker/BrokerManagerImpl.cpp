@@ -111,26 +111,62 @@ public:
   }
 
   virtual void deleteTopic(const std::string& topicName) override {
-    auto topicDeleter = rd_kafka_DeleteTopic_new(topicName.c_str());
-    rd_kafka_DeleteTopic_destroy(topicDeleter);
-    /**
- * @brief Delete topics from cluster as specified by the \p topics
- *        array of size \p topic_cnt elements.
- *
- * @param topics Array of topics to delete.
- * @param topic_cnt Number of elements in \p topics array.
- * @param options Optional admin options, or NULL for defaults.
- * @param rkqu Queue to emit result on.
- *
- * @remark The result event type emitted on the supplied queue is of type
- *         \c RD_KAFKA_EVENT_DELETETOPICS_RESULT
-RD_EXPORT
-void rd_kafka_DeleteTopics (rd_kafka_t *rk,
-                                  rd_kafka_DeleteTopic_t **del_topics,
-                                  size_t del_topic_cnt,
-                                  const rd_kafka_AdminOptions_t *options,
-                                  rd_kafka_queue_t *rkqu);
-                                  */
+    // rd_kafka_DeleteTopics is ASYNCHRONOUS: the request goes to the cluster and
+    // the outcome comes back as an event on a queue. The previous implementation
+    // built a DeleteTopic handle and immediately destroyed it without ever issuing
+    // the request (the call sat inside a comment block), so deleting a topic
+    // silently did nothing -- which the delete-topic tool and, later, replay's
+    // scratch-topic cleanup both quietly depended on.
+    const auto producer = createProducer();
+    if (!producer) {
+      std::cerr << "  [Kafka] deleteTopic(" << topicName
+                << "): no client handle\n";
+      return;
+    }
+    rd_kafka_t *handle = producer->c_ptr();
+    if (handle == nullptr) {
+      return;
+    }
+
+    rd_kafka_DeleteTopic_t *topic = rd_kafka_DeleteTopic_new(topicName.c_str());
+    rd_kafka_DeleteTopic_t *topics[1] = {topic};
+    rd_kafka_queue_t *queue = rd_kafka_queue_new(handle);
+    rd_kafka_DeleteTopics(handle, topics, 1, nullptr, queue);
+
+    // Wait for the result so a caller that deletes then immediately re-lists sees a
+    // consistent cluster. Bounded: a broker that never answers must not wedge us.
+    constexpr int kTimeoutMs = 10000;
+    rd_kafka_event_t *event = rd_kafka_queue_poll(queue, kTimeoutMs);
+    if (event == nullptr) {
+      std::cerr << "  [Kafka] deleteTopic(" << topicName
+                << "): timed out waiting for the cluster\n";
+    } else {
+      const rd_kafka_DeleteTopics_result_t *result =
+          rd_kafka_event_DeleteTopics_result(event);
+      if (result == nullptr) {
+        std::cerr << "  [Kafka] deleteTopic(" << topicName << "): "
+                  << rd_kafka_event_error_string(event) << '\n';
+      } else {
+        size_t count = 0;
+        const rd_kafka_topic_result_t **results =
+            rd_kafka_DeleteTopics_result_topics(result, &count);
+        for (size_t index = 0; index < count; ++index) {
+          const auto error = rd_kafka_topic_result_error(results[index]);
+          // UNKNOWN_TOPIC_OR_PART just means someone got there first.
+          if (error != RD_KAFKA_RESP_ERR_NO_ERROR &&
+              error != RD_KAFKA_RESP_ERR_UNKNOWN_TOPIC_OR_PART) {
+            std::cerr << "  [Kafka] deleteTopic("
+                      << rd_kafka_topic_result_name(results[index]) << "): "
+                      << rd_kafka_topic_result_error_string(results[index])
+                      << '\n';
+          }
+        }
+      }
+      rd_kafka_event_destroy(event);
+    }
+
+    rd_kafka_queue_destroy(queue);
+    rd_kafka_DeleteTopic_destroy(topic);
   }
 
   virtual StreamTimeExtent

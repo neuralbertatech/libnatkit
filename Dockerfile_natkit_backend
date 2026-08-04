@@ -11,16 +11,38 @@ RUN apt update
 RUN apt install cmake -y
 RUN apt install build-essential -y 
 RUN apt install -y libjsoncpp-dev libssl-dev zlib1g-dev libsqlite3-dev uuid-dev
+
+# Apache Arrow / Parquet C++ — the backend writes Parquet directly for the
+# stream export endpoint (GET /api/streams/{id}/parquet), so no Python is in the
+# export path. Arrow is not in Debian bookworm's default repos; pull Apache's
+# own APT source, which provides libparquet-dev.
+RUN apt install -y lsb-release wget ca-certificates \
+    && wget -q https://apache.jfrog.io/artifactory/arrow/debian/apache-arrow-apt-source-latest-bookworm.deb -O /tmp/apache-arrow-apt-source.deb \
+    && apt install -y /tmp/apache-arrow-apt-source.deb \
+    && apt update \
+    && apt install -y libparquet-dev \
+    && rm -f /tmp/apache-arrow-apt-source.deb
 #RUN apt install dos2unix -y
 
-COPY . ./
-#RUN find . -type f -print0 | xargs -0 dos2unix
+# Toolchain probes. Kept ABOVE any COPY so they stay cached — they describe the
+# base image, not our source.
 RUN ls /usr/include/jsoncpp/json
-RUN ls /usr/local/lib
 RUN g++ -xc++ -E -v - < /dev/null
 RUN gcc -v -E - < /dev/null 2>&1 | awk '/#include <...> search starts here:/ {f=1; next} /End of search list./ {f=0} f' | xargs ls
 
-
+# --- Third-party: drogon ----------------------------------------------------
+# Copied and built BEFORE the project source. Drogon takes the bulk of this
+# image's build time and changes only when the submodule moves, but it used to sit
+# behind `COPY . ./` — so editing one line of backend C++ invalidated it and every
+# rebuild paid the full ~20 minutes. Copying just third-party/ first keeps those
+# layers cached across source edits (~2 min rebuilds instead).
+#
+# Safe because the project build consumes drogon from its INSTALL prefix
+# (/usr/local): the top-level CMakeLists never adds third-party/drogon as a
+# subdirectory, so nothing rebuilds it later. The `COPY . ./` below re-copies
+# third-party/ with identical content and cannot clobber the build output —
+# .dockerignore excludes third-party/drogon/build/, CMakeCache.txt and CMakeFiles/.
+COPY third-party ./third-party
 RUN cmake -B third-party/drogon/build -S third-party/drogon -DCMAKE_BUILD_TYPE=Release
 RUN sh -lc 'jobs="${NATKIT_CMAKE_BUILD_PARALLEL:-}"; \
     if [ -z "$jobs" ]; then \
@@ -29,10 +51,16 @@ RUN sh -lc 'jobs="${NATKIT_CMAKE_BUILD_PARALLEL:-}"; \
     fi; \
     cmake --build third-party/drogon/build --parallel "$jobs"'
 RUN cmake --install third-party/drogon/build
+RUN ls /usr/local/lib
 RUN ln -s /usr/include/jsoncpp/json /usr/include/json
 
 #CMD exec /bin/sh -c "trap : TERM INT; sleep infinity & wait"
 
+# --- Project source ---------------------------------------------------------
+# Everything below re-runs on any source edit. That is the point: it is the cheap
+# part (librdkafka + libnatkit-core + the backend itself).
+COPY . ./
+#RUN find . -type f -print0 | xargs -0 dos2unix
 RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_NATKIT_BACKEND=ON
 RUN sh -lc 'jobs="${NATKIT_CMAKE_BUILD_PARALLEL:-}"; \
     if [ -z "$jobs" ]; then \

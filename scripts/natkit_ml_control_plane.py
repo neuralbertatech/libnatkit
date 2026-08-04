@@ -200,6 +200,14 @@ def build_pipeline_namespace(
         "families": payload.get("families"),
         "train_runs": train_runs,
         "eval_runs": eval_runs,
+        # Instance-backed datasets (experiment-history-snapshots-plan, Phase 6).
+        # Each entry names an instance's materialized artifacts, so the pipeline
+        # skips Kafka discovery/reconstruction entirely — training from a recording
+        # no longer depends on it still being inside retention. Passed through
+        # verbatim; the backend resolves instance ids to paths because it owns the
+        # instance store.
+        "train_instances": list(payload.get("train_instances") or []),
+        "eval_instances": list(payload.get("eval_instances") or []),
         "selected_fields": list(payload.get("selected_fields") or []),
         "rest_gesture": payload.get("rest_gesture", base_args.rest_gesture),
         "active_gesture": payload.get("active_gesture", base_args.active_gesture),
@@ -314,11 +322,17 @@ def sanitize_pipeline_report(
         "model_family": report.get("selected_family"),
         "selected_fields": list(report.get("selected_fields") or []),
         "selected_channel_indexes": list(report.get("selected_channel_indexes") or []),
+        # Absolute paths stay stripped — they are container-local and ephemeral, and
+        # the browser has no use for them. The INSTANCE identity does travel: a model
+        # whose lineage cannot be traced back to the exact snapshot it was trained on
+        # is the problem instance-backed training exists to solve.
         "train_runs": [
             {
                 "session_id": run.get("session_id"),
                 "run_index": run.get("run_index"),
                 "device_id": run.get("device_id"),
+                "instance_id": run.get("instance_id") or None,
+                "instance_graph_id": run.get("instance_graph_id") or None,
             }
             for run in report.get("train_runs", [])
         ],
@@ -327,6 +341,8 @@ def sanitize_pipeline_report(
                 "session_id": run.get("session_id"),
                 "run_index": run.get("run_index"),
                 "device_id": run.get("device_id"),
+                "instance_id": run.get("instance_id") or None,
+                "instance_graph_id": run.get("instance_graph_id") or None,
             }
             for run in report.get("eval_runs", [])
         ],
@@ -358,6 +374,8 @@ def build_job_request_payload(
         "broker": payload.get("broker", base_args.broker),
         "families": list(payload.get("families") or []),
         "train_runs": list(payload.get("train_runs") or []),
+        "train_instances": list(payload.get("train_instances") or []),
+        "eval_instances": list(payload.get("eval_instances") or []),
         "eval_runs": list(payload.get("eval_runs") or []),
         "selected_fields": list(payload.get("selected_fields") or []),
         "rest_gesture": payload.get("rest_gesture", base_args.rest_gesture),
@@ -2341,10 +2359,12 @@ class MlControlPlaneServer:
                 request_id=request_id,
             )
             return
-        if not request_payload["train_runs"]:
+        # A job needs a dataset, from EITHER source: run selectors (reconstructed
+        # from Kafka) or instances (read from their materialized artifacts).
+        if not request_payload["train_runs"] and not request_payload["train_instances"]:
             await self._send_error(
                 websocket,
-                "train_runs is required",
+                "train_runs or train_instances is required",
                 request_id=request_id,
             )
             return

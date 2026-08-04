@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutex>
+
 #include <chrono>
 #include <map>
 #include <set>
@@ -16,6 +18,12 @@ class KafkaMessengerPool {
   std::map<std::string, std::unique_ptr<kafka::BrokerMessagingQueue>>
       messengers;
   std::set<std::string> monitoredTopics{};
+  // Guards `messengers` + `monitoredTopics`. They are touched from TWO threads: the
+  // topic monitor (which creates and now also destroys messengers) and whichever
+  // thread calls sendMessage (the MQTT loop). Unsynchronised concurrent insert +
+  // lookup was already a latent race; adding erase would have made it a
+  // use-after-free.
+  mutable std::mutex messengersLock{};
   std::jthread newTopicMonitor{};
   std::function<void(const std::string &, std::unique_ptr<core::message_t> &&)>
       onMessageRecievedCallback;
@@ -35,9 +43,12 @@ public:
 private:
   void monitorTopics();
   void searchForNewKafakTopics();
+  // Both assume messengersLock is already held by the caller.
   void createNewMessenger(
       const std::unique_ptr<core::BasicTopicInformation> &basicTopicInfo);
   void createNewMessenger(const std::string &topicName);
+  // Tear down messengers whose topic no longer exists on the broker.
+  void dropVanishedTopics(const std::set<std::string> &existingTopics);
   void defaultOnMessageReceived(const std::string &topicString,
                                 std::unique_ptr<core::message_t> &&msg);
 };

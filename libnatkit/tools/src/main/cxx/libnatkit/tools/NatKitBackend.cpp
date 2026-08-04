@@ -31,6 +31,9 @@
 
 #include "StreamViewerWebSocket.hpp"
 #include "Auth.hpp"
+#include "ParquetExport.hpp"
+
+#include <filesystem>
 
 using namespace drogon;
 using namespace std::chrono_literals;
@@ -1315,6 +1318,247 @@ int main()
                     return;
                 }
                 api_controller->is_connected_to_broker(req, std::move(callback));
+        },
+        { Get });
+
+    // Register GET /api/export/parquet — materialize a stream to a Parquet file
+    // and hand it straight back as a download.
+    //
+    // The "join" is upstream on the canvas: a combine node fans a data stream
+    // and an experiment's `markers` into ONE channel (Data/<id> + Marker/<id>
+    // share a stream id), so pointing this at that channel gives rows labelled
+    // with the active cue. A plain data stream exports too, just unlabelled.
+    app().registerHandler("/api/export/parquet",
+        [manager, &auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
+
+                const auto fail = [&callback](const std::string& message,
+                                              HttpStatusCode code) {
+                    Json::Value err_json;
+                    err_json["message"] = message;
+                    callback(makeJsonResponse(err_json, code));
+                };
+
+                if (!natkit::tools::parquetExportAvailable()) {
+                    fail("This backend was built without Parquet support "
+                         "(libparquet-dev missing at build time).",
+                         k501NotImplemented);
+                    return;
+                }
+
+                natkit::tools::ParquetExportRequest export_request;
+                const auto stream_id_param = req->getParameter("stream_id");
+                if (stream_id_param.empty()) {
+                    fail("stream_id is required.", k400BadRequest);
+                    return;
+                }
+                try {
+                    export_request.streamId =
+                        std::stoull(stream_id_param);
+                } catch (const std::exception&) {
+                    fail("stream_id must be a positive integer.", k400BadRequest);
+                    return;
+                }
+
+                // Optional: markers from a different channel, so an export node
+                // can take a data stream and an experiment as separate inputs
+                // rather than requiring a combine node to bundle them first.
+                const auto marker_stream_param =
+                    req->getParameter("marker_stream_id");
+                if (!marker_stream_param.empty()) {
+                    try {
+                        export_request.markerStreamId =
+                            std::stoull(marker_stream_param);
+                    } catch (const std::exception&) {
+                        fail("marker_stream_id must be a positive integer.",
+                             k400BadRequest);
+                        return;
+                    }
+                }
+
+                const auto parse_optional_i64 =
+                    [&req](const char* name) -> std::optional<int64_t> {
+                    const auto raw = req->getParameter(name);
+                    if (raw.empty()) {
+                        return std::nullopt;
+                    }
+                    try {
+                        return std::stoll(raw);
+                    } catch (const std::exception&) {
+                        return std::nullopt;
+                    }
+                };
+                export_request.startUs = parse_optional_i64("start_us");
+                export_request.endUs = parse_optional_i64("end_us");
+
+                const auto label_field = req->getParameter("label_field");
+                if (!label_field.empty()) {
+                    export_request.labelField = label_field;
+                }
+                // Tunables for a slow broker / large session.
+                const auto first_record_timeout_ms =
+                    parse_optional_i64("first_record_timeout_ms");
+                if (first_record_timeout_ms.has_value()) {
+                    export_request.firstRecordTimeoutMs =
+                        static_cast<int>(first_record_timeout_ms.value());
+                }
+                const auto idle_timeout_ms = parse_optional_i64("idle_timeout_ms");
+                if (idle_timeout_ms.has_value()) {
+                    export_request.idleTimeoutMs =
+                        static_cast<int>(idle_timeout_ms.value());
+                }
+
+                const auto run_index = req->getParameter("run_index");
+                if (!run_index.empty()) {
+                    try {
+                        export_request.runIndex = std::stoi(run_index);
+                    } catch (const std::exception&) {
+                        fail("run_index must be an integer.", k400BadRequest);
+                        return;
+                    }
+                }
+
+                // Written to a temp dir, read back, then unlinked — the file is
+                // an implementation detail, the download is the product.
+                const std::string temp_dir =
+                    std::getenv("NATKIT_EXPORT_TMPDIR") != nullptr
+                        ? std::getenv("NATKIT_EXPORT_TMPDIR")
+                        : "/tmp";
+                const auto result = natkit::tools::exportStreamToParquet(
+                    manager, export_request, temp_dir);
+                if (!result.ok) {
+                    LOG_WARN << "Parquet export failed for stream "
+                             << export_request.streamId << ": " << result.error;
+                    fail(result.error, k404NotFound);
+                    return;
+                }
+
+                std::string body;
+                {
+                    std::ifstream file(result.filePath,
+                                       std::ios::binary | std::ios::ate);
+                    if (!file) {
+                        fail("Export succeeded but the file could not be read.",
+                             k500InternalServerError);
+                        std::remove(result.filePath.c_str());
+                        return;
+                    }
+                    const auto size = file.tellg();
+                    file.seekg(0, std::ios::beg);
+                    body.resize(static_cast<size_t>(size));
+                    file.read(body.data(), size);
+                }
+                std::remove(result.filePath.c_str());
+
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k200OK);
+                resp->setContentTypeString("application/vnd.apache.parquet");
+                resp->setBody(std::move(body));
+                resp->addHeader("Content-Disposition",
+                                "attachment; filename=\"" + result.fileName + "\"");
+                // Surfaced in the UI after the download so the operator can see
+                // what they actually got without opening the file.
+                resp->addHeader("X-Natkit-Frame-Count",
+                                std::to_string(result.frameCount));
+                resp->addHeader("X-Natkit-Labelled-Frame-Count",
+                                std::to_string(result.labelledFrameCount));
+                resp->addHeader("X-Natkit-Marker-Count",
+                                std::to_string(result.markerCount));
+                resp->addHeader("X-Natkit-Truncated",
+                                result.truncated ? "true" : "false");
+                if (!result.sessionId.empty()) {
+                    resp->addHeader("X-Natkit-Session-Id", result.sessionId);
+                }
+                LOG_INFO << "Parquet export: stream " << export_request.streamId
+                         << " -> " << result.frameCount << " frames ("
+                         << result.labelledFrameCount << " labelled), "
+                         << result.markerCount << " markers";
+                callback(resp);
+        },
+        { Get });
+
+    // Register GET /api/instances/artifact — download a MATERIALIZED instance
+    // artifact straight off disk.
+    //
+    // Deliberately not the /api/export/parquet path: that one re-drains Kafka, and
+    // the entire point of an instance is that its data has LEFT Kafka (retention is
+    // 168h). Reviewing a snapshot from a year ago has to read the file, not the
+    // broker.
+    app().registerHandler("/api/instances/artifact",
+        [&auth_manager](const HttpRequestPtr& req,
+            std::function<void(const HttpResponsePtr&)>&& callback) {
+                if (!auth_manager.authenticateRequest(req).has_value()) {
+                    Json::Value err_json;
+                    err_json["message"] = "Authentication required.";
+                    callback(makeJsonResponse(err_json, k401Unauthorized));
+                    return;
+                }
+                const auto fail = [&callback](const std::string& message,
+                                              HttpStatusCode code) {
+                    Json::Value err_json;
+                    err_json["message"] = message;
+                    callback(makeJsonResponse(err_json, code));
+                };
+
+                const auto graph_id = req->getParameter("graph_id");
+                const auto name = req->getParameter("path");
+                if (graph_id.empty() || name.empty()) {
+                    fail("graph_id and path are required.", k400BadRequest);
+                    return;
+                }
+
+                // The artifact directory comes from the STORE, and `path` is
+                // matched against the manifest rather than joined onto the
+                // directory: a client-supplied path would otherwise be a directory
+                // traversal ("../../etc/passwd") straight out of the volume.
+                std::string directory;
+                bool listed = false;
+                if (!natkitLookupInstanceArtifact(graph_id, name, directory,
+                                                  listed)) {
+                    fail("Unknown instance graph: " + graph_id, k404NotFound);
+                    return;
+                }
+                if (!listed) {
+                    fail("'" + name + "' is not an artifact of this instance.",
+                         k404NotFound);
+                    return;
+                }
+
+                const std::filesystem::path full =
+                    std::filesystem::path(directory) / name;
+                std::ifstream file(full, std::ios::binary | std::ios::ate);
+                if (!file) {
+                    fail("The artifact is missing from disk: " + full.string() +
+                         " — the instance record and the store disagree.",
+                         k410Gone);
+                    return;
+                }
+                std::string body;
+                const auto size = file.tellg();
+                file.seekg(0, std::ios::beg);
+                body.resize(static_cast<size_t>(size));
+                file.read(body.data(), size);
+
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k200OK);
+                const bool is_parquet = name.size() > 8 &&
+                    name.compare(name.size() - 8, 8, ".parquet") == 0;
+                resp->setContentTypeString(
+                    is_parquet ? "application/vnd.apache.parquet"
+                               : "application/x-ndjson");
+                resp->setBody(std::move(body));
+                resp->addHeader("Content-Disposition",
+                                "attachment; filename=\"" + graph_id + "-" + name +
+                                    "\"");
+                LOG_INFO << "Served instance artifact " << graph_id << "/" << name
+                         << " (" << size << " bytes)";
+                callback(resp);
         },
         { Get });
 

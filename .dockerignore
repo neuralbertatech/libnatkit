@@ -1,6 +1,15 @@
+# Host build output must never enter the build context: the image builds into its
+# own directories, so ours is dead weight that gets re-sent and re-COPYed on every
+# source edit.
+#
+# `build/` on its own matches ONLY the root build dir, so the nested ones were
+# slipping through — lib/libnatkit-core/build is ~171M — and the whole tree is
+# re-COPYed by the project layer every time a source file changes. Match at any
+# depth instead. (Verified: the only directories named `build` in this tree are
+# ./build, ./lib/libnatkit-core/build and ./third-party/drogon/build — all output.)
 build/
+**/build/
 .cache/
 uploads/
-third-party/drogon/build/
 **/CMakeFiles/
 **/CMakeCache.txt
