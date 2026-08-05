@@ -371,7 +371,10 @@ std::optional<std::shared_ptr<core::message_t>> KafkaMosquittoBridge::getNextKaf
 }
 
 void KafkaMosquittoBridge::tryCreateMosquittoPublisher(const std::string &topicName) {
-  const auto topicString = "natKit/reciving/" + topicName;
+  // Outbound (Kafka -> device) topic prefix. Was "natKit/reciving/" -- a typo
+// fixed while nothing subscribed to it yet. Any device subscriber must use
+// this spelling.
+  const auto topicString = "natKit/receiving/" + topicName;
   auto publisherMaybe = mosquittoBroker->createPublisher(topicString);
   if (publisherMaybe.has_value()) {
     mosquittoPublishers.insert(
@@ -487,7 +490,7 @@ void KafkaMosquittoBridge::sendKafkaMessagesThreadSafe() {
   }
 }
 
-// Continuously move messages from the reciving MQTT and Kafka recieiving queues
+// Continuously move messages from the receiving MQTT and Kafka receiving queues
 // to their corrisponding sending queues so that they may be sent out.
 //
 // Note: The rational for moving messages for both MQTT and Kafka here is because this
