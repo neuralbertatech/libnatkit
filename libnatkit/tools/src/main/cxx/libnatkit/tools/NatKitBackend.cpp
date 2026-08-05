@@ -452,16 +452,33 @@ public:
     }
 
     // Helper to extract all accuracies from a single NatImuDataSchema
-    ImuAccuracies getAccuraciesFromImuData(nat::core::NatImuDataSchema* imuData) {
-        ImuAccuracies result;
-        if (imuData == nullptr) return result;
-        result.accelerometer = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
-            imuData->getAccelerationAccuracy());
-        result.gyroscope = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
-            imuData->getGyroscopeAccuracy());
-        result.rotation = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
-            imuData->getRotationAccuracy());
-        return result;
+    // Fold a sample's accuracies over what is already known, taking a sensor's
+    // value ONLY if that sample actually carries that sensor.
+    //
+    // has_data used to be ignored here, so a sample that carried no gyro reported
+    // gyro accuracy 0 -- indistinguishable from a measured "Unreliable". Since a
+    // sample rarely carries all three sensors at once, whichever sensors were
+    // absent from the sample that happened to be read got reported as Unreliable,
+    // which made calibration look far worse than it was.
+    ImuAccuracies foldAccuraciesFromImuData(nat::core::NatImuDataSchema* imuData,
+                                            ImuAccuracies known) {
+        if (imuData == nullptr) return known;
+        if (imuData->wasDataSetForAcceleration()) {
+            known.accelerometer =
+                nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                    imuData->getAccelerationAccuracy());
+        }
+        if (imuData->wasDataSetForGryoscope()) {
+            known.gyroscope =
+                nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                    imuData->getGyroscopeAccuracy());
+        }
+        if (imuData->wasDataSetForRotation()) {
+            known.rotation =
+                nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                    imuData->getRotationAccuracy());
+        }
+        return known;
     }
 
     // Handler for GET /api/get_accuracies
@@ -493,16 +510,22 @@ public:
                     // Try to cast to NatImuDataSchema first
                     nat::core::NatImuDataSchema* imuData = dynamic_cast<nat::core::NatImuDataSchema*>(message.get());
                     if (imuData != nullptr) {
-                        accuracies = getAccuraciesFromImuData(imuData);
+                        accuracies = foldAccuraciesFromImuData(imuData, accuracies);
                     } else {
                         // Try to cast to NatImuBulkDataSchema (bulk data)
                         nat::core::NatImuBulkDataSchema* bulkData = dynamic_cast<nat::core::NatImuBulkDataSchema*>(message.get());
                         if (bulkData != nullptr) {
-                            // Get the records and use the last one for accuracy
+                            // Fold the whole frame, oldest to newest, so each
+                            // sensor reports the most recent sample that actually
+                            // carried it. Reading only records->back() meant a
+                            // frame whose last sample lacked (say) rotation
+                            // reported rotation as Unreliable even though an
+                            // earlier sample in the SAME frame had a good value.
                             std::unique_ptr<std::vector<nat::core::NatImuDataSchema>> records = bulkData->createImuRecords();
                             if (records && !records->empty()) {
-                                // Use the last record's accuracy (most recent)
-                                accuracies = getAccuraciesFromImuData(&records->back());
+                                for (auto& record : *records) {
+                                    accuracies = foldAccuraciesFromImuData(&record, accuracies);
+                                }
                             }
                         }
                     }
