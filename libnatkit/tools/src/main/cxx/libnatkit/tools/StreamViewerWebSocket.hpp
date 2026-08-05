@@ -269,6 +269,13 @@ private:
     void handleDeleteStreamGraph(const drogon::WebSocketConnectionPtr& conn,
                                  const nlohmann::json& json);
 
+    // Send a command to a device on its EXECUTION_COMMAND topic and wait for the
+    // device's answer on its LOGGING_LOG topic, correlated by command_id. Runs the
+    // produce-and-wait off the WS thread, so a device that never answers stalls
+    // nothing but its own request.
+    void handleSendDeviceCommand(const drogon::WebSocketConnectionPtr& conn,
+                                 const nlohmann::json& json);
+
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
 

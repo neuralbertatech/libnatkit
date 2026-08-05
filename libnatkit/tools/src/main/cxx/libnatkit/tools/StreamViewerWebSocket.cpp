@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <deque>
@@ -7117,6 +7118,9 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "delete_stream_graph") {
             handleDeleteStreamGraph(conn, json);
         }
+        else if (action == "send_device_command") {
+            handleSendDeviceCommand(conn, json);
+        }
         else {
             sendError(conn, "Unknown action: " + action);
         }
@@ -8710,6 +8714,235 @@ void StreamViewerWebSocket::handleDeleteStreamGraph(
     if (conn && conn->connected()) {
         conn->send(response.dump());
     }
+}
+
+// --- device commands (EXECUTION_COMMAND / LOGGING_LOG) --------------------
+
+namespace {
+
+// Commands and their answers are plain JSON on topics named for the schema; no
+// C++ schema class is involved, because the only thing that decodes these
+// payloads is a human reading a log line.
+constexpr const char* kCommandSchemaName = "NatExecutionCommandV1";
+constexpr const char* kLogSchemaName = "NatLogV1";
+
+std::string deviceCommandTopic(uint64_t stream_id) {
+    return "Command-" + std::to_string(stream_id) + "-Json-" + kCommandSchemaName;
+}
+
+std::string deviceLogTopic(uint64_t stream_id) {
+    return "Log-" + std::to_string(stream_id) + "-Json-" + kLogSchemaName;
+}
+
+std::string makeCommandId() {
+    const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    std::ostringstream out;
+    out << "cmd-" << std::hex << now_us << "-" << std::hex
+        << (static_cast<uint32_t>(std::random_device{}()) & 0xffffffu);
+    return out.str();
+}
+
+}  // namespace
+
+void StreamViewerWebSocket::handleSendDeviceCommand(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available", request_id);
+        return;
+    }
+
+    // stream_id arrives as a string from the browser (it exceeds 2^53) but a
+    // number from scripts, so accept both.
+    uint64_t stream_id = 0;
+    try {
+        const auto& raw = json.at("stream_id");
+        stream_id = raw.is_string() ? std::stoull(raw.get<std::string>())
+                                    : raw.get<uint64_t>();
+    } catch (const std::exception&) {
+        sendError(conn, "send_device_command requires a numeric stream_id",
+                  request_id);
+        return;
+    }
+    if (stream_id == 0) {
+        sendError(conn, "send_device_command requires a numeric stream_id",
+                  request_id);
+        return;
+    }
+
+    const auto command = json.value("command", std::string{});
+    if (command.empty()) {
+        sendError(conn, "send_device_command requires a command", request_id);
+        return;
+    }
+    // The device's command buffer is 40 bytes; refusing here beats a payload the
+    // device silently truncates.
+    if (command.size() > 32) {
+        sendError(conn, "Command name is too long (32 characters max)", request_id);
+        return;
+    }
+
+    // Which side executes it. "sensor" is the common case; "server" is here so
+    // the same topic can carry the other direction later.
+    const auto target = json.value("target", std::string{"sensor"});
+    if (target != "sensor" && target != "server") {
+        sendError(conn, "target must be \"sensor\" or \"server\"", request_id);
+        return;
+    }
+
+    // How long to wait for the device to answer. A calibration save takes tens of
+    // milliseconds, but the device only executes between sample batches and the
+    // Kafka round trip adds a hop each way.
+    int64_t timeout_ms = json.value("timeout_ms", static_cast<int64_t>(8000));
+    timeout_ms = std::clamp<int64_t>(timeout_ms, 500, 30000);
+
+    nlohmann::json command_json;
+    command_json["schema_version"] = "nat.execution.command.v1";
+    command_json["command_id"] = makeCommandId();
+    command_json["source"] = "server";
+    command_json["target"] = target;
+    command_json["command"] = command;
+    if (json.contains("args") && json.at("args").is_object()) {
+        command_json["args"] = json.at("args");
+    }
+
+    std::thread([this, conn, request_id, stream_id, command, timeout_ms,
+                 command_json]() {
+        const auto command_id = command_json.value("command_id", std::string{});
+        const auto command_topic = deviceCommandTopic(stream_id);
+        const auto log_topic = deviceLogTopic(stream_id);
+
+        const auto sendFailure = [&](const std::string& message) {
+            nlohmann::json response;
+            response["type"] = "device_command_result";
+            response["request_id"] = request_id;
+            response["stream_id"] = std::to_string(stream_id);
+            response["command"] = command;
+            response["command_id"] = command_id;
+            response["ok"] = false;
+            response["timed_out"] = false;
+            response["error"] = message;
+            response["records"] = nlohmann::json::array();
+            if (conn && conn->connected()) {
+                conn->send(response.dump());
+            }
+        };
+
+        try {
+            const auto command_info_maybe =
+                nat::core::BasicTopicInformation::create(command_topic);
+            const auto log_info_maybe =
+                nat::core::BasicTopicInformation::create(log_topic);
+            if (!command_info_maybe.has_value() || !log_info_maybe.has_value()) {
+                sendFailure("Could not build the device's command/log topics");
+                return;
+            }
+
+            // Subscribe to the answer BEFORE sending, or a device that answers
+            // quickly answers into a topic nobody is reading yet.
+            const auto log_messenger = broker_manager_->createMessenger(
+                std::make_shared<nat::core::BasicTopicInformation>(
+                    *log_info_maybe.value()));
+            if (!log_messenger) {
+                sendFailure("Could not consume the device's log topic");
+                return;
+            }
+
+            // The bridge only forwards Kafka topics it has a messenger for, and it
+            // discovers new ones on a 1 s poll. On a device's FIRST command the
+            // command topic does not exist yet: producing immediately would write
+            // at offset 0, the bridge would attach at OFFSET_END afterwards, and
+            // that first command would be silently dropped. So create the topic,
+            // give the bridge a poll cycle to attach to an empty topic, and only
+            // then produce.
+            const auto existing = broker_manager_->getAllTopicStrings();
+            const bool command_topic_existed =
+                std::find(existing.begin(), existing.end(), command_topic) !=
+                existing.end();
+
+            const auto command_messenger = broker_manager_->createMessenger(
+                std::make_shared<nat::core::BasicTopicInformation>(
+                    *command_info_maybe.value()));
+            if (!command_messenger) {
+                sendFailure("Could not produce to the device's command topic");
+                return;
+            }
+            if (!command_topic_existed) {
+                LOG_INFO << "Command topic " << command_topic
+                         << " is new; waiting for the bridge to attach before "
+                            "sending";
+                std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            }
+
+            const auto payload = command_json.dump();
+            nat::core::message_t message(payload.begin(), payload.end());
+            command_messenger->sendRawMessage(message);
+            command_messenger->flush();
+            LOG_INFO << "Sent device command " << command << " (" << command_id
+                     << ") to " << command_topic;
+
+            // Collect every log record carrying our command_id until one says it is
+            // the last, so a multi-step command can report progress.
+            nlohmann::json records = nlohmann::json::array();
+            bool ok = false;
+            bool terminal = false;
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(timeout_ms);
+            while (std::chrono::steady_clock::now() < deadline && !terminal) {
+                auto next = log_messenger->tryGetNextRawMessage();
+                if (!next.has_value()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    continue;
+                }
+                const auto& bytes = *next.value();
+                std::string text(bytes.begin(), bytes.end());
+                nlohmann::json record;
+                try {
+                    record = nlohmann::json::parse(text);
+                } catch (const std::exception&) {
+                    continue;  // not one of ours; the log topic is shared
+                }
+                if (record.value("command_id", std::string{}) != command_id) {
+                    continue;
+                }
+                records.push_back(record);
+                ok = record.value("ok", false);
+                terminal = record.value("terminal", false);
+            }
+
+            nlohmann::json response;
+            response["type"] = "device_command_result";
+            response["request_id"] = request_id;
+            response["stream_id"] = std::to_string(stream_id);
+            response["command"] = command;
+            response["command_id"] = command_id;
+            response["records"] = records;
+            response["timed_out"] = !terminal;
+            response["ok"] = terminal && ok;
+            if (!terminal) {
+                // Distinguish "the device said no" from "the device said nothing":
+                // the second usually means it is offline or on old firmware.
+                response["error"] =
+                    records.empty()
+                        ? "The device did not answer. It may be offline, or its "
+                          "firmware may predate the command channel."
+                        : "The device stopped answering before the command "
+                          "finished.";
+            } else if (!ok && !records.empty()) {
+                response["error"] =
+                    records.back().value("message", std::string{"Command failed"});
+            }
+            if (conn && conn->connected()) {
+                conn->send(response.dump());
+            }
+        } catch (const std::exception& e) {
+            sendFailure(std::string("Failed to send device command: ") + e.what());
+        }
+    }).detach();
 }
 
 void StreamViewerWebSocket::handleListExperiments(
