@@ -60,7 +60,11 @@ RUN ln -s /usr/include/jsoncpp/json /usr/include/json
 # Everything below re-runs on any source edit. That is the point: it is the cheap
 # part (librdkafka + libnatkit-core + the backend itself).
 COPY . ./
-#RUN find . -type f -print0 | xargs -0 dos2unix
+# Normalize Linux build inputs copied from Windows while skipping binaries.
+RUN find scripts third-party/librdkafka -type f \
+    -exec sh -c 'for file do \
+      if grep -Iq . "$file"; then sed -i "s/\r$//" "$file"; fi; \
+    done' sh {} +
 RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_NATKIT_BACKEND=ON
 RUN sh -lc 'jobs="${NATKIT_CMAKE_BUILD_PARALLEL:-}"; \
     if [ -z "$jobs" ]; then \
