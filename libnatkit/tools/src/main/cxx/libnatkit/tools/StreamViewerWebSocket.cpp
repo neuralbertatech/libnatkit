@@ -561,14 +561,25 @@ getAlternateTransformInputMappings()
                 {"AF7", "eeg.af7"},
                 {"AF8", "eeg.af8"},
                 {"TP10", "eeg.tp10"}}},
-        // IMU accel/gyro as filterable channels. The bulk frame is sample-major
-        // on the wire; NatImuBulkDataSchemaDescriptor projects it into the per-axis
-        // sample arrays referenced here. sample_rate_hz comes from the frame
-        // envelope (real path, not a fixed value). Quaternion is intentionally
+        // IMU accel/gyro/mag as filterable channels. The bulk frame is
+        // sample-major on the wire; NatImuBulkDataSchemaDescriptor projects it into
+        // the per-axis sample arrays referenced here. sample_rate_hz comes from the
+        // frame envelope (real path, not a fixed value). Quaternion is intentionally
         // excluded — a unit rotation isn't a meaningful per-channel filter target.
+        //
+        // ⚠️ THIS LIST IS ALSO THE PARQUET COLUMN LIST. ParquetExport has no IMU
+        // schema of its own -- it takes its columns from projectRecordToChannelFrame,
+        // which is driven by this mapping. So a channel missing here is a column
+        // missing from every exported file, silently.
+        //
+        // ⚠️ The magnetometer columns are present for frames of EVERY version, and
+        // read zero for version 1 (anything recorded before 2026-08). The mapping
+        // has no way to express "absent" -- it is a fixed column list -- so the
+        // distinction lives in has_data.magnetometer on the JSON path only. Do not
+        // read a column of zeroes in an old Parquet file as a measurement.
         TransformInputMappingDefinition{
             "natimu_motion_v1",
-            "IMU accel/gyro",
+            "IMU accel/gyro/mag",
             nat::core::NatImuBulkDataSchema::name,
             "seq_no",
             "device_ts_us",
@@ -580,7 +591,10 @@ getAlternateTransformInputMappings()
                 {"Accel Z", "accel_z"},
                 {"Gyro X", "gyro_x"},
                 {"Gyro Y", "gyro_y"},
-                {"Gyro Z", "gyro_z"}}}};
+                {"Gyro Z", "gyro_z"},
+                {"Mag X", "mag_x"},
+                {"Mag Y", "mag_y"},
+                {"Mag Z", "mag_z"}}}};
     return mappings;
 }
 
@@ -10954,16 +10968,28 @@ nlohmann::json StreamViewerWebSocket::formatImuDataAsJson(const nat::core::NatIm
     json["data"]["quat"]["j"] = values[8];
     json["data"]["quat"]["k"] = values[9];
 
+    // Magnetometer, frame version 2 onwards. ⚠️ Always emitted, so the shape of
+    // the message does not depend on the recording -- a consumer that switched on
+    // the key's PRESENCE would work on new data and break on old. It is
+    // has_data.magnetometer that says whether the numbers mean anything, and for
+    // every version 1 frame that is false with the values zeroed.
+    json["data"]["mag"]["x"] = values[10];
+    json["data"]["mag"]["y"] = values[11];
+    json["data"]["mag"]["z"] = values[12];
+
     json["accuracies"]["accelerometer"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
         data.getAccelerationAccuracy());
     json["accuracies"]["gyroscope"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
         data.getGyroscopeAccuracy());
     json["accuracies"]["rotation"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
         data.getRotationAccuracy());
+    json["accuracies"]["magnetometer"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+        data.getMagnetometerAccuracy());
 
     json["has_data"]["accelerometer"] = data.wasDataSetForAcceleration();
     json["has_data"]["gyroscope"] = data.wasDataSetForGryoscope();
     json["has_data"]["rotation"] = data.wasDataSetForRotation();
+    json["has_data"]["magnetometer"] = data.wasDataSetForMagnetometer();
 
     return json;
 }
@@ -11007,16 +11033,24 @@ nlohmann::json StreamViewerWebSocket::formatBulkDataAsJson(const nat::core::NatI
             sample["data"]["quat"]["j"] = values[8];
             sample["data"]["quat"]["k"] = values[9];
 
+            // See formatImuDataAsJson: always emitted, gated by has_data.
+            sample["data"]["mag"]["x"] = values[10];
+            sample["data"]["mag"]["y"] = values[11];
+            sample["data"]["mag"]["z"] = values[12];
+
             sample["accuracies"]["accelerometer"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
                 record.getAccelerationAccuracy());
             sample["accuracies"]["gyroscope"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
                 record.getGyroscopeAccuracy());
             sample["accuracies"]["rotation"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
                 record.getRotationAccuracy());
+            sample["accuracies"]["magnetometer"] = nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                record.getMagnetometerAccuracy());
 
             sample["has_data"]["accelerometer"] = record.wasDataSetForAcceleration();
             sample["has_data"]["gyroscope"] = record.wasDataSetForGryoscope();
             sample["has_data"]["rotation"] = record.wasDataSetForRotation();
+            sample["has_data"]["magnetometer"] = record.wasDataSetForMagnetometer();
 
             json["samples"].push_back(sample);
         }
