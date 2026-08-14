@@ -18,6 +18,7 @@
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
 #include <libnatkit-kafka.hpp>
+#include "RecordingState.hpp"
 #include <libnatkit-core.hpp>
 #include <libnatkit/util/Strings.hpp>
 #include <libnatkit/util/Vectors.hpp>
@@ -855,6 +856,7 @@ public:
 
         // Initialize new session
         recording_session->session_id = generate_uuid();
+        nat::tools::setRecordingActive(true);
         recording_session->is_recording = true;
         recording_session->start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -897,6 +899,7 @@ public:
         }
 
         recording_session->is_recording = false;
+        nat::tools::setRecordingActive(false);
         uint64_t end_time = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 

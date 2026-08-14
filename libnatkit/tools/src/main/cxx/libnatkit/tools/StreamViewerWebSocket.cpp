@@ -1,4 +1,5 @@
 #include "StreamViewerWebSocket.hpp"
+#include "RecordingState.hpp"
 
 #include "GraphTopicResolution.hpp"
 #include "GraphTransportPlan.hpp"
@@ -8797,6 +8798,31 @@ void StreamViewerWebSocket::handleSendDeviceCommand(
     // device silently truncates.
     if (command.size() > 32) {
         sendError(conn, "Command name is too long (32 characters max)", request_id);
+        return;
+    }
+
+    // ⚠️ REFUSED WHILE A RECORDING IS RUNNING, for commands that change what a
+    // node collects. Parquet has one column set per file, so reconfiguring a
+    // sensor mid-recording changes a file's schema halfway through and nothing
+    // downstream can express that (TEC-NATKIT-40).
+    //
+    // Checked HERE rather than on the device or in the browser: a leaf cannot
+    // know whether anything is recording it, and a check in the frontend is a
+    // suggestion -- the same command can be published straight to the broker.
+    //
+    // The list is specific rather than blanket. Refusing every command during a
+    // recording would also refuse the diagnostic ones, and "why has this node
+    // gone quiet mid-session" is exactly when you want to ask it something.
+    static const std::set<std::string> kCommandsBlockedWhileRecording = {
+        "set_reports",
+    };
+    if (kCommandsBlockedWhileRecording.count(command) != 0 &&
+        nat::tools::isRecordingActive()) {
+        sendError(conn,
+                  "Cannot change the sensor configuration while a recording is "
+                  "in progress: it would change the recording's schema halfway "
+                  "through. Stop the recording first.",
+                  request_id);
         return;
     }
 
