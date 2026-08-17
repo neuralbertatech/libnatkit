@@ -18,6 +18,7 @@
 #include <librdkafka/rdkafka.h>
 #include <librdkafka/rdkafkacpp.h>
 #include <libnatkit-kafka.hpp>
+#include "RecordingState.hpp"
 #include <libnatkit-core.hpp>
 #include <libnatkit/util/Strings.hpp>
 #include <libnatkit/util/Vectors.hpp>
@@ -158,9 +159,14 @@ struct ImuSample {
     bool has_data_accelerometer;
     bool has_data_gyroscope;
     bool has_data_rotation;
+    // False for anything recorded from a frame version 1 stream, where mag_* are
+    // zeroed rather than measured.
+    bool has_data_magnetometer;
+    int calibration_status_magnetometer;
     float quat_i, quat_j, quat_k, quat_real;
     float accel_x, accel_y, accel_z;
     float gyro_x, gyro_y, gyro_z;
+    float mag_x, mag_y, mag_z;
     float gravity_x, gravity_y, gravity_z;
 };
 
@@ -738,6 +744,10 @@ public:
                                     sample.has_data_accelerometer = record.wasDataSetForAcceleration();
                                     sample.has_data_gyroscope = record.wasDataSetForGryoscope();
                                     sample.has_data_rotation = record.wasDataSetForRotation();
+                                    sample.has_data_magnetometer = record.wasDataSetForMagnetometer();
+                                    sample.calibration_status_magnetometer =
+                                        nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                            record.getMagnetometerAccuracy());
                                     // data[0-2]: accelerometer x, y, z
                                     sample.accel_x = data[0];
                                     sample.accel_y = data[1];
@@ -751,6 +761,10 @@ public:
                                     sample.quat_i = data[7];
                                     sample.quat_j = data[8];
                                     sample.quat_k = data[9];
+                                    // data[10-12]: magnetometer x, y, z (frame v2+)
+                                    sample.mag_x = data[10];
+                                    sample.mag_y = data[11];
+                                    sample.mag_z = data[12];
                                     // No gravity data in current format
                                     sample.gravity_x = 0.0f;
                                     sample.gravity_y = 0.0f;
@@ -780,6 +794,10 @@ public:
                                 sample.has_data_accelerometer = imuData->wasDataSetForAcceleration();
                                 sample.has_data_gyroscope = imuData->wasDataSetForGryoscope();
                                 sample.has_data_rotation = imuData->wasDataSetForRotation();
+                                sample.has_data_magnetometer = imuData->wasDataSetForMagnetometer();
+                                sample.calibration_status_magnetometer =
+                                    nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                                        imuData->getMagnetometerAccuracy());
                                 sample.accel_x = data[0];
                                 sample.accel_y = data[1];
                                 sample.accel_z = data[2];
@@ -790,6 +808,9 @@ public:
                                 sample.quat_i = data[7];
                                 sample.quat_j = data[8];
                                 sample.quat_k = data[9];
+                                sample.mag_x = data[10];
+                                sample.mag_y = data[11];
+                                sample.mag_z = data[12];
                                 sample.gravity_x = 0.0f;
                                 sample.gravity_y = 0.0f;
                                 sample.gravity_z = 0.0f;
@@ -835,6 +856,7 @@ public:
 
         // Initialize new session
         recording_session->session_id = generate_uuid();
+        nat::tools::setRecordingActive(true);
         recording_session->is_recording = true;
         recording_session->start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -877,6 +899,7 @@ public:
         }
 
         recording_session->is_recording = false;
+        nat::tools::setRecordingActive(false);
         uint64_t end_time = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
@@ -982,6 +1005,8 @@ public:
             s["has_data_accelerometer"] = sample.has_data_accelerometer;
             s["has_data_gyroscope"] = sample.has_data_gyroscope;
             s["has_data_rotation"] = sample.has_data_rotation;
+            s["has_data_magnetometer"] = sample.has_data_magnetometer;
+            s["calibration_status_magnetometer"] = sample.calibration_status_magnetometer;
             s["quat_i"] = sample.quat_i;
             s["quat_j"] = sample.quat_j;
             s["quat_k"] = sample.quat_k;
@@ -992,6 +1017,9 @@ public:
             s["gyro_x"] = sample.gyro_x;
             s["gyro_y"] = sample.gyro_y;
             s["gyro_z"] = sample.gyro_z;
+            s["mag_x"] = sample.mag_x;
+            s["mag_y"] = sample.mag_y;
+            s["mag_z"] = sample.mag_z;
             s["gravity_x"] = sample.gravity_x;
             s["gravity_y"] = sample.gravity_y;
             s["gravity_z"] = sample.gravity_z;
