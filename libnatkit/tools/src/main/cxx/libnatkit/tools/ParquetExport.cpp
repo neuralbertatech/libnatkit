@@ -703,6 +703,11 @@ ParquetExportResult exportStreamToParquet(
     // it does not need this -- but a snapshot that cannot say what sensor produced
     // it is not much of a provenance record.
     metadata->Append("natkit.schema_name", result.schemaName);
+    // WHO. Omitted rather than written blank when there is no participant, so an
+    // ad-hoc export of a live stream cannot be mistaken for an attributed one.
+    if (!request.participantId.empty()) {
+        metadata->Append("natkit.participant_id", request.participantId);
+    }
     if (windowStart.has_value()) {
         metadata->Append("natkit.window_start_us",
                          std::to_string(windowStart.value()));

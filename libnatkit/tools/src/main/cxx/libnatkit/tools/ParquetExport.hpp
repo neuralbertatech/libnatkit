@@ -39,6 +39,12 @@ struct ParquetExportRequest {
     // session window implied by the markers, or everything when there are none.
     std::optional<int64_t> startUs{};
     std::optional<int64_t> endUs{};
+    // Who was recorded. Written into the Parquet key-value metadata as
+    // `natkit.participant_id` so the file is self-describing once it leaves the
+    // rig — a data file that cannot name its own subject is not usable evidence.
+    // Empty is legitimate (an ad-hoc export of a live stream has no participant);
+    // it is simply omitted from the metadata rather than written blank.
+    std::string participantId{};
     // Column name for the joined cue class.
     std::string labelField = "label";
     // Restrict to one run inside a multi-run session (1-based). 0 = all runs.

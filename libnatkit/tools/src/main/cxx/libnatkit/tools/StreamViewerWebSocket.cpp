@@ -2789,6 +2789,103 @@ bool applyExperimentGraphBindingLocked(
     return persistStreamGraphStoreLocked(error);
 }
 
+// One-time repair of instances recorded before the participant and protocol were
+// snapshotted into the run (TEC-NATKIT-54). Their `recording` carries neither, so
+// "whose run is this" could only be answered by reading the live experiment's
+// editable fields -- and editing those silently re-attributed every past run.
+//
+// Recovers what the mapping can still tell us and marks it: a back-filled value
+// is stamped `participant_backfilled` / `protocol_backfilled` so it can never be
+// mistaken for one captured at record time. That distinction matters more than
+// the value -- a recovered attribution is evidence about our bookkeeping, not
+// about the session.
+//
+// ⚠️ This writes to instances that are SEALED (`immutable`). That is deliberate
+// and is the one place allowed to: it adds attribution metadata only, touches no
+// data file and invalidates no checksum. handleSaveStreamGraph still refuses to
+// let a client do the same thing.
+//
+// Idempotent -- an instance that already has a participant_id is skipped, so a
+// re-run cannot overwrite a real capture with a recovered one.
+//
+// Called with g_experiment_mutex held and takes g_stream_graph_mutex, keeping the
+// lock order experiment -> graph like applyExperimentGraphBindingLocked.
+void backfillInstanceParticipantsLocked()
+{
+    std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+    ensureStreamGraphStoreLoadedLocked();
+    if (!g_stream_graph_store_error.empty()) {
+        LOG_ERROR << "Participant back-fill skipped: " << g_stream_graph_store_error;
+        return;
+    }
+
+    size_t repaired = 0;    // instances touched at all
+    size_t filled = 0;      // ... of which a real participant was recovered
+    size_t unrecorded = 0;  // ... of which nobody had ever entered one
+    std::vector<std::string> unresolved;
+    for (auto& entry : g_stream_graphs) {
+        auto& graph = entry.second;
+        if (graph.instanceId.empty() || graph.recording.is_null()) {
+            continue;  // a live board has nothing recorded to attribute
+        }
+        if (graph.recording.contains("participant_id")) {
+            continue;
+        }
+        const auto experiment = g_experiments.find(graph.experimentId);
+        if (experiment == g_experiments.end()) {
+            // The owning experiment is gone, so nothing can say who this was.
+            // Named in the log rather than passed over: an instance that can
+            // never be attributed is a permanent hole, and a silent one reads
+            // as a clean migration.
+            unresolved.push_back(graph.graphId);
+            continue;
+        }
+        graph.recording["participant_id"] = experiment->second.participantId;
+        // THREE distinct states, and collapsing any two of them is how a data set
+        // starts lying: captured at record time (neither flag), recovered from the
+        // experiment record afterwards (`participant_backfilled`), or never
+        // entered by anyone (`participant_unrecorded`). An empty string stamped
+        // "back-filled" would claim an attribution that never existed, which is
+        // worse than the missing field it replaced.
+        if (experiment->second.participantId.empty()) {
+            graph.recording["participant_unrecorded"] = true;
+            ++unrecorded;
+        } else {
+            graph.recording["participant_backfilled"] = true;
+            ++filled;
+        }
+        if (!graph.recording.contains("protocol")) {
+            graph.recording["protocol"] = experiment->second.protocol;
+            graph.recording["protocol_backfilled"] = true;
+        }
+        graph.updatedAtUs = nowUs();
+        ++repaired;
+    }
+
+    if (!unresolved.empty()) {
+        LOG_WARN << "Participant back-fill could not attribute "
+                 << unresolved.size()
+                 << " instance(s) -- their experiment no longer exists: "
+                 << nlohmann::json(unresolved).dump();
+    }
+    if (repaired == 0) {
+        return;
+    }
+    std::string persist_error;
+    if (!persistStreamGraphStoreLocked(persist_error)) {
+        LOG_ERROR << "Participant back-fill could not be persisted, so it will be "
+                     "retried next start: "
+                  << persist_error;
+        return;
+    }
+    // All three counts, every time. "Repaired 2" alone would read as two runs
+    // attributed, when it can equally mean two runs proven unattributable.
+    LOG_INFO << "Participant back-fill repaired " << repaired
+             << " pre-existing instance(s): " << filled
+             << " attributed from their experiment record, " << unrecorded
+             << " had no participant ever entered";
+}
+
 bool persistExperimentStoreLocked(std::string& error)
 {
     const auto store_path = resolveExperimentStorePath();
@@ -7909,6 +8006,19 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
         // One marker topic per experiment (Marker/<experiment_id>), so every run
         // shares a session id and is delimited by its own window.
         recording["session_id"] = experiment_id;
+        // WHO, and WHAT THEY WERE ASKED TO DO, captured HERE rather than resolved
+        // at read time. Both used to be read back through the live experiment
+        // record, whose participant_id is an editable text field and whose
+        // protocol is re-authorable -- so retyping either silently re-attributed
+        // every past run of this experiment, while the sha256'd artifacts kept
+        // verifying because none of the DATA had changed. A sealed instance has to
+        // answer both questions from itself.
+        //
+        // The board snapshot above cannot cover this: the protocol moved off the
+        // canvas to the experiment record, so the copied nodes carry only a
+        // config-less `markers` source.
+        recording["participant_id"] = experiment->second.participantId;
+        recording["protocol"] = experiment->second.protocol;
         recording["window_start_us"] =
             json.value("window_start_us", static_cast<uint64_t>(nowUs()));
         recording["window_end_us"] = nullptr;
@@ -7998,6 +8108,7 @@ void StreamViewerWebSocket::materializeInstance(const std::string& graph_id)
 {
     std::string experiment_id;
     std::string instance_id;
+    std::string participant_id;
     std::vector<std::pair<uint64_t, std::string>> sources;  // id, schema_name
     int64_t window_start = 0;
     int64_t window_end = 0;
@@ -8010,6 +8121,10 @@ void StreamViewerWebSocket::materializeInstance(const std::string& graph_id)
         experiment_id = stored->second.experimentId;
         instance_id = stored->second.instanceId;
         const auto& recording = stored->second.recording;
+        // Read from the INSTANCE, never from the live experiment: this runs on a
+        // detached thread long after Record was pressed, so the experiment's
+        // participant field may already have been edited for the next run.
+        participant_id = recording.value("participant_id", std::string{});
         window_start = recording.value("window_start_us", static_cast<int64_t>(0));
         window_end = recording.value("window_end_us", static_cast<int64_t>(0));
         for (const auto& entry : recording.value("streams", nlohmann::json::array())) {
@@ -8106,6 +8221,9 @@ void StreamViewerWebSocket::materializeInstance(const std::string& graph_id)
         natkit::tools::ParquetExportRequest request;
         request.streamId = stream_id;
         request.markerStreamId = marker_stream_id;
+        // Travels into the file's key-value metadata, so a Parquet that leaves
+        // this rig still says whose run it is.
+        request.participantId = participant_id;
         request.startUs = window_start > 0 ? std::optional<int64_t>(window_start)
                                           : std::nullopt;
         request.endUs = window_end > 0 ? std::optional<int64_t>(window_end)
@@ -8997,6 +9115,12 @@ void StreamViewerWebSocket::handleListExperiments(
             sendError(conn, g_experiment_store_error, request_id);
             return;
         }
+        // Hung off the first experiment listing rather than startup: this is the
+        // earliest point where BOTH stores are loaded and the experiment mutex is
+        // already held, which is the half of the lock order that has to come
+        // first. Once per process.
+        static std::once_flag backfill_once;
+        std::call_once(backfill_once, backfillInstanceParticipantsLocked);
     }
     sendExperimentList(conn, request_id);
 }
