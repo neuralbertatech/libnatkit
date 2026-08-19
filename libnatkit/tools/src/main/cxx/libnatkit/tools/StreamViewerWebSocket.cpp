@@ -8316,6 +8316,16 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
             recording["participant_unrecorded"] = true;
         }
         recording["protocol"] = experiment->second.protocol;
+        // WHAT WAS WORN WHERE (TEC-NATKIT-62). Per run, like the participant: the
+        // same board records different people with the sensors physically re-placed
+        // each time, so a mapping that lives only on the board says nothing about
+        // any particular run. Absent when the client sent none -- recorded as
+        // absent rather than as an empty placement.
+        if (json.contains("sensor_positions") &&
+            json["sensor_positions"].is_array() &&
+            !json["sensor_positions"].empty()) {
+            recording["sensor_positions"] = json["sensor_positions"];
+        }
         recording["window_start_us"] =
             json.value("window_start_us", static_cast<uint64_t>(nowUs()));
         recording["window_end_us"] = nullptr;
