@@ -228,6 +228,21 @@ private:
     // a stored entity that owns a board and (later) its recorded instances, so the
     // protocol/participant/notes leave the canvas. save_experiment is also the
     // sole writer of the 1:1 experiment<->board binding.
+    // Workspaces (TEC-NATKIT-56): a container that scopes the experiment picker.
+    void handleListWorkspaces(const drogon::WebSocketConnectionPtr& conn,
+                              const nlohmann::json& json);
+    void handleSaveWorkspace(const drogon::WebSocketConnectionPtr& conn,
+                             const nlohmann::json& json);
+    void handleDeleteWorkspace(const drogon::WebSocketConnectionPtr& conn,
+                               const nlohmann::json& json);
+    void sendWorkspaceList(const drogon::WebSocketConnectionPtr& conn,
+                           const std::string& request_id);
+    void sendWorkspaceSaved(const drogon::WebSocketConnectionPtr& conn,
+                            const std::string& request_id,
+                            const nlohmann::json& workspace_json);
+    void sendWorkspaceDeleted(const drogon::WebSocketConnectionPtr& conn,
+                              const std::string& request_id,
+                              const std::string& workspace_id);
     void handleListExperiments(const drogon::WebSocketConnectionPtr& conn,
                                const nlohmann::json& json);
     void handleSaveExperiment(const drogon::WebSocketConnectionPtr& conn,

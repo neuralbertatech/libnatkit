@@ -1617,6 +1617,16 @@ struct StreamGraphDefinition {
     // A fork is a recording that happens to be editable -- same record shape,
     // same place in the tree, and it INHERITS `recording` so it points at the
     // very same materialized artifacts. Forking never copies data.
+    // --- Workspace membership (TEC-NATKIT-56) --------------------------------
+    // Which workspace this belongs to, or empty for "Unfiled". Membership lives
+    // on the MEMBER and nowhere else: a workspace holding its own list of ids
+    // would be a second copy of the same fact, and the two would drift the first
+    // time something was deleted while a client held a stale list.
+    //
+    // Nullable on purpose -- everything that existed before workspaces reads as
+    // Unfiled, so there is no migration and no store version bump.
+    std::string workspaceId{};
+
     std::string experimentId{};
     std::string instanceId{};
     bool immutable = false;
@@ -1872,6 +1882,9 @@ void to_json(nlohmann::json& json, const StreamGraphDefinition& value)
     if (!value.experimentId.empty()) {
         json["experiment_id"] = value.experimentId;
     }
+    if (!value.workspaceId.empty()) {
+        json["workspace_id"] = value.workspaceId;
+    }
     if (!value.instanceId.empty()) {
         json["instance_id"] = value.instanceId;
         json["immutable"] = value.immutable;
@@ -1930,6 +1943,7 @@ void from_json(const nlohmann::json& json, StreamGraphDefinition& value)
     value.notes = json.value("notes", std::vector<std::string>{});
     value.editorMetadata = json.value("editor_metadata", nlohmann::json(nullptr));
     value.experimentId = json.value("experiment_id", std::string{});
+    value.workspaceId = json.value("workspace_id", std::string{});
     value.instanceId = json.value("instance_id", std::string{});
     value.immutable = json.value("immutable", false);
     value.origin = json.value("origin", std::string{});
@@ -2494,6 +2508,11 @@ bool persistStreamGraphStoreLocked(std::string& error)
 struct Profile {
     std::string participantId;
     std::string displayName;
+    // Which workspace's roster this participant is on, or empty for Unfiled
+    // (TEC-NATKIT-56). ⚠️ ONE workspace, so the same person cannot yet appear in
+    // two cohorts. Deliberate for now -- nothing asked for it, and a set here
+    // would have to be reconciled on every workspace delete.
+    std::string workspaceId;
     std::string modelPath;  // bundle path (reference/display; also baked into the graph)
     std::string graphId;    // the classify graph to reload
     std::string protocolId;
@@ -2509,6 +2528,7 @@ void to_json(nlohmann::json& json, const Profile& value)
     json = {
         {"participant_id", value.participantId},
         {"display_name", value.displayName},
+        {"workspace_id", value.workspaceId},
         {"model_path", value.modelPath},
         {"graph_id", value.graphId},
         {"protocol_id", value.protocolId},
@@ -2524,6 +2544,7 @@ void from_json(const nlohmann::json& json, Profile& value)
 {
     value.participantId = json.at("participant_id").get<std::string>();
     value.displayName = json.value("display_name", std::string{});
+    value.workspaceId = json.value("workspace_id", std::string{});
     value.modelPath = json.value("model_path", std::string{});
     value.graphId = json.value("graph_id", std::string{});
     value.protocolId = json.value("protocol_id", std::string{});
@@ -2643,6 +2664,11 @@ bool persistProfileStoreLocked(std::string& error)
 struct Experiment {
     std::string experimentId;
     std::string label;
+    // Which workspace this experiment belongs to, or empty for Unfiled
+    // (TEC-NATKIT-56). Scoping the picker to this is the whole point of the
+    // container: an experiment list that is every experiment ever made is not a
+    // list anybody can pick from.
+    std::string workspaceId;
     nlohmann::json protocol = nlohmann::json(nullptr);
     // DEPRECATED (TEC-NATKIT-55). The participant is a property of a RUN, not of
     // the procedure: one experiment records a whole cohort, so a single field here
@@ -2665,6 +2691,7 @@ void to_json(nlohmann::json& json, const Experiment& value)
     json = {
         {"experiment_id", value.experimentId},
         {"label", value.label},
+        {"workspace_id", value.workspaceId},
         {"participant_id", value.legacyParticipantId},
         {"notes", value.notes},
         {"live_graph_id", value.liveGraphId},
@@ -2678,6 +2705,7 @@ void from_json(const nlohmann::json& json, Experiment& value)
 {
     value.experimentId = json.at("experiment_id").get<std::string>();
     value.label = json.value("label", std::string{});
+    value.workspaceId = json.value("workspace_id", std::string{});
     value.protocol = json.value("protocol", nlohmann::json(nullptr));
     value.legacyParticipantId = json.value("participant_id", std::string{});
     value.notes = json.value("notes", std::string{});
@@ -2752,6 +2780,14 @@ void ensureExperimentStoreLoadedLocked()
 bool applyExperimentGraphBindingLocked(
     const std::string& experiment_id,
     const std::string& live_graph_id,
+    // The bound experiment's workspace, stamped onto the board along with the
+    // binding (TEC-NATKIT-56). A board carries its own workspaceId so an
+    // unbound analysis board has somewhere to live, but once it is bound the
+    // experiment's filing wins -- two halves of one binding sitting in different
+    // workspaces is a state no picker could show honestly. This function is
+    // already the sole writer of the pair, so it is the only place that needs to
+    // know.
+    const std::string& workspace_id,
     std::string& error)
 {
     std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
@@ -2782,6 +2818,15 @@ bool applyExperimentGraphBindingLocked(
             continue;  // history: never re-parented by a binding change
         }
         const bool should_be_bound = !live_graph_id.empty() && entry.first == live_graph_id;
+        if (should_be_bound && graph.workspaceId != workspace_id) {
+            // Follows the experiment INCLUDING when the experiment is Unfiled:
+            // dragging an experiment out of a workspace has to take its board
+            // with it, or the board is orphaned in a workspace whose experiment
+            // list no longer mentions it.
+            graph.workspaceId = workspace_id;
+            graph.updatedAtUs = nowUs();
+            changed = true;
+        }
         if (should_be_bound && graph.experimentId != experiment_id) {
             graph.experimentId = experiment_id;
             graph.updatedAtUs = nowUs();
@@ -2932,6 +2977,229 @@ bool persistExperimentStoreLocked(std::string& error)
             "Failed to atomically replace experiment store: " + rename_error.message();
         return false;
     }
+    return true;
+}
+
+// --- Workspaces (TEC-NATKIT-56) ------------------------------------------
+//
+// A selectable container, so that picking an experiment is not picking from every
+// experiment ever made. The motivation is cohorts: one workspace per study, its
+// experiments and boards and participant roster inside it.
+//
+// It is a CONTAINER and nothing more. The 1:1 experiment<->board binding is
+// untouched, boards do not inherit the workspace's experiment, and protocols are
+// not shared by reference -- all three were considered and declined (Zach,
+// 2026-08-19), because each of them changes what an experiment IS rather than
+// where it is filed.
+//
+// Membership lives on the MEMBER (`workspaceId` on graphs, experiments and
+// profiles) and is deliberately NOT mirrored into a list here: two copies of the
+// same fact drift the first time something is deleted while a client holds a
+// stale list. So this record is identity and description only.
+//
+// Everything that predates workspaces has an empty workspaceId and reads as
+// "Unfiled", which is why there is no migration and no store version bump.
+struct Workspace {
+    std::string workspaceId;
+    std::string label;
+    std::string notes;
+    uint64_t createdAtUs = 0;
+    uint64_t updatedAtUs = 0;
+};
+
+void to_json(nlohmann::json& json, const Workspace& value)
+{
+    json = {
+        {"workspace_id", value.workspaceId},
+        {"label", value.label},
+        {"notes", value.notes},
+        {"created_at_us", value.createdAtUs},
+        {"updated_at_us", value.updatedAtUs},
+    };
+}
+
+void from_json(const nlohmann::json& json, Workspace& value)
+{
+    value.workspaceId = json.at("workspace_id").get<std::string>();
+    value.label = json.value("label", std::string{});
+    value.notes = json.value("notes", std::string{});
+    value.createdAtUs = json.value("created_at_us", static_cast<uint64_t>(0));
+    value.updatedAtUs = json.value("updated_at_us", static_cast<uint64_t>(0));
+}
+
+std::filesystem::path resolveWorkspaceStorePath()
+{
+    const char* store_path = std::getenv("NATKIT_WORKSPACE_STORE");
+    if (store_path != nullptr && store_path[0] != '\0') {
+        return std::filesystem::path(store_path);
+    }
+    // Same durable-volume caveat as the experiment store: the relative fallback
+    // is the ephemeral container layer, so compose must point this at the volume
+    // the other stores live on or a workspace vanishes on recreate -- taking
+    // nothing with it, but leaving every member Unfiled.
+    return std::filesystem::path("./data/workspaces.json");
+}
+
+std::unordered_map<std::string, Workspace> g_workspaces;
+std::mutex g_workspace_mutex;
+bool g_workspace_store_loaded = false;
+std::string g_workspace_store_error{};
+
+void ensureWorkspaceStoreLoadedLocked()
+{
+    if (g_workspace_store_loaded) {
+        return;
+    }
+    g_workspace_store_loaded = true;
+    g_workspace_store_error.clear();
+    g_workspaces.clear();
+    const auto store_path = resolveWorkspaceStorePath();
+    if (!std::filesystem::exists(store_path)) {
+        return;  // no workspaces yet: everything is Unfiled, which is valid
+    }
+    std::ifstream input(store_path);
+    if (!input) {
+        g_workspace_store_error =
+            "Failed to open workspace store at " + store_path.string();
+        return;
+    }
+    try {
+        nlohmann::json json = nlohmann::json::parse(input);
+        if (json.value("store_version", 0) != 1 || !json["workspaces"].is_array()) {
+            throw std::runtime_error(
+                "Workspace store must contain store_version=1 and a workspaces array");
+        }
+        for (const auto& workspace_json : json["workspaces"]) {
+            Workspace workspace = workspace_json.get<Workspace>();
+            g_workspaces[workspace.workspaceId] = std::move(workspace);
+        }
+    } catch (const std::exception& exception) {
+        g_workspaces.clear();
+        g_workspace_store_error =
+            "Failed to parse workspace store: " + std::string(exception.what());
+    }
+}
+
+bool persistWorkspaceStoreLocked(std::string& error)
+{
+    const auto store_path = resolveWorkspaceStorePath();
+    if (store_path.has_parent_path()) {
+        std::filesystem::create_directories(store_path.parent_path());
+    }
+    nlohmann::json store_json;
+    store_json["store_version"] = 1;
+    store_json["workspaces"] = nlohmann::json::array();
+    for (const auto& entry : g_workspaces) {
+        store_json["workspaces"].push_back(entry.second);
+    }
+    const auto temp_path = store_path.string() + ".tmp";
+    {
+        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            error = "Failed to open temporary workspace store file for write";
+            return false;
+        }
+        output << store_json.dump(2);
+        if (!output.good()) {
+            error = "Failed while writing workspace store";
+            return false;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temp_path, store_path, rename_error);
+    if (rename_error) {
+        std::filesystem::remove(store_path, rename_error);
+        rename_error.clear();
+        std::filesystem::rename(temp_path, store_path, rename_error);
+    }
+    if (rename_error) {
+        error =
+            "Failed to atomically replace workspace store: " + rename_error.message();
+        return false;
+    }
+    return true;
+}
+
+// Un-file every member of a workspace that is going away.
+//
+// ⚠️ Deleting a workspace must NOT delete its contents. It is a filing cabinet,
+// and the affordance that empties it reads to an operator like tidying up -- so
+// destroying a cohort's recorded history from it would be the worst possible
+// reading of a UI gesture. Experiments, boards and profiles survive with an empty
+// workspaceId, which puts them in Unfiled where they can be re-filed.
+//
+// Instances are re-filed too, unlike the experiment<->board binding which leaves
+// them alone: an instance's workspace is a filing location, not the attribution
+// its own record now carries (TEC-NATKIT-54), so moving it loses nothing.
+//
+// Called with g_workspace_mutex held. Takes the experiment, graph and profile
+// mutexes in that order, establishing the lock order
+// workspace -> experiment -> graph -> profile. Nothing acquires them the other
+// way round: the experiment and graph handlers never touch the workspace store.
+bool unfileWorkspaceMembersLocked(const std::string& workspace_id, std::string& error)
+{
+    size_t experiments_unfiled = 0;
+    size_t graphs_unfiled = 0;
+    size_t profiles_unfiled = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_experiment_mutex);
+        ensureExperimentStoreLoadedLocked();
+        if (!g_experiment_store_error.empty()) {
+            error = g_experiment_store_error;
+            return false;
+        }
+        for (auto& entry : g_experiments) {
+            if (entry.second.workspaceId == workspace_id) {
+                entry.second.workspaceId.clear();
+                entry.second.updatedAtUs = nowUs();
+                ++experiments_unfiled;
+            }
+        }
+        if (experiments_unfiled > 0 && !persistExperimentStoreLocked(error)) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_stream_graph_mutex);
+        ensureStreamGraphStoreLoadedLocked();
+        if (!g_stream_graph_store_error.empty()) {
+            error = g_stream_graph_store_error;
+            return false;
+        }
+        for (auto& entry : g_stream_graphs) {
+            if (entry.second.workspaceId == workspace_id) {
+                entry.second.workspaceId.clear();
+                entry.second.updatedAtUs = nowUs();
+                ++graphs_unfiled;
+            }
+        }
+        if (graphs_unfiled > 0 && !persistStreamGraphStoreLocked(error)) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        ensureProfileStoreLoadedLocked();
+        if (!g_profile_store_error.empty()) {
+            error = g_profile_store_error;
+            return false;
+        }
+        for (auto& entry : g_profiles) {
+            if (entry.second.workspaceId == workspace_id) {
+                entry.second.workspaceId.clear();
+                entry.second.updatedAtUs = nowUs();
+                ++profiles_unfiled;
+            }
+        }
+        if (profiles_unfiled > 0 && !persistProfileStoreLocked(error)) {
+            return false;
+        }
+    }
+
+    LOG_INFO << "Un-filed workspace " << workspace_id << ": "
+             << experiments_unfiled << " experiment(s), " << graphs_unfiled
+             << " board(s), " << profiles_unfiled << " profile(s) moved to Unfiled";
     return true;
 }
 
@@ -7209,6 +7477,15 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "delete_profile") {
             handleDeleteProfile(conn, json);
         }
+        else if (action == "list_workspaces") {
+            handleListWorkspaces(conn, json);
+        }
+        else if (action == "save_workspace") {
+            handleSaveWorkspace(conn, json);
+        }
+        else if (action == "delete_workspace") {
+            handleDeleteWorkspace(conn, json);
+        }
         else if (action == "list_experiments") {
             handleListExperiments(conn, json);
         }
@@ -9200,7 +9477,8 @@ void StreamViewerWebSocket::handleSaveExperiment(
         // an immutable instance) the experiment record is left untouched rather
         // than saved with a binding that was refused.
         if (!applyExperimentGraphBindingLocked(
-                experiment.experimentId, experiment.liveGraphId, persist_error)) {
+                experiment.experimentId, experiment.liveGraphId,
+                experiment.workspaceId, persist_error)) {
             sendError(conn, persist_error, request_id);
             return;
         }
@@ -9268,8 +9546,11 @@ void StreamViewerWebSocket::handleDeleteExperiment(
         }
         // Unbind the live board before dropping the record, so no graph is left
         // pointing at an experiment that no longer exists.
+        // Empty workspace on the unbind path: there is no bound board left to
+        // stamp, so the argument is unused -- but it must not read as "file the
+        // board into workspace X" either.
         if (!applyExperimentGraphBindingLocked(experiment_id, std::string{},
-                                               persist_error)) {
+                                               std::string{}, persist_error)) {
             sendError(conn, persist_error, request_id);
             return;
         }
@@ -11810,6 +12091,157 @@ void StreamViewerWebSocket::sendExperimentDeleted(
     response["type"] = "experiment_deleted";
     response["request_id"] = request_id;
     response["experiment_id"] = experiment_id;
+    conn->send(response.dump());
+}
+
+// --- Workspace handlers (TEC-NATKIT-56) ----------------------------------
+
+void StreamViewerWebSocket::handleListWorkspaces(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    {
+        std::lock_guard<std::mutex> lock(g_workspace_mutex);
+        ensureWorkspaceStoreLoadedLocked();
+        if (!g_workspace_store_error.empty()) {
+            sendError(conn, g_workspace_store_error, request_id);
+            return;
+        }
+    }
+    sendWorkspaceList(conn, request_id);
+}
+
+void StreamViewerWebSocket::handleSaveWorkspace(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    if (!json.contains("workspace")) {
+        sendError(conn, "save_workspace requires a workspace payload", request_id);
+        return;
+    }
+
+    Workspace workspace;
+    try {
+        workspace = json.at("workspace").get<Workspace>();
+    } catch (const std::exception& exception) {
+        sendError(conn, "Malformed workspace: " + std::string(exception.what()),
+                  request_id);
+        return;
+    }
+    if (workspace.workspaceId.empty()) {
+        sendError(conn, "save_workspace requires a non-empty workspace_id",
+                  request_id);
+        return;
+    }
+
+    std::string persist_error;
+    nlohmann::json saved;
+    {
+        std::lock_guard<std::mutex> lock(g_workspace_mutex);
+        ensureWorkspaceStoreLoadedLocked();
+        if (!g_workspace_store_error.empty()) {
+            sendError(conn, g_workspace_store_error, request_id);
+            return;
+        }
+        // Preserve the original creation timestamp on update, as the experiment
+        // store does: a rename must not look like a new workspace.
+        const auto existing = g_workspaces.find(workspace.workspaceId);
+        if (existing != g_workspaces.end() && existing->second.createdAtUs != 0) {
+            workspace.createdAtUs = existing->second.createdAtUs;
+        }
+        if (workspace.createdAtUs == 0) {
+            workspace.createdAtUs = nowUs();
+        }
+        workspace.updatedAtUs = nowUs();
+        g_workspaces[workspace.workspaceId] = workspace;
+        if (!persistWorkspaceStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+        saved = workspace;
+    }
+    sendWorkspaceSaved(conn, request_id, saved);
+}
+
+void StreamViewerWebSocket::handleDeleteWorkspace(
+    const WebSocketConnectionPtr& conn,
+    const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    const std::string workspace_id = json.value("workspace_id", std::string{});
+    if (workspace_id.empty()) {
+        sendError(conn, "delete_workspace requires a workspace_id", request_id);
+        return;
+    }
+
+    std::string persist_error;
+    {
+        std::lock_guard<std::mutex> lock(g_workspace_mutex);
+        ensureWorkspaceStoreLoadedLocked();
+        if (!g_workspace_store_error.empty()) {
+            sendError(conn, g_workspace_store_error, request_id);
+            return;
+        }
+        if (g_workspaces.find(workspace_id) == g_workspaces.end()) {
+            sendError(conn, "No workspace found for workspace_id " + workspace_id,
+                      request_id);
+            return;
+        }
+        // Un-file the members BEFORE dropping the record: if this fails, the
+        // workspace is still there and its members are still consistently filed,
+        // rather than pointing at a workspace that no longer exists.
+        if (!unfileWorkspaceMembersLocked(workspace_id, persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+        g_workspaces.erase(workspace_id);
+        if (!persistWorkspaceStoreLocked(persist_error)) {
+            sendError(conn, persist_error, request_id);
+            return;
+        }
+    }
+    sendWorkspaceDeleted(conn, request_id, workspace_id);
+}
+
+void StreamViewerWebSocket::sendWorkspaceList(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id)
+{
+    nlohmann::json response;
+    response["type"] = "workspace_list";
+    response["request_id"] = request_id;
+    response["workspaces"] = nlohmann::json::array();
+    std::lock_guard<std::mutex> lock(g_workspace_mutex);
+    for (const auto& entry : g_workspaces) {
+        response["workspaces"].push_back(entry.second);
+    }
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendWorkspaceSaved(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const nlohmann::json& workspace_json)
+{
+    nlohmann::json response;
+    response["type"] = "workspace_saved";
+    response["request_id"] = request_id;
+    response["workspace"] = workspace_json;
+    response["workspace_id"] = workspace_json.value("workspace_id", std::string{});
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::sendWorkspaceDeleted(
+    const WebSocketConnectionPtr& conn,
+    const std::string& request_id,
+    const std::string& workspace_id)
+{
+    nlohmann::json response;
+    response["type"] = "workspace_deleted";
+    response["request_id"] = request_id;
+    response["workspace_id"] = workspace_id;
     conn->send(response.dump());
 }
 
