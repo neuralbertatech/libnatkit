@@ -10,6 +10,13 @@ RUN apt update
 RUN apt install cmake netcat-openbsd -y
 
 COPY . ./
+# Windows checkouts may carry CRLF into vendored shell entrypoints and sourced
+# helper modules. Normalize text files used by the Linux build, skipping binary
+# files rather than rewriting the third-party source tree on the host.
+RUN find scripts third-party/librdkafka -type f \
+    -exec sh -c 'for file do \
+      if grep -Iq . "$file"; then sed -i "s/\r$//" "$file"; fi; \
+    done' sh {} +
 RUN cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 RUN sh -lc 'jobs="${NATKIT_CMAKE_BUILD_PARALLEL:-}"; \
     if [ -z "$jobs" ]; then \

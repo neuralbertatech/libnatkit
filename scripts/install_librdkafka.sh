@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -e
+
 SRC_DIR=$1
 BUILD_DIR=$2
 INSTALL_DIR=$3
