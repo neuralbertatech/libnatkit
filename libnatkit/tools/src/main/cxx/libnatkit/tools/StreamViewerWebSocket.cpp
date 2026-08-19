@@ -2644,7 +2644,16 @@ struct Experiment {
     std::string experimentId;
     std::string label;
     nlohmann::json protocol = nlohmann::json(nullptr);
-    std::string participantId;
+    // DEPRECATED (TEC-NATKIT-55). The participant is a property of a RUN, not of
+    // the procedure: one experiment records a whole cohort, so a single field here
+    // could only ever name the most recent person. `start_experiment_instance`
+    // carries it per run now and the instance snapshots it.
+    //
+    // Still read AND written verbatim on purpose: it is the only source the
+    // one-time back-fill has for instances recorded before the snapshot existed,
+    // and dropping it on the first save would destroy that source before the
+    // migration ran. Nothing else may read it.
+    std::string legacyParticipantId;
     std::string notes;
     std::string liveGraphId;  // the editable board this experiment records with
     uint64_t createdAtUs = 0;
@@ -2656,7 +2665,7 @@ void to_json(nlohmann::json& json, const Experiment& value)
     json = {
         {"experiment_id", value.experimentId},
         {"label", value.label},
-        {"participant_id", value.participantId},
+        {"participant_id", value.legacyParticipantId},
         {"notes", value.notes},
         {"live_graph_id", value.liveGraphId},
         {"created_at_us", value.createdAtUs},
@@ -2670,7 +2679,7 @@ void from_json(const nlohmann::json& json, Experiment& value)
     value.experimentId = json.at("experiment_id").get<std::string>();
     value.label = json.value("label", std::string{});
     value.protocol = json.value("protocol", nlohmann::json(nullptr));
-    value.participantId = json.value("participant_id", std::string{});
+    value.legacyParticipantId = json.value("participant_id", std::string{});
     value.notes = json.value("notes", std::string{});
     value.liveGraphId = json.value("live_graph_id", std::string{});
     value.createdAtUs = json.value("created_at_us", static_cast<uint64_t>(0));
@@ -2840,14 +2849,14 @@ void backfillInstanceParticipantsLocked()
             unresolved.push_back(graph.graphId);
             continue;
         }
-        graph.recording["participant_id"] = experiment->second.participantId;
+        graph.recording["participant_id"] = experiment->second.legacyParticipantId;
         // THREE distinct states, and collapsing any two of them is how a data set
         // starts lying: captured at record time (neither flag), recovered from the
         // experiment record afterwards (`participant_backfilled`), or never
         // entered by anyone (`participant_unrecorded`). An empty string stamped
         // "back-filled" would claim an attribution that never existed, which is
         // worse than the missing field it replaced.
-        if (experiment->second.participantId.empty()) {
+        if (experiment->second.legacyParticipantId.empty()) {
             graph.recording["participant_unrecorded"] = true;
             ++unrecorded;
         } else {
@@ -8017,7 +8026,18 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
         // The board snapshot above cannot cover this: the protocol moved off the
         // canvas to the experiment record, so the copied nodes carry only a
         // config-less `markers` source.
-        recording["participant_id"] = experiment->second.participantId;
+        //
+        // WHO comes from the REQUEST, per run (TEC-NATKIT-55): one experiment
+        // records a whole cohort, so the procedure cannot name the person. An
+        // absent participant is recorded as absent rather than quietly inherited
+        // from anywhere -- the same three states the back-fill keeps apart, so a
+        // run taken before the Record gate exists says so about itself instead of
+        // borrowing an attribution.
+        const auto participant_id = json.value("participant_id", std::string{});
+        recording["participant_id"] = participant_id;
+        if (participant_id.empty()) {
+            recording["participant_unrecorded"] = true;
+        }
         recording["protocol"] = experiment->second.protocol;
         recording["window_start_us"] =
             json.value("window_start_us", static_cast<uint64_t>(nowUs()));
