@@ -8326,6 +8326,17 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
             !json["sensor_positions"].empty()) {
             recording["sensor_positions"] = json["sensor_positions"];
         }
+        // Recorded through the calibration gate on purpose (TEC-NATKIT-63). Stored
+        // with the reason the operator was shown, because by the time anyone asks
+        // why, the accuracies that justified the decision are long gone.
+        //
+        // ⚠️ Its ABSENCE is the claim that the run met the threshold, so this is
+        // written only from the gate's own field and never defaulted to a value.
+        const auto calibration_override =
+            json.value("calibration_override", std::string{});
+        if (!calibration_override.empty()) {
+            recording["calibration_override"] = calibration_override;
+        }
         recording["window_start_us"] =
             json.value("window_start_us", static_cast<uint64_t>(nowUs()));
         recording["window_end_us"] = nullptr;
