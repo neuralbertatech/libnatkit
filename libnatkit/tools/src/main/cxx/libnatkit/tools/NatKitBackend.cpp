@@ -32,6 +32,7 @@
 
 #include "StreamViewerWebSocket.hpp"
 #include "Auth.hpp"
+#include "CohortExport.hpp"
 #include "ParquetExport.hpp"
 
 #include <filesystem>
@@ -1371,6 +1372,75 @@ int main()
                 api_controller->is_connected_to_broker(req, std::move(callback));
         },
         { Get });
+
+    // Register GET /api/export/cohort — every completed run in a workspace, as one
+    // tar (TEC-NATKIT-65). The payoff of the workspace container: without it a
+    // study's data is collected by pressing Download once per instance, which is
+    // both tedious and unauditable.
+    //
+    // ⚠️ Reads the MATERIALIZED ARTIFACTS, never Kafka. /api/export/parquet
+    // re-drains the topic, which is right for a live stream and wrong for sealed
+    // history: retention may have rolled, and a re-drain could hand back a
+    // different file from the one the instance recorded a sha256 for.
+    app().registerHandler("/api/export/cohort",
+        [](const HttpRequestPtr& req,
+           std::function<void(const HttpResponsePtr&)>&& callback) {
+            // Absent workspace_id means the Unfiled pseudo-workspace, which is a
+            // real view holding everything recorded before workspaces existed --
+            // so "" is a valid request, not a missing parameter.
+            const auto workspace_id = req->getParameter("workspace_id");
+
+            std::string error;
+            const auto inputs =
+                natkit::tools::collectCohortInputs(workspace_id, error);
+            if (!error.empty()) {
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k400BadRequest);
+                resp->setContentTypeCode(CT_TEXT_PLAIN);
+                resp->setBody(error);
+                callback(resp);
+                return;
+            }
+            if (inputs.instances.empty() && inputs.skips.empty()) {
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k404NotFound);
+                resp->setContentTypeCode(CT_TEXT_PLAIN);
+                resp->setBody("No recorded runs in this workspace.");
+                callback(resp);
+                return;
+            }
+
+            const auto result = natkit::tools::buildCohortArchive(inputs);
+            if (!result.ok) {
+                auto resp = HttpResponse::newHttpResponse();
+                resp->setStatusCode(k500InternalServerError);
+                resp->setContentTypeCode(CT_TEXT_PLAIN);
+                resp->setBody(result.error);
+                callback(resp);
+                return;
+            }
+
+            auto resp = HttpResponse::newHttpResponse();
+            resp->setStatusCode(k200OK);
+            resp->setContentTypeString("application/x-tar");
+            resp->setBody(result.archive);
+            resp->addHeader("Content-Disposition",
+                            "attachment; filename=\"" + result.fileName + "\"");
+            // Surfaced so the operator sees what they got without extracting it --
+            // and so a SKIP count is visible even if nobody opens the manifest.
+            resp->addHeader("X-Natkit-Instance-Count",
+                            std::to_string(result.instanceCount));
+            resp->addHeader("X-Natkit-File-Count", std::to_string(result.fileCount));
+            resp->addHeader("X-Natkit-Skip-Count", std::to_string(result.skipCount));
+            resp->addHeader("X-Natkit-Checksum-Mismatch-Count",
+                            std::to_string(result.checksumMismatchCount));
+            LOG_INFO << "Cohort export: workspace '" << workspace_id << "' -> "
+                     << result.instanceCount << " instance(s), " << result.fileCount
+                     << " file(s), " << result.skipCount << " skipped, "
+                     << result.checksumMismatchCount << " checksum mismatch(es)";
+            callback(resp);
+        },
+        {Get});
 
     // Register GET /api/export/parquet — materialize a stream to a Parquet file
     // and hand it straight back as a download.

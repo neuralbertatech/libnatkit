@@ -4,9 +4,11 @@
 #include "GraphTopicResolution.hpp"
 #include "GraphTransportPlan.hpp"
 #include "InProcessTransport.hpp"
+#include "CohortExport.hpp"
 #include "ParquetExport.hpp"
 #include "ReplaySource.hpp"
 
+#include <set>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -12629,3 +12631,153 @@ bool StreamViewerWebSocket::resolveTrainInstanceDatasets(
     };
     return resolveList("train_instances") && resolveList("eval_instances");
 }
+
+// --- Cohort export input collection (TEC-NATKIT-411) ----------------------
+//
+// Lives here because this translation unit owns the workspace, experiment and
+// graph stores. The archive building itself is in CohortExport.cpp, which is pure
+// and therefore testable without any of them.
+namespace natkit::tools {
+
+CohortExportInputs collectCohortInputs(const std::string& workspaceId,
+                                       std::string& error)
+{
+    CohortExportInputs inputs;
+    inputs.workspaceId = workspaceId;
+
+    // Lock order is workspace -> experiment -> graph, as established by
+    // unfileWorkspaceMembersLocked. Nothing here takes them the other way round.
+    std::lock_guard<std::mutex> workspace_lock(g_workspace_mutex);
+    ensureWorkspaceStoreLoadedLocked();
+    if (!g_workspace_store_error.empty()) {
+        error = g_workspace_store_error;
+        return inputs;
+    }
+    if (!workspaceId.empty()) {
+        const auto workspace = g_workspaces.find(workspaceId);
+        if (workspace == g_workspaces.end()) {
+            error = "No workspace found for workspace_id " + workspaceId;
+            return inputs;
+        }
+        inputs.workspaceLabel = workspace->second.label;
+    } else {
+        // The empty id is the Unfiled pseudo-workspace, which is a real view and
+        // exportable like any other -- everything recorded before workspaces
+        // existed lives there.
+        inputs.workspaceLabel = "Unfiled";
+    }
+
+    std::lock_guard<std::mutex> experiment_lock(g_experiment_mutex);
+    ensureExperimentStoreLoadedLocked();
+    if (!g_experiment_store_error.empty()) {
+        error = g_experiment_store_error;
+        return inputs;
+    }
+    std::set<std::string> experiment_ids;
+    for (const auto& entry : g_experiments) {
+        if (entry.second.workspaceId == workspaceId) {
+            experiment_ids.insert(entry.first);
+        }
+    }
+
+    std::lock_guard<std::mutex> graph_lock(g_stream_graph_mutex);
+    ensureStreamGraphStoreLoadedLocked();
+    if (!g_stream_graph_store_error.empty()) {
+        error = g_stream_graph_store_error;
+        return inputs;
+    }
+
+    // Deterministic order (TEC-NATKIT-411 asks for reproducible re-export), so walk
+    // a sorted view rather than the hash map's iteration order.
+    std::vector<const StreamGraphDefinition*> instances;
+    for (const auto& entry : g_stream_graphs) {
+        const auto& graph = entry.second;
+        if (graph.instanceId.empty()) continue;  // a live board is not a run
+        if (experiment_ids.count(graph.experimentId) == 0) continue;
+        instances.push_back(&graph);
+    }
+    std::sort(instances.begin(), instances.end(),
+              [](const StreamGraphDefinition* left, const StreamGraphDefinition* right) {
+                  if (left->experimentId != right->experimentId) {
+                      return left->experimentId < right->experimentId;
+                  }
+                  return left->instanceId < right->instanceId;
+              });
+
+    for (const auto* graph : instances) {
+        const auto& recording = graph->recording;
+        const auto status = recording.value("status", std::string{});
+        if (status != "complete") {
+            // ⚠️ Named, never dropped: an in-flight or failed run absent from the
+            // archive with no explanation reads as a cohort that never had it.
+            inputs.skips.push_back({graph->experimentId, graph->instanceId,
+                                    status.empty() ? "no recording status"
+                                                   : "status is " + status});
+            continue;
+        }
+
+        CohortInstance instance;
+        instance.experimentId = graph->experimentId;
+        instance.instanceId = graph->instanceId;
+        instance.participantId = recording.value("participant_id", std::string{});
+        instance.participantBackfilled = recording.value("participant_backfilled", false);
+        instance.participantUnrecorded = recording.value("participant_unrecorded", false);
+        instance.calibrationOverride =
+            recording.value("calibration_override", std::string{});
+        if (recording.contains("sensor_positions") &&
+            recording["sensor_positions"].is_array()) {
+            for (const auto& entry : recording["sensor_positions"]) {
+                instance.sensorPositions.emplace_back(
+                    entry.value("stream_id", std::string{}),
+                    entry.value("position", std::string{}));
+            }
+        }
+
+        const auto artifacts = recording.value("artifacts", nlohmann::json::object());
+        instance.totalRows = artifacts.value("total_rows", static_cast<uint64_t>(0));
+        const auto directory = artifacts.value("directory", std::string{});
+        if (directory.empty()) {
+            inputs.skips.push_back({graph->experimentId, graph->instanceId,
+                                    "complete but records no artifact directory"});
+            continue;
+        }
+
+        // ⚠️ `path` is a FILE NAME relative to `directory`, not an absolute path.
+        // Reading it as absolute makes every artifact look missing, which is a
+        // mistake already made once while verifying TEC-NATKIT-54.
+        const std::string prefix =
+            (instance.participantId.empty() ? std::string("unattributed")
+                                            : instance.participantId) +
+            "/" + graph->experimentId + "/" + graph->instanceId + "/";
+
+        for (const auto& file : artifacts.value("data", nlohmann::json::array())) {
+            const auto name = file.value("path", std::string{});
+            if (name.empty()) continue;
+            CohortArtifact artifact;
+            artifact.absolutePath = (std::filesystem::path(directory) / name).string();
+            artifact.archivePath = prefix + name;
+            artifact.recordedSha256 = file.value("sha256", std::string{});
+            artifact.truncated = file.value("truncated", false);
+            instance.artifacts.push_back(std::move(artifact));
+        }
+        const auto markers = artifacts.value("markers", std::string{});
+        if (!markers.empty()) {
+            CohortArtifact artifact;
+            artifact.absolutePath = (std::filesystem::path(directory) / markers).string();
+            artifact.archivePath = prefix + markers;
+            artifact.recordedSha256 = artifacts.value("markers_sha256", std::string{});
+            instance.artifacts.push_back(std::move(artifact));
+        }
+
+        if (instance.artifacts.empty()) {
+            inputs.skips.push_back({graph->experimentId, graph->instanceId,
+                                    "complete but lists no artifacts"});
+            continue;
+        }
+        inputs.instances.push_back(std::move(instance));
+    }
+
+    return inputs;
+}
+
+}  // namespace natkit::tools

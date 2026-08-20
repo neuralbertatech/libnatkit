@@ -78,6 +78,7 @@ if(BUILD_NATKIT_BACKEND)
 
   add_executable(libnatkit-natkit-backend
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/Auth.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/CohortExport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/ParquetExport.cpp
