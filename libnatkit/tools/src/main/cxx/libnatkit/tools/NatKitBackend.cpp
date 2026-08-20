@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <deque>
 #include <fstream>
@@ -1040,6 +1041,27 @@ public:
 
 int main()
 {
+    // ⚠️ LINE-BUFFER STDOUT BEFORE ANYTHING WRITES TO IT (TEC-NATKIT-62).
+    //
+    // Every LOG_INFO / LOG_WARN / LOG_ERROR in this backend was invisible in the
+    // deployed container. The logger, its level and its sink were all fine: the
+    // supervisor runs `<backend> 2>&1 | tee /logs/log_...log`, and stdio
+    // BLOCK-buffers stdout when it is a pipe rather than a terminal. This process
+    // is meant to run for weeks and never exits normally, so drogon's output sat
+    // in a ~4 KB buffer indefinitely.
+    //
+    // ⚠️ The tell that took a wrong diagnosis to spot: a 406 KB backend log whose
+    // only content was librdkafka. librdkafka writes to STDERR, which is unbuffered
+    // -- so "Kafka lines present, drogon lines absent" is the signature of stdout
+    // buffering, not of a broken logger. I first read it as proof that buffering was
+    // NOT the cause.
+    //
+    // Done here rather than with `stdbuf -oL` in compose so it survives anyone
+    // rewriting the compose command, and so it holds however the binary is
+    // launched. Line buffering, not unbuffered: per-line flushing is enough to make
+    // a running server observable without a write syscall per fragment.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     std::cout << "Starting Drogon server now..." << std::endl;
 
     // Set the number of threads for the application.
