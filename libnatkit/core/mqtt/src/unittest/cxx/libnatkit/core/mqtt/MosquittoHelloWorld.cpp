@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cstdlib>
+#include <string>
 #include <libnatkit-mqtt.hpp>
 
 
@@ -70,6 +72,23 @@ void on_message(struct mosquitto* mosq, void* obj, const struct mosquitto_messag
 	printf("%s %d %s\n", msg->topic, msg->qos, (char*)msg->payload);
 }
 
+// Whether the caller has opted into tests that reach a THIRD-PARTY server.
+//
+// ⚠️ Off by default, and that is the whole point of this ticket
+// (TEC-NATKIT-79). `ManualConnection.HelloWorld` connects to
+// `test.mosquitto.org` — somebody else's public broker, on the internet. On a
+// machine that cannot reach it the test spends 133 SECONDS timing out and then
+// fails, which made `ctest` red for the whole repository: every subsequent change
+// had to decide whether the one red test was theirs, and that is exactly how a
+// real failure eventually gets waved through.
+//
+// It is also not ours to hammer. Opt in with NATKIT_TEST_PUBLIC_BROKER=1 when you
+// actually want to check interoperability against a public broker.
+bool publicBrokerTestsEnabled() {
+    const char* opt_in = std::getenv("NATKIT_TEST_PUBLIC_BROKER");
+    return opt_in != nullptr && std::string(opt_in) == "1";
+}
+
 void manually_test_connection(const std::string& host, int port) {
 	struct mosquitto* mosq;
 	int rc;
@@ -84,7 +103,15 @@ void manually_test_connection(const std::string& host, int port) {
 	mosquitto_subscribe_callback_set(mosq, on_subscribe);
 	mosquitto_message_callback_set(mosq, on_message);
 	rc = mosquitto_connect(mosq, host.c_str(), port, 60);
-	EXPECT_EQ(rc, MOSQ_ERR_SUCCESS);
+	// Says WHICH broker and what to do about it. A bare "expected 0, got 14" left
+	// the reader to find the hard-coded host in the source before they could tell
+	// an unreachable broker from a broken client.
+	EXPECT_EQ(rc, MOSQ_ERR_SUCCESS)
+		<< "could not connect to " << host << ":" << port << " — "
+		<< mosquitto_strerror(rc)
+		<< (host == "localhost"
+			    ? ". Is the natKit dev stack running? (mosquitto is one of its services)"
+			    : ". This is a third-party broker; set NATKIT_TEST_PUBLIC_BROKER=1 only if you meant to reach it.");
 	if (rc != MOSQ_ERR_SUCCESS) {
 		mosquitto_destroy(mosq);
 		fprintf(stderr, "Error: %s\n", mosquitto_strerror(rc));
@@ -96,6 +123,10 @@ void manually_test_connection(const std::string& host, int port) {
 
 TEST(ManualConnection, HelloWorld)
 {
+	if (!publicBrokerTestsEnabled()) {
+		GTEST_SKIP() << "skipped: reaches test.mosquitto.org, a third-party public "
+		                "broker. Set NATKIT_TEST_PUBLIC_BROKER=1 to run it.";
+	}
 	manually_test_connection("test.mosquitto.org", 1883);
 }
 
