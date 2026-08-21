@@ -266,3 +266,177 @@ TEST(DeviceHealthTest, ForgettingDropsOnlyLongGoneDevices) {
     ASSERT_EQ(snapshot.size(), 1u);
     EXPECT_EQ(snapshot[0].deviceId, 2u);
 }
+
+// --- what a recording carries (TEC-NATKIT-77) ------------------------------
+//
+// These matter more than the live panel's arithmetic, because they are the only
+// record that survives. The status frames age out of Kafka retention and the
+// recording keeps no copy, so anything this gets wrong is wrong permanently and
+// nobody can go back and check.
+
+namespace {
+
+nat::tools::DeviceHealth healthOf(const uint64_t deviceId, const nlohmann::json& fields,
+                                  const uint64_t ageMs = 0) {
+    nat::tools::DeviceHealth health;
+    health.deviceId = deviceId;
+    health.ageMs = ageMs;
+    health.fields = fields;
+    return health;
+}
+
+nlohmann::json syncFields(const int beaconsMissed, const int epoch,
+                          const bool valid = true) {
+    return nlohmann::json{
+        {"data_frames", 1000},
+        {"sync",
+         {{"valid", valid},
+          {"quality", 2},
+          {"epoch", epoch},
+          {"residual_rms_ns", 45767},
+          {"peak_residual_ns", 138746},
+          {"skew_ppb", 43265},
+          {"beacons_missed", beaconsMissed}}}};
+}
+
+nlohmann::json fitsJson(const std::vector<nat::tools::RecordedClockFit>& fits) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& fit : fits) {
+        out.push_back(fit.toJson());
+    }
+    return out;
+}
+
+}  // namespace
+
+// ⚠️ The distinction the whole record hangs on. A device that never sent a status
+// frame must not be written down as a valid fit full of zeroes.
+TEST(RecordedClockFitTest, ADeviceThatNeverReportedSaysSo) {
+    const auto fits = nat::tools::snapshotClockFits({}, {"13793649670644"}, /*watching=*/true);
+    ASSERT_EQ(fits.size(), 1u);
+    EXPECT_EQ(fits[0].status, "no_status_frames");
+    EXPECT_TRUE(fits[0].fields.is_null());
+    // null in the JSON too: {} would read as "we looked and it was all zero".
+    EXPECT_TRUE(fits[0].toJson()["fields"].is_null());
+}
+
+TEST(RecordedClockFitTest, AReportingDeviceCarriesItsFields) {
+    const std::vector<nat::tools::DeviceHealth> devices = {
+        healthOf(13793649670644ULL, syncFields(100, 7))};
+    const auto fits = nat::tools::snapshotClockFits(devices, {"13793649670644"}, /*watching=*/true);
+    ASSERT_EQ(fits.size(), 1u);
+    EXPECT_EQ(fits[0].status, "reported");
+    EXPECT_EQ(fits[0].fields["sync"]["quality"].get<int>(), 2);
+}
+
+// A device that was reporting and has gone silent is neither of the other two.
+TEST(RecordedClockFitTest, ASilentDeviceIsDistinctFromOneThatNeverReported) {
+    const std::vector<nat::tools::DeviceHealth> devices = {
+        healthOf(1ULL, syncFields(100, 7), /*ageMs=*/40000)};
+    const auto fits = nat::tools::snapshotClockFits(devices, {"1"}, /*watching=*/true);
+    EXPECT_EQ(fits[0].status, "went_quiet");
+    // Its last-known fields are still recorded: they are the evidence.
+    EXPECT_FALSE(fits[0].fields.is_null());
+}
+
+TEST(RecordedClockFitTest, EveryRequestedStreamGetsARow) {
+    const std::vector<nat::tools::DeviceHealth> devices = {
+        healthOf(1ULL, syncFields(100, 7))};
+    const auto fits = nat::tools::snapshotClockFits(devices, {"1", "2", "3"}, /*watching=*/true);
+    ASSERT_EQ(fits.size(), 3u);
+    EXPECT_EQ(fits[0].status, "reported");
+    EXPECT_EQ(fits[1].status, "no_status_frames");
+    EXPECT_EQ(fits[2].status, "no_status_frames");
+}
+
+// ⚠️ A RATE over the run, not the since-boot total. Quoting the total would say
+// "this run missed 3662 beacons" about a device that missed them yesterday.
+TEST(ClockQualityTest, BeaconLossIsDifferencedOverTheRun) {
+    const auto start = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(3600, 7))}, {"1"}, /*watching=*/true));
+    const auto finish = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(3662, 7))}, {"1"}, /*watching=*/true));
+
+    const auto quality = nat::tools::buildClockQuality(start, finish, /*runSeconds=*/124.0);
+    ASSERT_EQ(quality["devices"].size(), 1u);
+    const auto& device = quality["devices"][0];
+    EXPECT_EQ(device["beacons_missed_in_run"].get<double>(), 62.0);
+    EXPECT_NEAR(device["beacons_missed_per_s"].get<double>(), 0.5, 1e-9);
+    EXPECT_EQ(quality["run_seconds"].get<double>(), 124.0);
+}
+
+// ⚠️ The single most important thing this record can say, and it is invisible in
+// either endpoint alone: the fit was REBUILT mid-run, so timestamps before and
+// after it sit on different fits.
+TEST(ClockQualityTest, AnEpochChangeMidRunIsRecorded) {
+    const auto start = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(10, 7))}, {"1"}, /*watching=*/true));
+    const auto same = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(12, 7))}, {"1"}, /*watching=*/true));
+    const auto changed = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(12, 8))}, {"1"}, /*watching=*/true));
+
+    EXPECT_FALSE(nat::tools::buildClockQuality(start, same, 60.0)["devices"][0]
+                     ["epoch_changed_during_run"]
+                         .get<bool>());
+    EXPECT_TRUE(nat::tools::buildClockQuality(start, changed, 60.0)["devices"][0]
+                    ["epoch_changed_during_run"]
+                        .get<bool>());
+}
+
+// A counter that went BACKWARDS means the device rebooted mid-run. No rate is
+// reported rather than a negative or a wrapped one, and the row still exists.
+TEST(ClockQualityTest, ARebootMidRunYieldsNoRateRatherThanNonsense) {
+    const auto start = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(50000, 7))}, {"1"}, /*watching=*/true));
+    const auto finish = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(12, 9))}, {"1"}, /*watching=*/true));
+
+    const auto quality = nat::tools::buildClockQuality(start, finish, 60.0);
+    const auto& device = quality["devices"][0];
+    EXPECT_EQ(device.count("beacons_missed_per_s"), 0u);
+    EXPECT_TRUE(device["epoch_changed_during_run"].get<bool>());
+    EXPECT_EQ(device["device_id"].get<std::string>(), "1");
+}
+
+TEST(ClockQualityTest, AZeroLengthRunReportsNoRate) {
+    const auto start = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(10, 7))}, {"1"}, /*watching=*/true));
+    const auto finish = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(10, 7))}, {"1"}, /*watching=*/true));
+    const auto quality = nat::tools::buildClockQuality(start, finish, 0.0);
+    EXPECT_EQ(quality["devices"][0].count("beacons_missed_per_s"), 0u);
+}
+
+// A device with no status frames at either end still gets a row saying so — the
+// row is the record that it was part of the run and could not be vouched for.
+TEST(ClockQualityTest, ASilentDeviceStillGetsARow) {
+    const auto start = fitsJson(nat::tools::snapshotClockFits({}, {"7"}, /*watching=*/true));
+    const auto finish = fitsJson(nat::tools::snapshotClockFits({}, {"7"}, /*watching=*/true));
+    const auto quality = nat::tools::buildClockQuality(start, finish, 60.0);
+    ASSERT_EQ(quality["devices"].size(), 1u);
+    EXPECT_EQ(quality["devices"][0]["status"].get<std::string>(), "no_status_frames");
+    EXPECT_EQ(quality["devices"][0].count("valid"), 0u);
+}
+
+TEST(ClockQualityTest, AnInvalidFitIsRecordedAsInvalid) {
+    const auto start = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(10, 7, /*valid=*/false))}, {"1"}, /*watching=*/true));
+    const auto finish = fitsJson(nat::tools::snapshotClockFits({healthOf(1ULL, syncFields(20, 7, /*valid=*/false))}, {"1"}, /*watching=*/true));
+    const auto quality = nat::tools::buildClockQuality(start, finish, 60.0);
+    EXPECT_FALSE(quality["devices"][0]["valid"].get<bool>());
+}
+
+// ⚠️ The distinction that keeps the record honest about WHOSE fault an absence is.
+// Lazily starting the tailer meant the first recording after a restart snapshotted
+// an empty tracker, and every device in it was sealed as "no_status_frames" —
+// permanently accusing the hardware of our own cold start.
+TEST(RecordedClockFitTest, NotWatchingIsNotTheSameAsTheDeviceNotReporting) {
+    const auto watching =
+        nat::tools::snapshotClockFits({}, {"1"}, /*watching=*/true);
+    const auto blind =
+        nat::tools::snapshotClockFits({}, {"1"}, /*watching=*/false);
+    EXPECT_EQ(watching[0].status, "no_status_frames");
+    EXPECT_EQ(blind[0].status, "not_watching");
+    // Neither invents a fit.
+    EXPECT_TRUE(watching[0].fields.is_null());
+    EXPECT_TRUE(blind[0].fields.is_null());
+}
+
+// And it survives into the sealed record rather than being smoothed away.
+TEST(ClockQualityTest, NotWatchingSurvivesIntoTheRecord) {
+    const auto blind = fitsJson(
+        nat::tools::snapshotClockFits({}, {"1"}, /*watching=*/false));
+    const auto quality = nat::tools::buildClockQuality(blind, blind, 60.0);
+    EXPECT_EQ(quality["devices"][0]["status"].get<std::string>(), "not_watching");
+}

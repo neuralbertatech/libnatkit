@@ -20,13 +20,18 @@
 // this can be WRONG lives here (a wrapped counter, a reboot, a stale sample
 // quoted as current) and none of it needs a broker to test.
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <libnatkit-core.hpp>
+#include <libnatkit-kafka.hpp>
 #include <nlohmann/json.hpp>
 
 namespace nat {
@@ -146,6 +151,94 @@ std::map<std::string, uint64_t> nodeCounters(
     const nat::core::NatKitNodeStatusV1Schema &record);
 std::map<std::string, uint64_t> hubCounters(
     const nat::core::NatKitPrimaryStatusV1Schema &record);
+
+// One tailer for the whole backend, rather than one per browser.
+//
+// ⚠️ It exists for a reason beyond tidiness. A RECORDING has to be able to say
+// what the clocks were doing while it ran, and a recording is started by a
+// browser that may have the health panel shut, or by a client that is not a
+// browser at all. Health tailing that lives inside a per-connection thread means
+// the answer depends on who happened to be watching — which is exactly the kind
+// of "it was fine when I looked" that this whole channel exists to remove.
+//
+// So the tailing is a service: started once, tailing whatever status topics exist,
+// and readable by anybody. The per-client push threads read from it too, which
+// also stops N browsers opening N Kafka consumers on the same five topics.
+class DeviceHealthService {
+public:
+    static DeviceHealthService &instance();
+
+    // Idempotent. Safe to call from every path that might need health, because
+    // the first caller starts it and the rest are no-ops.
+    void start(const std::shared_ptr<nat::kafka::BrokerManager> &brokerManager);
+    void stop();
+
+    /** Every device seen, hub first. Empty before the first frame arrives. */
+    std::vector<DeviceHealth> snapshot() const;
+
+    /** How many status topics are being tailed, which distinguishes "the rig has
+     *  never published" from "everything went silent". */
+    size_t topicsTailed() const;
+
+    /** Whether the tailer is running at all, so a caller can say "not watching"
+     *  rather than "nothing to report". */
+    bool running() const { return running_; }
+
+private:
+    DeviceHealthService() = default;
+    ~DeviceHealthService();
+    DeviceHealthService(const DeviceHealthService &) = delete;
+    DeviceHealthService &operator=(const DeviceHealthService &) = delete;
+
+    void tailLoop();
+
+    std::shared_ptr<nat::kafka::BrokerManager> brokerManager_;
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+    mutable std::mutex mutex_;
+    DeviceHealthTracker tracker_;
+    size_t topicsTailed_ = 0;
+};
+
+// The clock fit for one device, as a RECORDING should carry it (TEC-NATKIT-77).
+//
+// ⚠️ `status` is the field that matters. "This device never sent a status frame"
+// is a real answer and must not be rendered as a valid fit full of zeroes: a
+// cohort recorded while a leaf had no fit has to be distinguishable from a clean
+// one afterwards, and afterwards is the only time anybody will ask.
+struct RecordedClockFit {
+    std::string deviceId;
+    /**
+     * "reported" | "no_status_frames" | "went_quiet" | "not_watching"
+     *
+     * ⚠️ `not_watching` is its own state and it is about US, not the device: the
+     * backend had no status tailer running yet, or had tailed no topic. Folding it
+     * into `no_status_frames` blames the hardware for our own cold start, and the
+     * first recording after a backend restart would permanently accuse every
+     * device of not reporting.
+     */
+    std::string status;
+    nlohmann::json fields;  // the raw sync fields at this moment, or null
+    nlohmann::json toJson() const;
+};
+
+/** Snapshot the clock fit for a set of stream ids, for sealing onto a recording. */
+std::vector<RecordedClockFit> snapshotClockFits(
+    const std::vector<DeviceHealth> &devices,
+    const std::vector<std::string> &streamIds,
+    /** Whether the backend was tailing status at all. False => "not_watching". */
+    bool watching);
+
+/**
+ * Combine a start-of-run and end-of-run snapshot into the record a reader wants.
+ *
+ * Pure, so the differencing is testable without a broker: the beacon-loss figure
+ * a reader needs is a RATE OVER THE RUN, and the frames carry only totals since
+ * the device booted.
+ */
+nlohmann::json buildClockQuality(const nlohmann::json &atStart,
+                                 const nlohmann::json &atFinish,
+                                 double runSeconds);
 
 }  // namespace tools
 }  // namespace nat

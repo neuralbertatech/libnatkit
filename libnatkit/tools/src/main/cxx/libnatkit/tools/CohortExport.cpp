@@ -110,12 +110,18 @@ CohortExportResult buildCohortArchive(const CohortExportInputs& inputs)
              << "# Every completed run in this workspace. Read the SKIPPED section at\n"
              << "# the bottom before treating this as the whole cohort.\n"
              << "#\n"
+             << "# clocks: held        = every device held a usable clock fit\n"
+             << "#         N in question = that many could not be vouched for; read\n"
+             << "#                         the instance record for which and why\n"
+             << "#         (blank)       = the run predates the clock record, which\n"
+             << "#                         is NOT the same as clean\n"
+             << "#\n"
              << "# attribution: captured  = the participant was recorded at run time\n"
              << "#              backfilled = recovered from the experiment afterwards\n"
              << "#                           (a weaker claim)\n"
              << "#              unrecorded = nobody ever entered one\n\n"
              << "participant,attribution,experiment_id,instance_id,rows,"
-                "calibration_override,sensor_positions,file,recorded_sha256,"
+                "calibration_override,sensor_positions,clocks,file,recorded_sha256,"
                 "sha256_matches,truncated\n";
 
     std::string archive;
@@ -142,6 +148,7 @@ CohortExportResult buildCohortArchive(const CohortExportInputs& inputs)
                              << instance.totalRows << ","
                              << csvCell(instance.calibrationOverride) << ","
                              << csvCell(positions) << ","
+                             << csvCell(instance.clockSummary) << ","
                              << csvCell(artifact.archivePath)
                              << ",," << "FILE MISSING" << ",\n";
                     continue;
@@ -168,6 +175,7 @@ CohortExportResult buildCohortArchive(const CohortExportInputs& inputs)
                      << instance.totalRows << ","
                      << csvCell(instance.calibrationOverride) << ","
                      << csvCell(positions) << ","
+                     << csvCell(instance.clockSummary) << ","
                      << csvCell(artifact.archivePath) << ","
                      << artifact.recordedSha256 << ","
                      << matches << ","

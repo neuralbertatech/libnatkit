@@ -50,6 +50,15 @@ struct CohortInstance {
     // Non-empty when the run was taken below the calibration minimum on purpose
     // (TEC-NATKIT-63).
     std::string calibrationOverride;
+    /**
+     * One-line summary of whether the clocks could be trusted (TEC-NATKIT-77).
+     *
+     * ⚠️ In the manifest because a Parquet leaves this system: whoever analyses
+     * it months later has the file and the manifest, not the backend's store and
+     * certainly not the status frames, which aged out of Kafka long before.
+     * "" means the run predates the record — which is not the same as clean.
+     */
+    std::string clockSummary;
     // stream_id -> body position, as recorded (TEC-NATKIT-62).
     std::vector<std::pair<std::string, std::string>> sensorPositions;
     uint64_t totalRows = 0;
