@@ -7519,6 +7519,15 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "delete_stream_graph") {
             handleDeleteStreamGraph(conn, json);
         }
+        else if (action == "list_log_streams") {
+            handleListLogStreams(conn, json);
+        }
+        else if (action == "subscribe_logs") {
+            handleSubscribeLogs(conn, json);
+        }
+        else if (action == "unsubscribe_logs") {
+            handleUnsubscribeLogs(conn);
+        }
         else if (action == "subscribe_device_health") {
             handleSubscribeDeviceHealth(conn, json);
         }
@@ -9613,6 +9622,303 @@ void StreamViewerWebSocket::deviceHealthThreadFunc(
 
     ctx->device_health_active = false;
     LOG_INFO << "Device health: stopped for a client";
+}
+
+
+// --- the log viewer (TEC-NATKIT-33, second half) ---------------------------
+//
+// Devices publish free-form log lines on `Log-<id>-Json-NatLogV1` and structured
+// health on `Log-<id>-Binary-NatKit*StatusV1`. Both are LOGGING_LOG topics, and
+// until now the only way to read either was to attach a consumer by hand.
+//
+// This tails whichever of them the client asks for and forwards each record. It
+// is deliberately GENERIC -- it resolves a topic through the schema registry
+// rather than knowing schema names -- because the point is that a log added
+// tomorrow is readable without a frontend change. Three cases, in order:
+//
+//   1. a registered decoder exists  -> decode and send its JSON, plus the
+//      schema's own timestamp, which is better than arrival time.
+//   2. no decoder but the topic says Json -> pass the text through. THIS IS THE
+//      COMMON CASE: NatLogV1 has no schema class at all, it is free-form JSON
+//      that the firmware and the command path already agree on informally.
+//   3. neither -> report the record as an undecodable byte count.
+//
+// ⚠️ Case 3 must not silently drop. A log viewer that shows nothing for a topic
+// it cannot parse is indistinguishable from a device that is not logging, and
+// the second is what everybody will conclude.
+
+namespace {
+
+constexpr size_t kMaxLogRecordsPerPush = 200;
+constexpr uint64_t kDefaultLogIntervalMs = 500;
+// A single record's text, truncated. A device that logs a megabyte in one line
+// should not be able to wedge a browser tab, and the truncation is reported.
+constexpr size_t kMaxLogTextBytes = 8192;
+
+bool isLogTopic(const nat::core::BasicTopicInformation& topic) {
+    return topic.type == nat::core::StreamType::LOGGING_LOG;
+}
+
+}  // namespace
+
+void StreamViewerWebSocket::handleListLogStreams(
+    const WebSocketConnectionPtr& conn, const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available", request_id);
+        return;
+    }
+
+    nlohmann::json response;
+    response["type"] = "log_stream_list";
+    response["request_id"] = request_id;
+    nlohmann::json topics = nlohmann::json::array();
+
+    auto& registry = nat::core::DataSchemaDescriptorRegistry::getDefault();
+    for (const auto& topic : broker_manager_->getAllTopics()) {
+        if (!topic || !isLogTopic(*topic)) {
+            continue;
+        }
+        nlohmann::json entry;
+        entry["topic"] = topic->toTopicString();
+        // A string: these ids exceed 2^53 and JavaScript would round them.
+        entry["stream_id"] = std::to_string(topic->id);
+        entry["schema_name"] = topic->schemaName;
+        entry["serialization_type"] = nat::core::toString(topic->serializationType);
+        // Whether this topic can be rendered as structured fields or only as
+        // text, so the frontend can say which rather than discovering it per
+        // record. A descriptor is what makes field labels possible.
+        const auto descriptor = registry.findBySchemaName(topic->schemaName);
+        entry["has_descriptor"] = descriptor.has_value();
+        const auto descriptor_json = getDescriptorJsonForSchemaName(topic->schemaName);
+        if (descriptor_json.has_value()) {
+            entry["descriptor"] = descriptor_json.value();
+        }
+        topics.push_back(std::move(entry));
+    }
+    response["topics"] = std::move(topics);
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::handleSubscribeLogs(
+    const WebSocketConnectionPtr& conn, const nlohmann::json& json)
+{
+    StreamViewerClientContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        auto it = clients_.find(conn);
+        if (it == clients_.end()) {
+            return;
+        }
+        ctx = it->second.get();
+    }
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available");
+        return;
+    }
+
+    std::set<std::string> requested;
+    if (json.contains("topics") && json["topics"].is_array()) {
+        for (const auto& entry : json["topics"]) {
+            if (entry.is_string()) {
+                requested.insert(entry.get<std::string>());
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->log_topics_mutex);
+        ctx->log_topics = requested;
+    }
+
+    // An empty set means "stop", which is what unchecking the last topic does.
+    // Treating it as "tail everything" would turn a deselection into a flood.
+    if (requested.empty()) {
+        ctx->log_tail_active = false;
+        return;
+    }
+
+    // Already running: the set has been swapped above and the thread re-reads it
+    // each tick, so a client toggling a checkbox keeps its place in every topic
+    // it was already reading rather than restarting at the live end.
+    if (ctx->log_tail_active.exchange(true)) {
+        return;
+    }
+
+    const uint64_t interval_ms = json.value("interval_ms", kDefaultLogIntervalMs);
+    if (ctx->log_tail_thread.joinable()) {
+        ctx->log_tail_thread.join();
+    }
+    ctx->log_tail_thread = std::thread(&StreamViewerWebSocket::logTailThreadFunc,
+                                       this, conn, ctx,
+                                       std::max<uint64_t>(100, interval_ms));
+}
+
+void StreamViewerWebSocket::handleUnsubscribeLogs(const WebSocketConnectionPtr& conn)
+{
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    auto it = clients_.find(conn);
+    if (it == clients_.end()) {
+        return;
+    }
+    it->second->log_tail_active = false;
+}
+
+void StreamViewerWebSocket::logTailThreadFunc(const WebSocketConnectionPtr& conn,
+                                              StreamViewerClientContext* ctx,
+                                              const uint64_t interval_ms)
+{
+    // Messengers are kept per topic for the life of the subscription: rebuilding
+    // one re-attaches at the live end and loses whatever arrived in between.
+    // Deliberately NOT torn down when a topic is deselected, so re-checking it
+    // resumes rather than skipping the gap.
+    std::map<std::string, std::unique_ptr<nat::core::TopicMessenger>> messengers;
+    std::map<std::string, std::shared_ptr<nat::core::BasicTopicInformation>> infos;
+    auto registry = broker_manager_->getRegistry();
+
+    LOG_INFO << "Log tail: started for a client";
+
+    while (ctx->active && ctx->log_tail_active && conn->connected()) {
+        std::set<std::string> wanted;
+        {
+            std::lock_guard<std::mutex> lock(ctx->log_topics_mutex);
+            wanted = ctx->log_topics;
+        }
+
+        for (const auto& name : wanted) {
+            if (messengers.count(name) > 0) {
+                continue;
+            }
+            const auto info_maybe = nat::core::BasicTopicInformation::create(name);
+            if (!info_maybe.has_value()) {
+                // A name the client made up, or a topic string this build cannot
+                // parse. Said out loud rather than ignored: silence here reads as
+                // "that topic has no logs".
+                nlohmann::json problem;
+                problem["type"] = "log_records";
+                problem["records"] = nlohmann::json::array();
+                problem["error"] = "Not a topic this backend can parse: " + name;
+                if (conn->connected()) {
+                    conn->send(problem.dump());
+                }
+                continue;
+            }
+            auto info = std::make_shared<nat::core::BasicTopicInformation>(
+                *info_maybe.value());
+            auto messenger = broker_manager_->createMessenger(info);
+            if (!messenger) {
+                LOG_WARN << "Log tail: could not consume " << name;
+                continue;
+            }
+            LOG_INFO << "Log tail: tailing " << name;
+            infos[name] = info;
+            messengers[name] = std::move(messenger);
+        }
+
+        nlohmann::json records = nlohmann::json::array();
+        size_t dropped = 0;
+
+        for (auto& entry : messengers) {
+            if (wanted.count(entry.first) == 0) {
+                // Not selected right now. Its messenger stays alive (see above),
+                // but its records are drained and discarded rather than queued
+                // forever -- an unbounded queue behind a deselected checkbox is a
+                // leak that only shows up hours later.
+                while (entry.second->tryGetNextRawMessage().has_value()) {
+                }
+                continue;
+            }
+            const auto& info = infos[entry.first];
+            for (size_t drained = 0; drained < kMaxLogRecordsPerPush * 2; ++drained) {
+                if (records.size() >= kMaxLogRecordsPerPush) {
+                    // Count what we walked away from rather than pretending the
+                    // burst did not happen.
+                    if (entry.second->tryGetNextRawMessage().has_value()) {
+                        ++dropped;
+                        continue;
+                    }
+                    break;
+                }
+                auto next = entry.second->tryGetNextRawMessage();
+                if (!next.has_value()) {
+                    break;
+                }
+                const auto& bytes = *next.value();
+
+                nlohmann::json record;
+                record["topic"] = entry.first;
+                record["stream_id"] = std::to_string(info->id);
+                record["schema_name"] = info->schemaName;
+                record["received_ms"] = nowMs();
+                record["bytes"] = bytes.size();
+
+                bool rendered = false;
+
+                // 1. A registered decoder: structured fields, and the schema's
+                //    own timestamp rather than arrival time.
+                if (registry) {
+                    nat::core::TopicTranslator translator(info, registry);
+                    auto decoded = translator.tryDecodeMessage(bytes);
+                    if (decoded.has_value() && decoded.value()) {
+                        const auto& schema = *decoded.value();
+                        try {
+                            record["json"] = nlohmann::json::parse(schema.toString());
+                        } catch (const std::exception&) {
+                            record["text"] = schema.toString();
+                        }
+                        record["device_ts_us"] = schema.getTimestampUs();
+                        record["decoded"] = "schema";
+                        rendered = true;
+                    }
+                }
+
+                // 2. No decoder, but the topic says Json. NatLogV1 lives here:
+                //    it has no schema class, only a shape the firmware and the
+                //    command path agree on.
+                if (!rendered &&
+                    info->serializationType == nat::core::SerializationType::Json) {
+                    std::string text(bytes.begin(), bytes.end());
+                    bool truncated = false;
+                    if (text.size() > kMaxLogTextBytes) {
+                        text.resize(kMaxLogTextBytes);
+                        truncated = true;
+                    }
+                    try {
+                        record["json"] = nlohmann::json::parse(text);
+                        record["decoded"] = "json";
+                    } catch (const std::exception&) {
+                        record["text"] = text;
+                        record["decoded"] = "text";
+                    }
+                    if (truncated) {
+                        record["truncated"] = true;
+                    }
+                    rendered = true;
+                }
+
+                // 3. Neither. Reported, NOT dropped -- see the note at the top.
+                if (!rendered) {
+                    record["decoded"] = "none";
+                }
+                records.push_back(std::move(record));
+            }
+        }
+
+        if (!records.empty() || dropped > 0) {
+            nlohmann::json response;
+            response["type"] = "log_records";
+            response["records"] = std::move(records);
+            response["dropped"] = dropped;
+            if (conn->connected()) {
+                conn->send(response.dump());
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+
+    ctx->log_tail_active = false;
+    LOG_INFO << "Log tail: stopped for a client";
 }
 
 void StreamViewerWebSocket::handleListExperiments(

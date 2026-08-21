@@ -83,17 +83,29 @@ struct StreamViewerClientContext {
     // "is the rig alive?" is asked most often when no board is streaming.
     std::atomic<bool> device_health_active{false};
     std::thread device_health_thread;
+    // The log viewer (TEC-NATKIT-33, second half). Its own thread for the same
+    // reason as device health, plus one of its own: which topics it tails is
+    // chosen by the client and changes while it runs, so the set is guarded and
+    // re-read each tick rather than captured at start.
+    std::atomic<bool> log_tail_active{false};
+    std::thread log_tail_thread;
+    std::mutex log_topics_mutex;
+    std::set<std::string> log_topics;
     std::mutex mutex;
     std::optional<AuthenticatedUser> user;
 
     ~StreamViewerClientContext() {
         active = false;
         device_health_active = false;
+        log_tail_active = false;
         if (streaming_thread.joinable()) {
             streaming_thread.join();
         }
         if (device_health_thread.joinable()) {
             device_health_thread.join();
+        }
+        if (log_tail_thread.joinable()) {
+            log_tail_thread.join();
         }
     }
 };
@@ -315,6 +327,24 @@ private:
                                 StreamViewerClientContext* ctx,
                                 uint64_t interval_ms,
                                 uint64_t quiet_after_ms);
+
+    // --- the log viewer (TEC-NATKIT-33) ---
+    //
+    // LOGGING_LOG topics are deliberately absent from the stream list: they are
+    // not data a graph can consume, and listing them there would offer a "node
+    // status" source node. They are reachable here instead.
+
+    // Every LOGGING_LOG topic on the broker, so the client can choose.
+    void handleListLogStreams(const drogon::WebSocketConnectionPtr& conn,
+                              const nlohmann::json& json);
+    // Start / change / stop tailing. Re-sending it replaces the topic set, so a
+    // client toggling a checkbox does not restart the thread and lose its place.
+    void handleSubscribeLogs(const drogon::WebSocketConnectionPtr& conn,
+                             const nlohmann::json& json);
+    void handleUnsubscribeLogs(const drogon::WebSocketConnectionPtr& conn);
+    void logTailThreadFunc(const drogon::WebSocketConnectionPtr& conn,
+                           StreamViewerClientContext* ctx,
+                           uint64_t interval_ms);
 
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
