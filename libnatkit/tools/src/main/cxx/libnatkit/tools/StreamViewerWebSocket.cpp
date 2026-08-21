@@ -5,6 +5,7 @@
 #include "GraphTransportPlan.hpp"
 #include "InProcessTransport.hpp"
 #include "CohortExport.hpp"
+#include "DeviceHealth.hpp"
 #include "ParquetExport.hpp"
 #include "ReplaySource.hpp"
 
@@ -7518,6 +7519,12 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "delete_stream_graph") {
             handleDeleteStreamGraph(conn, json);
         }
+        else if (action == "subscribe_device_health") {
+            handleSubscribeDeviceHealth(conn, json);
+        }
+        else if (action == "unsubscribe_device_health") {
+            handleUnsubscribeDeviceHealth(conn);
+        }
         else if (action == "send_device_command") {
             handleSendDeviceCommand(conn, json);
         }
@@ -9410,6 +9417,202 @@ void StreamViewerWebSocket::handleSendDeviceCommand(
             sendFailure(std::string("Failed to send device command: ") + e.what());
         }
     }).detach();
+}
+
+
+// --- device health (TEC-NATKIT-33) ----------------------------------------
+//
+// The hub publishes its own health and every leaf's once a second on
+// `Log-<id>-Binary-NatKitPrimaryStatusV1` / `-NatKitNodeStatusV1`. Those are
+// LOGGING_LOG topics, which sendStreamList deliberately does not carry -- they
+// are not data a graph can consume -- so a client has no way to reach them
+// through subscribe. This is the way in.
+//
+// One thread per client, tailing every status topic on the broker. That is more
+// consumers than strictly necessary if several browsers watch at once, but it
+// keeps each client's differencing history its own: a second browser connecting
+// must not reset the first one's rates, and a shared tracker would do exactly
+// that on every reconnect.
+
+namespace {
+
+constexpr char kNodeStatusSchema[] = "NatKitNodeStatusV1";
+constexpr char kPrimaryStatusSchema[] = "NatKitPrimaryStatusV1";
+
+// How long without a frame before a device is shown as quiet. The hardware
+// publishes at 1 Hz, so 3 s is three missed frames -- long enough that a single
+// dropped publish or a GC pause does not flap the indicator, short enough to
+// notice a board that fell off the rig while somebody is looking at the panel.
+constexpr uint64_t kDefaultQuietAfterMs = 3000;
+constexpr uint64_t kDefaultIntervalMs = 1000;
+
+// Devices are dropped from the panel after this long without a frame. Generous
+// on purpose: a device that went quiet is the most interesting row on the panel,
+// and removing it would turn a visible failure into an empty space.
+constexpr uint64_t kForgetAfterMs = 15ULL * 60ULL * 1000ULL;
+
+uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+}  // namespace
+
+void StreamViewerWebSocket::handleSubscribeDeviceHealth(
+    const WebSocketConnectionPtr& conn, const nlohmann::json& json)
+{
+    StreamViewerClientContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        auto it = clients_.find(conn);
+        if (it == clients_.end()) {
+            return;
+        }
+        ctx = it->second.get();
+    }
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available");
+        return;
+    }
+    // Already running: a repeated subscribe (a re-render, a reconnect that raced
+    // the close) must not start a second thread pushing to the same socket.
+    if (ctx->device_health_active.exchange(true)) {
+        return;
+    }
+
+    const uint64_t interval_ms = json.value("interval_ms", kDefaultIntervalMs);
+    const uint64_t quiet_after_ms = json.value("quiet_after_ms", kDefaultQuietAfterMs);
+
+    if (ctx->device_health_thread.joinable()) {
+        ctx->device_health_thread.join();
+    }
+    ctx->device_health_thread = std::thread(
+        &StreamViewerWebSocket::deviceHealthThreadFunc, this, conn, ctx,
+        std::max<uint64_t>(250, interval_ms), quiet_after_ms);
+}
+
+void StreamViewerWebSocket::handleUnsubscribeDeviceHealth(
+    const WebSocketConnectionPtr& conn)
+{
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    auto it = clients_.find(conn);
+    if (it == clients_.end()) {
+        return;
+    }
+    // Just clear the flag. The thread notices within one interval and returns;
+    // joining here would block the WS thread for up to that long, and the
+    // context's destructor joins anyway.
+    it->second->device_health_active = false;
+}
+
+void StreamViewerWebSocket::deviceHealthThreadFunc(
+    const WebSocketConnectionPtr& conn, StreamViewerClientContext* ctx,
+    const uint64_t interval_ms, const uint64_t quiet_after_ms)
+{
+    nat::tools::DeviceHealthTracker tracker;
+    // One messenger per status topic, kept for the life of the subscription:
+    // rebuilding them each tick would re-attach at OFFSET_END and lose whatever
+    // arrived in between, which for a 1 Hz publisher is most of it.
+    std::map<std::string, std::unique_ptr<nat::core::TopicMessenger>> messengers;
+
+    LOG_INFO << "Device health: started for a client (interval " << interval_ms
+             << " ms, quiet after " << quiet_after_ms << " ms)";
+
+    uint64_t last_topic_scan_ms = 0;
+
+    while (ctx->active && ctx->device_health_active && conn->connected()) {
+        const uint64_t tick_ms = nowMs();
+
+        // Rescan for new status topics every few seconds rather than every tick:
+        // a board that boots mid-session creates its topic then, and its topic
+        // will not exist at subscribe time. Not every tick, because the metadata
+        // call is not free and nothing else here is.
+        if (tick_ms - last_topic_scan_ms >= 5000) {
+            last_topic_scan_ms = tick_ms;
+            for (const auto& topic : broker_manager_->getAllTopics()) {
+                if (!topic || topic->type != nat::core::StreamType::LOGGING_LOG) {
+                    continue;
+                }
+                if (topic->schemaName != kNodeStatusSchema &&
+                    topic->schemaName != kPrimaryStatusSchema) {
+                    continue;
+                }
+                const std::string name = topic->toTopicString();
+                if (messengers.count(name) > 0) {
+                    continue;
+                }
+                auto messenger = broker_manager_->createMessenger(
+                    std::make_shared<nat::core::BasicTopicInformation>(*topic));
+                if (!messenger) {
+                    LOG_WARN << "Device health: could not consume " << name;
+                    continue;
+                }
+                LOG_INFO << "Device health: tailing " << name;
+                messengers[name] = std::move(messenger);
+            }
+        }
+
+        // Drain everything waiting. ⚠️ Drain, not read-one: at 1 Hz per device
+        // with four devices plus the hub, reading a single message per tick would
+        // fall permanently behind and the panel would show minutes-old figures
+        // while claiming to be live.
+        for (auto& entry : messengers) {
+            const bool is_hub =
+                entry.first.find(kPrimaryStatusSchema) != std::string::npos;
+            for (int drained = 0; drained < 256; ++drained) {
+                auto next = entry.second->tryGetNextRawMessage();
+                if (!next.has_value()) {
+                    break;
+                }
+                const auto& bytes = *next.value();
+                const uint64_t received_ms = nowMs();
+                if (is_hub) {
+                    auto decoded =
+                        nat::core::NatKitPrimaryStatusV1Schema::decodeBinary(bytes);
+                    if (decoded.has_value()) {
+                        tracker.observeHub(decoded.value(), received_ms);
+                    }
+                } else {
+                    auto decoded =
+                        nat::core::NatKitNodeStatusV1Schema::decodeBinary(bytes);
+                    if (decoded.has_value()) {
+                        tracker.observeNode(decoded.value(), received_ms);
+                    }
+                }
+                // A frame that did not decode is dropped in silence on purpose:
+                // the size check is exact, so this is old firmware or another
+                // producer on the topic, and logging it at 1 Hz per device would
+                // bury the log.
+            }
+        }
+
+        tracker.forgetOlderThan(nowMs(), kForgetAfterMs);
+
+        nlohmann::json response;
+        response["type"] = "device_health";
+        response["wall_ms"] = nowMs();
+        response["quiet_after_ms"] = quiet_after_ms;
+        // Whether we are even watching, distinct from having nothing to report.
+        // An empty devices list with topics_tailed 0 means the rig has never
+        // published; with topics_tailed 4 it means every board went silent.
+        response["topics_tailed"] = messengers.size();
+        nlohmann::json devices = nlohmann::json::array();
+        for (const auto& health : tracker.snapshot(nowMs())) {
+            devices.push_back(health.toJson(quiet_after_ms));
+        }
+        response["devices"] = std::move(devices);
+
+        if (conn->connected()) {
+            conn->send(response.dump());
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+
+    ctx->device_health_active = false;
+    LOG_INFO << "Device health: stopped for a client";
 }
 
 void StreamViewerWebSocket::handleListExperiments(

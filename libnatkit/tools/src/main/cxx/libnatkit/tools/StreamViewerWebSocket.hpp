@@ -77,13 +77,23 @@ struct StreamViewerClientContext {
     std::set<uint64_t> bound_marker_ids;
     std::atomic<bool> active{true};
     std::thread streaming_thread;
+    // Device health (TEC-NATKIT-33) is its own thread, not part of the streaming
+    // one: it tails LOGGING_LOG status topics that no graph subscribes to, on its
+    // own 1 s cadence, and it must keep working while nothing is running --
+    // "is the rig alive?" is asked most often when no board is streaming.
+    std::atomic<bool> device_health_active{false};
+    std::thread device_health_thread;
     std::mutex mutex;
     std::optional<AuthenticatedUser> user;
 
     ~StreamViewerClientContext() {
         active = false;
+        device_health_active = false;
         if (streaming_thread.joinable()) {
             streaming_thread.join();
+        }
+        if (device_health_thread.joinable()) {
+            device_health_thread.join();
         }
     }
 };
@@ -290,6 +300,21 @@ private:
     // nothing but its own request.
     void handleSendDeviceCommand(const drogon::WebSocketConnectionPtr& conn,
                                  const nlohmann::json& json);
+
+    // Start / stop pushing device_health snapshots to this client. The rig's
+    // status topics are LOGGING_LOG, which the stream list deliberately does not
+    // carry (they are not data a graph can consume), so a client cannot reach
+    // them through subscribe -- this is the way in.
+    void handleSubscribeDeviceHealth(const drogon::WebSocketConnectionPtr& conn,
+                                     const nlohmann::json& json);
+    void handleUnsubscribeDeviceHealth(const drogon::WebSocketConnectionPtr& conn);
+
+    // Tails every NatKitNodeStatusV1 / NatKitPrimaryStatusV1 topic on the broker
+    // and pushes a differenced snapshot once per interval.
+    void deviceHealthThreadFunc(const drogon::WebSocketConnectionPtr& conn,
+                                StreamViewerClientContext* ctx,
+                                uint64_t interval_ms,
+                                uint64_t quiet_after_ms);
 
     // Send stream list to client
     void sendStreamList(const drogon::WebSocketConnectionPtr& conn);
