@@ -1,5 +1,4 @@
 add_subdirectory(util/src)
-#add_subdirectory(core/streams/src)
 if(NOT LIBNATKIT_ESP_BUILD)
     add_subdirectory(core/kafka/src)
     if(NOT BUILD_KAFKA_ABI_ONLY)
