@@ -440,3 +440,70 @@ TEST(ClockQualityTest, NotWatchingSurvivesIntoTheRecord) {
     const auto quality = nat::tools::buildClockQuality(blind, blind, 60.0);
     EXPECT_EQ(quality["devices"][0]["status"].get<std::string>(), "not_watching");
 }
+
+// ⚠️ THE CASE THAT DEFEATED THE FIRST DESIGN, found on the rig rather than in
+// review.
+//
+// A leaf's status frame is composed and published BY THE HUB from its registry
+// entry. So when a leaf falls off the radio the hub keeps publishing its last
+// known state, once a second, indefinitely — arriving fresh, with every counter
+// frozen. Freshness of the FRAME says nothing about liveness of the DEVICE, and
+// the panel showed leaf 0c:8b:95:96:b9:f4 as live after 987,078 data frames and
+// then nothing.
+TEST(DeviceHealthTest, AHubRepublishingALostLeafIsNotAliveLeaf) {
+    DeviceHealthTracker tracker;
+    // Reporting normally: the hub's last_seen_us for it advances each second.
+    tracker.observeNode(leaf(1, 1000000, 100), 1000);
+    tracker.observeNode(leaf(1, 2000000, 110), 2000);
+    EXPECT_EQ(tracker.snapshot(2000)[0].unheardMs, 0u);
+    EXPECT_FALSE(tracker.snapshot(2000)[0].toJson(3000)["quiet"].get<bool>());
+
+    // Now the leaf goes away. The hub keeps publishing the SAME entry: frames
+    // arrive every second, last_seen_us and every counter frozen.
+    for (int i = 1; i <= 10; ++i) {
+        tracker.observeNode(leaf(1, 2000000, 110), 2000 + i * 1000);
+    }
+    const auto snapshot = tracker.snapshot(12000);
+    ASSERT_EQ(snapshot.size(), 1u);
+
+    // The frame is fresh — which is exactly why ageMs alone was not enough.
+    EXPECT_EQ(snapshot[0].ageMs, 0u);
+    // But the device has not been heard from for ten seconds.
+    EXPECT_EQ(snapshot[0].unheardMs, 10000u);
+
+    const auto json = snapshot[0].toJson(3000);
+    EXPECT_TRUE(json["quiet"].get<bool>()) << "a lost leaf must not read as live";
+    EXPECT_EQ(json["quiet_reason"].get<std::string>(), "device_not_heard");
+}
+
+// And the two reasons stay apart, because they need different actions: nothing is
+// arriving at all, versus the hub is talking about a device it cannot hear.
+TEST(DeviceHealthTest, TheTwoWaysOfBeingQuietAreDistinguished) {
+    DeviceHealthTracker tracker;
+    tracker.observeNode(leaf(1, 1000000, 100), 1000);
+    tracker.observeNode(leaf(1, 2000000, 110), 2000);
+
+    // Nothing arriving: the backend stopped receiving frames entirely.
+    const auto noFrames = tracker.snapshot(30000)[0].toJson(3000);
+    EXPECT_TRUE(noFrames["quiet"].get<bool>());
+    EXPECT_EQ(noFrames["quiet_reason"].get<std::string>(), "no_frames");
+
+    // Frames arriving about a device that has not been heard from.
+    for (int i = 1; i <= 10; ++i) {
+        tracker.observeNode(leaf(1, 2000000, 110), 2000 + i * 1000);
+    }
+    const auto notHeard = tracker.snapshot(12000)[0].toJson(3000);
+    EXPECT_TRUE(notHeard["quiet"].get<bool>());
+    EXPECT_EQ(notHeard["quiet_reason"].get<std::string>(), "device_not_heard");
+}
+
+// A healthy device says nothing about either, rather than an empty-string reason
+// that a reader has to know to ignore.
+TEST(DeviceHealthTest, AHealthyDeviceHasNoQuietReason) {
+    DeviceHealthTracker tracker;
+    tracker.observeNode(leaf(1, 1000000, 100), 1000);
+    tracker.observeNode(leaf(1, 2000000, 110), 2000);
+    const auto json = tracker.snapshot(2000)[0].toJson(3000);
+    EXPECT_FALSE(json["quiet"].get<bool>());
+    EXPECT_EQ(json["quiet_reason"].get<std::string>(), "");
+}

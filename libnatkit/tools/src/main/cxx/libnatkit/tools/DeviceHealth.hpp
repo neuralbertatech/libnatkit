@@ -71,11 +71,22 @@ struct DeviceHealth {
     uint64_t deviceId = 0;
     bool isHub = false;
 
-    // Milliseconds since the BACKEND last received a frame from this device,
-    // measured on the backend's wall clock. ⚠️ This is the only field that can
-    // say "gone quiet", and it cannot come from the frame: it is about the
-    // absence of frames.
+    // Milliseconds since the BACKEND last received a frame ABOUT this device,
+    // measured on the backend's wall clock.
+    //
+    // ⚠️ NOT the same as "the device is alive", and the difference was observed on
+    // the rig rather than imagined. A leaf's status frame is composed and published
+    // BY THE HUB from its registry entry, so when a leaf falls off the radio the
+    // hub keeps publishing its last known state once a second, indefinitely: every
+    // counter freezes and this field stays at ~0. It called a dead leaf healthy.
     uint64_t ageMs = 0;
+    // How long the DEVICE'S OWN clock has been frozen, on the hub's clock.
+    //
+    // ⚠️ This is the field that actually says whether a leaf is still there. For a
+    // leaf it derives from last_seen_us -- when the hub last HEARD from it -- so a
+    // hub still talking about a leaf it can no longer hear is caught here and
+    // nowhere else. Zero when the clock advanced on the latest frame.
+    uint64_t unheardMs = 0;
 
     // The most recent frame, as the schema's own JSON (snake_case keys matching
     // the descriptor's paths, so the frontend can label fields from the
@@ -125,6 +136,10 @@ private:
         // Rates are computed over THIS rather than over the backend's wall clock,
         // so a poll that jitters or a frame that queued does not skew them.
         uint64_t lastDeviceUs = 0;
+        // Wall time when the device clock was last seen to ADVANCE. A frame whose
+        // clock matches the previous one does not refresh this, which is what
+        // makes a hub re-broadcasting a stale entry detectable.
+        uint64_t deviceClockAdvancedWallMs = 0;
         std::map<std::string, uint64_t> counters;
         // Recent samples, oldest first, trimmed to kRateHistoryUs. A rate is the
         // difference against the OLDEST retained sample, so it always spans a

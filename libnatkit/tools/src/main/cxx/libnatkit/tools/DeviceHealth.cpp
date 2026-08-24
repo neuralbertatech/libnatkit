@@ -114,9 +114,14 @@ void DeviceHealthTracker::observe(const uint64_t deviceId, const bool isHub,
         entry.history.push_back(Entry::Sample{deviceUs, counters});
         entry.rateStatus = RateStatus::kRebooted;
     } else if (hadSample && deviceUs == entry.lastDeviceUs) {
-        // The same frame twice, or a status frame built before the clock
-        // advanced. Not an interval, and not a reboot: the history stays, so the
-        // next frame that does advance can still be differenced.
+        // The same frame twice, or a status frame built before the clock advanced.
+        // Not an interval, and not a reboot: the history stays, so the next frame
+        // that does advance can still be differenced.
+        //
+        // ⚠️ Deliberately does NOT refresh deviceClockAdvancedWallMs. A hub that
+        // has lost a leaf keeps publishing that leaf's last known entry once a
+        // second forever, so every counter freezes while frames keep arriving.
+        // That case is only visible as the device clock standing still.
         entry.rateStatus = RateStatus::kClockNotAdvanced;
     } else {
         entry.history.push_back(Entry::Sample{deviceUs, counters});
@@ -140,6 +145,9 @@ void DeviceHealthTracker::observe(const uint64_t deviceId, const bool isHub,
 
     entry.isHub = isHub;
     entry.lastWallMs = wallMs;
+    if (!hadSample || deviceUs != entry.lastDeviceUs) {
+        entry.deviceClockAdvancedWallMs = wallMs;
+    }
     entry.lastDeviceUs = deviceUs;
     entry.counters = std::move(counters);
     entry.fields = std::move(fields);
@@ -169,6 +177,11 @@ std::vector<DeviceHealth> DeviceHealthTracker::snapshot(const uint64_t wallMs) c
         // system clock stepped back, and a device reported as 4e18 ms stale is
         // less useful than one reported as fresh.
         health.ageMs = wallMs > entry.lastWallMs ? wallMs - entry.lastWallMs : 0;
+        // Saturating, like ageMs: a system clock that stepped back must not make a
+        // device look absent for four million years.
+        health.unheardMs = wallMs > entry.deviceClockAdvancedWallMs
+                               ? wallMs - entry.deviceClockAdvancedWallMs
+                               : 0;
         health.fields = entry.fields;
         health.rateStatus = entry.rateStatus;
 
@@ -224,7 +237,17 @@ nlohmann::json DeviceHealth::toJson(const uint64_t quietAfterMs) const {
     out["device_id"] = std::to_string(deviceId);
     out["role"] = isHub ? "hub" : "leaf";
     out["age_ms"] = ageMs;
-    out["quiet"] = ageMs > quietAfterMs;
+    out["unheard_ms"] = unheardMs;
+    // ⚠️ EITHER condition means the device is not reporting. A leaf that has
+    // fallen off the radio still has frames published ABOUT it by the hub, so
+    // ageMs alone called it live — observed on the rig, with 987,078 data frames
+    // and then every counter frozen while the panel showed it fine.
+    out["quiet"] = ageMs > quietAfterMs || unheardMs > quietAfterMs;
+    // Which of the two it is, because they need different actions: nothing is
+    // arriving at all, versus the hub is talking about a device it cannot hear.
+    out["quiet_reason"] = ageMs > quietAfterMs
+                              ? "no_frames"
+                              : (unheardMs > quietAfterMs ? "device_not_heard" : "");
     out["fields"] = fields;
     out["rate_status"] = toString(rateStatus);
     if (rateStatus == RateStatus::kAvailable && !rates.empty()) {
