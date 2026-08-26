@@ -3,6 +3,8 @@
 
 #include <libnatkit/util/Casting.hpp>
 
+#include <chrono>
+
 
 using namespace std::chrono_literals;
 
@@ -57,11 +59,51 @@ void KafkaMessengerPool::searchForNewKafakTopics() {
       const auto topicInfoMaybe =
           core::BasicTopicInformation::create(topicString);
       if (topicInfoMaybe.has_value()) {
-        createNewMessenger(topicInfoMaybe.value());
+        const int64_t startOffset =
+            initialSweepDone ? startOffsetForNewTopic(topicString) : -1;
+        createNewMessenger(topicInfoMaybe.value(), startOffset);
       }
     }
   }
+  initialSweepDone = true;
   dropVanishedTopics(existingTopics);
+}
+
+// Discovery is a POLL, so there is a window between a topic being created and
+// this pool attaching a consumer to it -- and a consumer attaching at the live
+// tail never sees what was produced inside that window. It is silent: nothing
+// fails, the message simply is not forwarded to MQTT.
+//
+// Measured on the running rig rather than reasoned about: producing to a topic
+// immediately after creating it delivered NOTHING to natKit/receiving/, while the
+// same produce five seconds after creation arrived normally. That is the whole
+// mechanism behind commands to a device timing out the first time and working on
+// the retry -- the backend creates Command-<id>-... and produces to it, and
+// whether the command survives depends on which side of this poll it lands.
+//
+// The cure is to attach slightly BEFORE now for a topic that has only just
+// appeared. It has to be a bounded look-back rather than OFFSET_BEGINNING: this
+// same code path runs for topics that already existed when the bridge started,
+// where the beginning is hours of retained frames that would be replayed into
+// MQTT in one burst. Hence `initialSweepDone` -- only topics that appear while we
+// are watching get the look-back, and for those the window is the only thing
+// there is to find.
+constexpr int64_t kDiscoveryLookbackUs = 15000000;  // comfortably > the 1s poll
+
+int64_t KafkaMessengerPool::startOffsetForNewTopic(
+    const std::string &topicName) const {
+  const auto nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  const auto extent =
+      kafkaManager->queryStreamTime(topicName, nowUs - kDiscoveryLookbackUs);
+  if (!extent.valid || extent.offsetForTimestamp < 0) {
+    // No answer is not the same as "start at the beginning". Fall back to the
+    // live tail, which is the behaviour this replaces: a lost message in the
+    // discovery window beats replaying a topic of unknown size.
+    return -1;
+  }
+  return extent.offsetForTimestamp;
 }
 
 // A topic can DISAPPEAR, and this pool used to be insert-only: monitoredTopics never
@@ -91,11 +133,13 @@ void KafkaMessengerPool::dropVanishedTopics(
 }
 
 void KafkaMessengerPool::createNewMessenger(
-    const std::unique_ptr<core::BasicTopicInformation> &basicTopicInfo) {
-  createNewMessenger(basicTopicInfo->toTopicString());
+    const std::unique_ptr<core::BasicTopicInformation> &basicTopicInfo,
+    int64_t startOffset) {
+  createNewMessenger(basicTopicInfo->toTopicString(), startOffset);
 }
 
-void KafkaMessengerPool::createNewMessenger(const std::string &topicName) {
+void KafkaMessengerPool::createNewMessenger(const std::string &topicName,
+                                            int64_t startOffset) {
   monitoredTopics.insert(topicName);
 
   const auto producer = kafkaManager->createProducer();
@@ -106,9 +150,14 @@ void KafkaMessengerPool::createNewMessenger(const std::string &topicName) {
       topicName, producer, consumer, std::move(topicHandle),
       [this, topicName](auto &&msg) {
         this->onMessageRecievedCallback(topicName, std::move(msg));
-      });
+      },
+      startOffset);
   messengers.insert(std::pair{topicName, std::move(messagingQueue)});
-  std::cout << "% Registered new topic: " << topicName << '\n';
+  std::cout << "% Registered new topic: " << topicName;
+  if (startOffset >= 0) {
+    std::cout << " (catching up from offset " << startOffset << ")";
+  }
+  std::cout << '\n';
 }
 
 void KafkaMessengerPool::defaultOnMessageReceived(const std::string &topicString,

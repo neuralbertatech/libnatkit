@@ -32,6 +32,7 @@
 #include <iostream>
 
 #include "StreamViewerWebSocket.hpp"
+#include "DeviceHealth.hpp"
 #include "Auth.hpp"
 #include "CohortExport.hpp"
 #include "ParquetExport.hpp"
@@ -1120,6 +1121,13 @@ int main()
     
     // Set broker manager and register WebSocket controller
     StreamViewerWebSocket::setBrokerManager(manager);
+    // ⚠️ Started HERE, at boot, rather than on first use. Lazily started meant the
+    // FIRST recording after a restart snapshotted an empty tracker and sealed
+    // "no clock data" for every device — and the first run of a session is the one
+    // nobody gets to redo. Warming it at boot costs one consumer on a 1 Hz topic
+    // (TEC-NATKIT-77).
+    nat::tools::DeviceHealthService::instance().start(manager);
+    std::cout << "Device health tailer started\n";
     auto ws_controller = std::make_shared<StreamViewerWebSocket>();
     app().registerController(ws_controller);
     std::cout << "StreamViewer WebSocket controller registered\n";

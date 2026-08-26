@@ -28,6 +28,14 @@ class KafkaMessengerPool {
   std::function<void(const std::string &, std::unique_ptr<core::message_t> &&)>
       onMessageRecievedCallback;
   bool running{true};
+  // Whether the first sweep of getAllTopicStrings() has completed.
+  //
+  // ⚠️ Load-bearing, and only for WHERE a new consumer attaches. Topics found in
+  // that first sweep are pre-existing and may hold hours of retained frames, so
+  // they must attach at the live tail. A topic that appears in a LATER sweep can
+  // only hold what was produced since the previous one, so it is safe -- and
+  // necessary -- to look slightly backwards for it. See kDiscoveryLookbackUs.
+  bool initialSweepDone{false};
 
 public:
   KafkaMessengerPool(std::shared_ptr<kafka::BrokerManager> kafkaManager,
@@ -45,8 +53,13 @@ private:
   void searchForNewKafakTopics();
   // Both assume messengersLock is already held by the caller.
   void createNewMessenger(
-      const std::unique_ptr<core::BasicTopicInformation> &basicTopicInfo);
-  void createNewMessenger(const std::string &topicName);
+      const std::unique_ptr<core::BasicTopicInformation> &basicTopicInfo,
+      int64_t startOffset = -1);
+  void createNewMessenger(const std::string &topicName,
+                          int64_t startOffset = -1);
+  // Where a consumer for a just-appeared topic should start, so a message
+  // produced in the gap before we noticed the topic is not lost.
+  int64_t startOffsetForNewTopic(const std::string &topicName) const;
   // Tear down messengers whose topic no longer exists on the broker.
   void dropVanishedTopics(const std::set<std::string> &existingTopics);
   void defaultOnMessageReceived(const std::string &topicString,

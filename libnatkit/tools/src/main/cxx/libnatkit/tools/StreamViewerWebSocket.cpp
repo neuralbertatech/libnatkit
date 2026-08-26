@@ -5,6 +5,7 @@
 #include "GraphTransportPlan.hpp"
 #include "InProcessTransport.hpp"
 #include "CohortExport.hpp"
+#include "DeviceHealth.hpp"
 #include "ParquetExport.hpp"
 #include "ReplaySource.hpp"
 
@@ -7518,6 +7519,21 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         else if (action == "delete_stream_graph") {
             handleDeleteStreamGraph(conn, json);
         }
+        else if (action == "list_log_streams") {
+            handleListLogStreams(conn, json);
+        }
+        else if (action == "subscribe_logs") {
+            handleSubscribeLogs(conn, json);
+        }
+        else if (action == "unsubscribe_logs") {
+            handleUnsubscribeLogs(conn);
+        }
+        else if (action == "subscribe_device_health") {
+            handleSubscribeDeviceHealth(conn, json);
+        }
+        else if (action == "unsubscribe_device_health") {
+            handleUnsubscribeDeviceHealth(conn);
+        }
         else if (action == "send_device_command") {
             handleSendDeviceCommand(conn, json);
         }
@@ -8278,6 +8294,8 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
         // stale derived data instead of recomputing -- which is the entire point
         // of forking.
         nlohmann::json streams = nlohmann::json::array();
+        // The same ids, plainly, for the clock-fit snapshot below.
+        std::vector<std::string> streams_for_clock;
         for (const auto& node : instance.nodes) {
             if (node.kind != "stream_source" || !node.streamId.has_value()) {
                 continue;
@@ -8287,6 +8305,7 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
             entry["schema_name"] = node.schemaName.value_or("");
             entry["role"] = "source";
             entry["node_id"] = node.id;
+            streams_for_clock.push_back(std::to_string(node.streamId.value()));
             streams.push_back(std::move(entry));
         }
 
@@ -8327,6 +8346,32 @@ void StreamViewerWebSocket::handleStartExperimentInstance(
             json["sensor_positions"].is_array() &&
             !json["sensor_positions"].empty()) {
             recording["sensor_positions"] = json["sensor_positions"];
+        }
+        // WHETHER THE CLOCKS COULD BE TRUSTED (TEC-NATKIT-77), at both ends of
+        // the run.
+        //
+        // ⚠️ Sealed HERE rather than left to be looked up later, for the same
+        // reason as the participant and the sensor placement: the status frames
+        // age out of Kafka retention and nothing else keeps a copy, so a cohort
+        // recorded while a leaf had no valid fit becomes indistinguishable from a
+        // clean one — permanently, and "was the clock all right?" is a question
+        // asked months later or not at all.
+        //
+        // Both ends, because the endpoints answer different questions. The start
+        // says whether it was reasonable to begin; the pair says whether the fit
+        // was REBUILT mid-run, which no single sample can reveal and which means
+        // timestamps either side of it sit on different fits.
+        {
+            auto& health = nat::tools::DeviceHealthService::instance();
+            health.start(broker_manager_);
+            const auto fits = nat::tools::snapshotClockFits(
+                health.snapshot(), streams_for_clock,
+                health.running() && health.topicsTailed() > 0);
+            nlohmann::json at_start = nlohmann::json::array();
+            for (const auto& fit : fits) {
+                at_start.push_back(fit.toJson());
+            }
+            recording["clock_at_start"] = std::move(at_start);
         }
         recording["window_start_us"] =
             json.value("window_start_us", static_cast<uint64_t>(nowUs()));
@@ -8390,8 +8435,44 @@ void StreamViewerWebSocket::handleFinishExperimentInstance(
                       request_id);
             return;
         }
-        stored->second.recording["window_end_us"] =
+        const uint64_t window_end_us =
             json.value("window_end_us", static_cast<uint64_t>(nowUs()));
+        stored->second.recording["window_end_us"] = window_end_us;
+
+        // The other end of the clock record (TEC-NATKIT-77). Differenced against
+        // the start so the beacon-loss figure is a RATE OVER THIS RUN rather than
+        // a total since the device booted — the total would say "this run missed
+        // 3662 beacons" about a device that missed them yesterday.
+        {
+            std::vector<std::string> source_stream_ids;
+            for (const auto& entry :
+                 stored->second.recording.value("streams", nlohmann::json::array())) {
+                const auto stream_id = entry.value("stream_id", std::string{});
+                if (!stream_id.empty()) {
+                    source_stream_ids.push_back(stream_id);
+                }
+            }
+            auto& health = nat::tools::DeviceHealthService::instance();
+            health.start(broker_manager_);
+            const auto fits = nat::tools::snapshotClockFits(
+                health.snapshot(), source_stream_ids,
+                health.running() && health.topicsTailed() > 0);
+            nlohmann::json at_finish = nlohmann::json::array();
+            for (const auto& fit : fits) {
+                at_finish.push_back(fit.toJson());
+            }
+            const uint64_t window_start_us =
+                stored->second.recording.value("window_start_us", window_end_us);
+            const double run_seconds =
+                window_end_us > window_start_us
+                    ? static_cast<double>(window_end_us - window_start_us) / 1e6
+                    : 0.0;
+            stored->second.recording["clock_quality"] = nat::tools::buildClockQuality(
+                stored->second.recording.value("clock_at_start",
+                                               nlohmann::json::array()),
+                at_finish, run_seconds);
+            stored->second.recording["clock_at_finish"] = std::move(at_finish);
+        }
         stored->second.recording["status"] = "materializing";
         stored->second.updatedAtUs = nowUs();
         if (!json.value("completed", true)) {
@@ -9410,6 +9491,425 @@ void StreamViewerWebSocket::handleSendDeviceCommand(
             sendFailure(std::string("Failed to send device command: ") + e.what());
         }
     }).detach();
+}
+
+
+// --- device health (TEC-NATKIT-33) ----------------------------------------
+//
+// The hub publishes its own health and every leaf's once a second on
+// `Log-<id>-Binary-NatKitPrimaryStatusV1` / `-NatKitNodeStatusV1`. Those are
+// LOGGING_LOG topics, which sendStreamList deliberately does not carry -- they
+// are not data a graph can consume -- so a client has no way to reach them
+// through subscribe. This is the way in.
+//
+// One thread per client, tailing every status topic on the broker. That is more
+// consumers than strictly necessary if several browsers watch at once, but it
+// keeps each client's differencing history its own: a second browser connecting
+// must not reset the first one's rates, and a shared tracker would do exactly
+// that on every reconnect.
+
+namespace {
+
+
+// How long without a frame before a device is shown as quiet. The hardware
+// publishes at 1 Hz, so 3 s is three missed frames -- long enough that a single
+// dropped publish or a GC pause does not flap the indicator, short enough to
+// notice a board that fell off the rig while somebody is looking at the panel.
+constexpr uint64_t kDefaultQuietAfterMs = 3000;
+constexpr uint64_t kDefaultIntervalMs = 1000;
+
+
+uint64_t nowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+}  // namespace
+
+void StreamViewerWebSocket::handleSubscribeDeviceHealth(
+    const WebSocketConnectionPtr& conn, const nlohmann::json& json)
+{
+    StreamViewerClientContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        auto it = clients_.find(conn);
+        if (it == clients_.end()) {
+            return;
+        }
+        ctx = it->second.get();
+    }
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available");
+        return;
+    }
+    // Already running: a repeated subscribe (a re-render, a reconnect that raced
+    // the close) must not start a second thread pushing to the same socket.
+    if (ctx->device_health_active.exchange(true)) {
+        return;
+    }
+
+    const uint64_t interval_ms = json.value("interval_ms", kDefaultIntervalMs);
+    const uint64_t quiet_after_ms = json.value("quiet_after_ms", kDefaultQuietAfterMs);
+
+    if (ctx->device_health_thread.joinable()) {
+        ctx->device_health_thread.join();
+    }
+    ctx->device_health_thread = std::thread(
+        &StreamViewerWebSocket::deviceHealthThreadFunc, this, conn, ctx,
+        std::max<uint64_t>(250, interval_ms), quiet_after_ms);
+}
+
+void StreamViewerWebSocket::handleUnsubscribeDeviceHealth(
+    const WebSocketConnectionPtr& conn)
+{
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    auto it = clients_.find(conn);
+    if (it == clients_.end()) {
+        return;
+    }
+    // Just clear the flag. The thread notices within one interval and returns;
+    // joining here would block the WS thread for up to that long, and the
+    // context's destructor joins anyway.
+    it->second->device_health_active = false;
+}
+
+void StreamViewerWebSocket::deviceHealthThreadFunc(
+    const WebSocketConnectionPtr& conn, StreamViewerClientContext* ctx,
+    const uint64_t interval_ms, const uint64_t quiet_after_ms)
+{
+    // Reads the SHARED tailer rather than opening its own consumers
+    // (TEC-NATKIT-77). Two reasons, and the second is the load-bearing one:
+    // N browsers no longer mean N Kafka consumers on the same five topics; and
+    // more importantly a RECORDING can now ask the same question, which it could
+    // not when the only tailer lived inside a per-connection thread — the answer
+    // would have depended on whether anybody happened to have the panel open.
+    auto& service = nat::tools::DeviceHealthService::instance();
+    service.start(broker_manager_);
+
+    LOG_INFO << "Device health: pushing to a client (interval " << interval_ms
+             << " ms, quiet after " << quiet_after_ms << " ms)";
+
+    while (ctx->active && ctx->device_health_active && conn->connected()) {
+        nlohmann::json response;
+        response["type"] = "device_health";
+        response["wall_ms"] = nowMs();
+        response["quiet_after_ms"] = quiet_after_ms;
+        // Whether we are even watching, distinct from having nothing to report.
+        // Zero topics means the rig has never published; a positive count with no
+        // devices means every board that used to report has stopped.
+        response["topics_tailed"] = service.topicsTailed();
+        nlohmann::json devices = nlohmann::json::array();
+        for (const auto& health : service.snapshot()) {
+            devices.push_back(health.toJson(quiet_after_ms));
+        }
+        response["devices"] = std::move(devices);
+
+        if (conn->connected()) {
+            conn->send(response.dump());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+
+    ctx->device_health_active = false;
+    LOG_INFO << "Device health: stopped pushing to a client";
+}
+
+// --- the log viewer (TEC-NATKIT-33, second half) ---------------------------
+//
+// Devices publish free-form log lines on `Log-<id>-Json-NatLogV1` and structured
+// health on `Log-<id>-Binary-NatKit*StatusV1`. Both are LOGGING_LOG topics, and
+// until now the only way to read either was to attach a consumer by hand.
+//
+// This tails whichever of them the client asks for and forwards each record. It
+// is deliberately GENERIC -- it resolves a topic through the schema registry
+// rather than knowing schema names -- because the point is that a log added
+// tomorrow is readable without a frontend change. Three cases, in order:
+//
+//   1. a registered decoder exists  -> decode and send its JSON, plus the
+//      schema's own timestamp, which is better than arrival time.
+//   2. no decoder but the topic says Json -> pass the text through. THIS IS THE
+//      COMMON CASE: NatLogV1 has no schema class at all, it is free-form JSON
+//      that the firmware and the command path already agree on informally.
+//   3. neither -> report the record as an undecodable byte count.
+//
+// ⚠️ Case 3 must not silently drop. A log viewer that shows nothing for a topic
+// it cannot parse is indistinguishable from a device that is not logging, and
+// the second is what everybody will conclude.
+
+namespace {
+
+constexpr size_t kMaxLogRecordsPerPush = 200;
+constexpr uint64_t kDefaultLogIntervalMs = 500;
+// A single record's text, truncated. A device that logs a megabyte in one line
+// should not be able to wedge a browser tab, and the truncation is reported.
+constexpr size_t kMaxLogTextBytes = 8192;
+
+bool isLogTopic(const nat::core::BasicTopicInformation& topic) {
+    return topic.type == nat::core::StreamType::LOGGING_LOG;
+}
+
+}  // namespace
+
+void StreamViewerWebSocket::handleListLogStreams(
+    const WebSocketConnectionPtr& conn, const nlohmann::json& json)
+{
+    const std::string request_id = json.value("request_id", std::string{});
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available", request_id);
+        return;
+    }
+
+    nlohmann::json response;
+    response["type"] = "log_stream_list";
+    response["request_id"] = request_id;
+    nlohmann::json topics = nlohmann::json::array();
+
+    auto& registry = nat::core::DataSchemaDescriptorRegistry::getDefault();
+    for (const auto& topic : broker_manager_->getAllTopics()) {
+        if (!topic || !isLogTopic(*topic)) {
+            continue;
+        }
+        nlohmann::json entry;
+        entry["topic"] = topic->toTopicString();
+        // A string: these ids exceed 2^53 and JavaScript would round them.
+        entry["stream_id"] = std::to_string(topic->id);
+        entry["schema_name"] = topic->schemaName;
+        entry["serialization_type"] = nat::core::toString(topic->serializationType);
+        // Whether this topic can be rendered as structured fields or only as
+        // text, so the frontend can say which rather than discovering it per
+        // record. A descriptor is what makes field labels possible.
+        const auto descriptor = registry.findBySchemaName(topic->schemaName);
+        entry["has_descriptor"] = descriptor.has_value();
+        const auto descriptor_json = getDescriptorJsonForSchemaName(topic->schemaName);
+        if (descriptor_json.has_value()) {
+            entry["descriptor"] = descriptor_json.value();
+        }
+        topics.push_back(std::move(entry));
+    }
+    response["topics"] = std::move(topics);
+    conn->send(response.dump());
+}
+
+void StreamViewerWebSocket::handleSubscribeLogs(
+    const WebSocketConnectionPtr& conn, const nlohmann::json& json)
+{
+    StreamViewerClientContext* ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        auto it = clients_.find(conn);
+        if (it == clients_.end()) {
+            return;
+        }
+        ctx = it->second.get();
+    }
+    if (!broker_manager_) {
+        sendError(conn, "Broker manager not available");
+        return;
+    }
+
+    std::set<std::string> requested;
+    if (json.contains("topics") && json["topics"].is_array()) {
+        for (const auto& entry : json["topics"]) {
+            if (entry.is_string()) {
+                requested.insert(entry.get<std::string>());
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->log_topics_mutex);
+        ctx->log_topics = requested;
+    }
+
+    // An empty set means "stop", which is what unchecking the last topic does.
+    // Treating it as "tail everything" would turn a deselection into a flood.
+    if (requested.empty()) {
+        ctx->log_tail_active = false;
+        return;
+    }
+
+    // Already running: the set has been swapped above and the thread re-reads it
+    // each tick, so a client toggling a checkbox keeps its place in every topic
+    // it was already reading rather than restarting at the live end.
+    if (ctx->log_tail_active.exchange(true)) {
+        return;
+    }
+
+    const uint64_t interval_ms = json.value("interval_ms", kDefaultLogIntervalMs);
+    if (ctx->log_tail_thread.joinable()) {
+        ctx->log_tail_thread.join();
+    }
+    ctx->log_tail_thread = std::thread(&StreamViewerWebSocket::logTailThreadFunc,
+                                       this, conn, ctx,
+                                       std::max<uint64_t>(100, interval_ms));
+}
+
+void StreamViewerWebSocket::handleUnsubscribeLogs(const WebSocketConnectionPtr& conn)
+{
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    auto it = clients_.find(conn);
+    if (it == clients_.end()) {
+        return;
+    }
+    it->second->log_tail_active = false;
+}
+
+void StreamViewerWebSocket::logTailThreadFunc(const WebSocketConnectionPtr& conn,
+                                              StreamViewerClientContext* ctx,
+                                              const uint64_t interval_ms)
+{
+    // Messengers are kept per topic for the life of the subscription: rebuilding
+    // one re-attaches at the live end and loses whatever arrived in between.
+    // Deliberately NOT torn down when a topic is deselected, so re-checking it
+    // resumes rather than skipping the gap.
+    std::map<std::string, std::unique_ptr<nat::core::TopicMessenger>> messengers;
+    std::map<std::string, std::shared_ptr<nat::core::BasicTopicInformation>> infos;
+    auto registry = broker_manager_->getRegistry();
+
+    LOG_INFO << "Log tail: started for a client";
+
+    while (ctx->active && ctx->log_tail_active && conn->connected()) {
+        std::set<std::string> wanted;
+        {
+            std::lock_guard<std::mutex> lock(ctx->log_topics_mutex);
+            wanted = ctx->log_topics;
+        }
+
+        for (const auto& name : wanted) {
+            if (messengers.count(name) > 0) {
+                continue;
+            }
+            const auto info_maybe = nat::core::BasicTopicInformation::create(name);
+            if (!info_maybe.has_value()) {
+                // A name the client made up, or a topic string this build cannot
+                // parse. Said out loud rather than ignored: silence here reads as
+                // "that topic has no logs".
+                nlohmann::json problem;
+                problem["type"] = "log_records";
+                problem["records"] = nlohmann::json::array();
+                problem["error"] = "Not a topic this backend can parse: " + name;
+                if (conn->connected()) {
+                    conn->send(problem.dump());
+                }
+                continue;
+            }
+            auto info = std::make_shared<nat::core::BasicTopicInformation>(
+                *info_maybe.value());
+            auto messenger = broker_manager_->createMessenger(info);
+            if (!messenger) {
+                LOG_WARN << "Log tail: could not consume " << name;
+                continue;
+            }
+            LOG_INFO << "Log tail: tailing " << name;
+            infos[name] = info;
+            messengers[name] = std::move(messenger);
+        }
+
+        nlohmann::json records = nlohmann::json::array();
+        size_t dropped = 0;
+
+        for (auto& entry : messengers) {
+            if (wanted.count(entry.first) == 0) {
+                // Not selected right now. Its messenger stays alive (see above),
+                // but its records are drained and discarded rather than queued
+                // forever -- an unbounded queue behind a deselected checkbox is a
+                // leak that only shows up hours later.
+                while (entry.second->tryGetNextRawMessage().has_value()) {
+                }
+                continue;
+            }
+            const auto& info = infos[entry.first];
+            for (size_t drained = 0; drained < kMaxLogRecordsPerPush * 2; ++drained) {
+                if (records.size() >= kMaxLogRecordsPerPush) {
+                    // Count what we walked away from rather than pretending the
+                    // burst did not happen.
+                    if (entry.second->tryGetNextRawMessage().has_value()) {
+                        ++dropped;
+                        continue;
+                    }
+                    break;
+                }
+                auto next = entry.second->tryGetNextRawMessage();
+                if (!next.has_value()) {
+                    break;
+                }
+                const auto& bytes = *next.value();
+
+                nlohmann::json record;
+                record["topic"] = entry.first;
+                record["stream_id"] = std::to_string(info->id);
+                record["schema_name"] = info->schemaName;
+                record["received_ms"] = nowMs();
+                record["bytes"] = bytes.size();
+
+                bool rendered = false;
+
+                // 1. A registered decoder: structured fields, and the schema's
+                //    own timestamp rather than arrival time.
+                if (registry) {
+                    nat::core::TopicTranslator translator(info, registry);
+                    auto decoded = translator.tryDecodeMessage(bytes);
+                    if (decoded.has_value() && decoded.value()) {
+                        const auto& schema = *decoded.value();
+                        try {
+                            record["json"] = nlohmann::json::parse(schema.toString());
+                        } catch (const std::exception&) {
+                            record["text"] = schema.toString();
+                        }
+                        record["device_ts_us"] = schema.getTimestampUs();
+                        record["decoded"] = "schema";
+                        rendered = true;
+                    }
+                }
+
+                // 2. No decoder, but the topic says Json. NatLogV1 lives here:
+                //    it has no schema class, only a shape the firmware and the
+                //    command path agree on.
+                if (!rendered &&
+                    info->serializationType == nat::core::SerializationType::Json) {
+                    std::string text(bytes.begin(), bytes.end());
+                    bool truncated = false;
+                    if (text.size() > kMaxLogTextBytes) {
+                        text.resize(kMaxLogTextBytes);
+                        truncated = true;
+                    }
+                    try {
+                        record["json"] = nlohmann::json::parse(text);
+                        record["decoded"] = "json";
+                    } catch (const std::exception&) {
+                        record["text"] = text;
+                        record["decoded"] = "text";
+                    }
+                    if (truncated) {
+                        record["truncated"] = true;
+                    }
+                    rendered = true;
+                }
+
+                // 3. Neither. Reported, NOT dropped -- see the note at the top.
+                if (!rendered) {
+                    record["decoded"] = "none";
+                }
+                records.push_back(std::move(record));
+            }
+        }
+
+        if (!records.empty() || dropped > 0) {
+            nlohmann::json response;
+            response["type"] = "log_records";
+            response["records"] = std::move(records);
+            response["dropped"] = dropped;
+            if (conn->connected()) {
+                conn->send(response.dump());
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+
+    ctx->log_tail_active = false;
+    LOG_INFO << "Log tail: stopped for a client";
 }
 
 void StreamViewerWebSocket::handleListExperiments(
@@ -12724,6 +13224,32 @@ CohortExportInputs collectCohortInputs(const std::string& workspaceId,
         instance.participantUnrecorded = recording.value("participant_unrecorded", false);
         instance.calibrationOverride =
             recording.value("calibration_override", std::string{});
+        // The clock record, summarised for the manifest (TEC-NATKIT-77). ⚠️ Left
+        // EMPTY when the run has no clock_quality, which is what every run made
+        // before this existed looks like — and empty is documented in the manifest
+        // header as "predates the record", explicitly NOT as clean.
+        if (recording.contains("clock_quality") &&
+            recording["clock_quality"].is_object()) {
+            const auto& devices =
+                recording["clock_quality"].value("devices", nlohmann::json::array());
+            size_t troubled = 0;
+            for (const auto& device : devices) {
+                const auto status = device.value("status", std::string{});
+                if (status != "reported" || !device.value("valid", true) ||
+                    device.value("epoch_changed_during_run", false)) {
+                    troubled += 1;
+                }
+            }
+            if (devices.empty()) {
+                instance.clockSummary = "no devices";
+            } else if (troubled == 0) {
+                instance.clockSummary = "held";
+            } else {
+                instance.clockSummary =
+                    std::to_string(troubled) + " of " +
+                    std::to_string(devices.size()) + " in question";
+            }
+        }
         if (recording.contains("sensor_positions") &&
             recording["sensor_positions"].is_array()) {
             for (const auto& entry : recording["sensor_positions"]) {
