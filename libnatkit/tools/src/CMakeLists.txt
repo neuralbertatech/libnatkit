@@ -81,6 +81,7 @@ if(BUILD_NATKIT_BACKEND)
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/CohortExport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeviceHealth.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeviceControls.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/StreamAliases.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/ParquetExport.cpp

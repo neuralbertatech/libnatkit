@@ -7,6 +7,7 @@
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
 #include "DeviceControls.hpp"
+#include "StreamAliases.hpp"
 #include "ParquetExport.hpp"
 #include "ReplaySource.hpp"
 
@@ -7534,6 +7535,38 @@ void StreamViewerWebSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
         }
         else if (action == "unsubscribe_device_health") {
             handleUnsubscribeDeviceHealth(conn);
+        }
+        else if (action == "set_stream_alias") {
+            // ⚠️ The alias is a rig-wide fact today: owner is left empty, which
+            // stores NULL and means "global". When this becomes multi-user the
+            // authenticated username goes here and nothing else about the shape
+            // changes — that is why the column already exists.
+            const auto stream_id = json.value("stream_id", std::string{});
+            const auto alias = json.value("alias", std::string{});
+            const auto request_id = json.value("request_id", std::string{});
+            if (stream_id.empty()) {
+                sendError(conn, "set_stream_alias requires a stream_id", request_id);
+            } else {
+                try {
+                    nat::tools::StreamAliasStore::instance().set(stream_id, alias);
+                    nlohmann::json response;
+                    response["type"] = "stream_aliases";
+                    response["request_id"] = request_id;
+                    response["aliases"] =
+                        nat::tools::StreamAliasStore::instance().visibleTo();
+                    conn->send(response.dump());
+                } catch (const std::exception& e) {
+                    sendError(conn, std::string("Could not store the alias: ") + e.what(),
+                              request_id);
+                }
+            }
+        }
+        else if (action == "list_stream_aliases") {
+            nlohmann::json response;
+            response["type"] = "stream_aliases";
+            response["request_id"] = json.value("request_id", std::string{});
+            response["aliases"] = nat::tools::StreamAliasStore::instance().visibleTo();
+            conn->send(response.dump());
         }
         else if (action == "send_device_command") {
             handleSendDeviceCommand(conn, json);
