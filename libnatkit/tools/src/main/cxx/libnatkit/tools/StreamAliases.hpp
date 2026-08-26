@@ -81,5 +81,42 @@ private:
     std::string dbPath() const;
 };
 
+/**
+ * Which streams the IMU surfaces watch (TEC-NATKIT-98 follow-up).
+ *
+ * ⚠️ This selection used to live ONLY in a member of the API controller, so
+ * every backend restart silently emptied it. Nothing said so: the streams kept
+ * arriving, the boards kept their wiring, and the calibration readout on a
+ * correctly-wired node just reported "No IMU streams selected" — a message that
+ * points at a settings page rather than at the restart that actually caused it.
+ * Rebuilding the backend is routine here, so this was lost several times a day.
+ *
+ * Same file as the aliases deliberately: both are small per-stream settings that
+ * have to outlive a restart, and a second copy of the SQLite RAII helpers in a
+ * third translation unit would be worse than the slightly broad file name. Same
+ * database, and the same NULL-owner-means-global shape.
+ */
+class ImuStreamSelectionStore {
+public:
+    static ImuStreamSelectionStore& instance();
+
+    /** Creates the table if absent. Idempotent; safe to call per request. */
+    void ensureSchema() const;
+
+    /** The selected stream ids, empty when nothing has ever been chosen. */
+    std::vector<uint64_t> selected(const std::string& username = std::string{}) const;
+
+    /**
+     * Replaces the whole selection — it is a set, not a list of edits, and the
+     * UI always sends the complete set.
+     */
+    void replace(const std::vector<uint64_t>& streamIds,
+                 const std::string& ownerUsername = std::string{}) const;
+
+private:
+    ImuStreamSelectionStore() = default;
+    std::string dbPath() const;
+};
+
 }  // namespace tools
 }  // namespace nat

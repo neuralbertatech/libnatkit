@@ -209,5 +209,114 @@ std::vector<StreamAlias> StreamAliasStore::all() const
     return out;
 }
 
+ImuStreamSelectionStore& ImuStreamSelectionStore::instance()
+{
+    static ImuStreamSelectionStore store;
+    return store;
+}
+
+std::string ImuStreamSelectionStore::dbPath() const
+{
+    return AuthManager::instance().sharedDbPath();
+}
+
+void ImuStreamSelectionStore::ensureSchema() const
+{
+    static bool created = false;
+    std::lock_guard<std::mutex> lock(schemaMutex());
+    if (created) return;
+
+    Db db(dbPath());
+    // ⚠️ The same IFNULL trick as stream_aliases, for the same reason: two NULLs
+    // are DISTINCT in a SQLite unique index, so a plain UNIQUE(stream_id,
+    // owner_username) would accept the same global row twice and the selection
+    // would grow a duplicate on every save.
+    const char* sql = R"SQL(
+        CREATE TABLE IF NOT EXISTS imu_stream_selection (
+            stream_id INTEGER NOT NULL,
+            owner_username TEXT,
+            created_at_us INTEGER NOT NULL,
+            FOREIGN KEY(owner_username) REFERENCES auth_users(username) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_imu_stream_selection_owner
+            ON imu_stream_selection(stream_id, IFNULL(owner_username, ''));
+    )SQL";
+    char* error = nullptr;
+    if (sqlite3_exec(db.get(), sql, nullptr, nullptr, &error) != SQLITE_OK) {
+        const std::string message = error != nullptr ? error : "unknown sqlite error";
+        sqlite3_free(error);
+        throw std::runtime_error("Failed to create imu_stream_selection: " + message);
+    }
+    created = true;
+}
+
+std::vector<uint64_t> ImuStreamSelectionStore::selected(const std::string& username) const
+{
+    ensureSchema();
+    Db db(dbPath());
+    Stmt stmt(db.get(),
+              "SELECT stream_id FROM imu_stream_selection "
+              "WHERE IFNULL(owner_username, '') = ?1 ORDER BY stream_id");
+    sqlite3_bind_text(stmt.get(), 1, username.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::vector<uint64_t> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.push_back(static_cast<uint64_t>(sqlite3_column_int64(stmt.get(), 0)));
+    }
+    return out;
+}
+
+void ImuStreamSelectionStore::replace(const std::vector<uint64_t>& streamIds,
+                                      const std::string& ownerUsername) const
+{
+    ensureSchema();
+    Db db(dbPath());
+
+    // One transaction: a half-applied selection is worse than the old one, and
+    // the delete below would otherwise be able to land on its own.
+    char* error = nullptr;
+    if (sqlite3_exec(db.get(), "BEGIN IMMEDIATE", nullptr, nullptr, &error) != SQLITE_OK) {
+        const std::string message = error != nullptr ? error : "unknown sqlite error";
+        sqlite3_free(error);
+        throw std::runtime_error("Failed to begin the IMU selection write: " + message);
+    }
+
+    try {
+        {
+            Stmt del(db.get(),
+                     "DELETE FROM imu_stream_selection WHERE IFNULL(owner_username, '') = ?1");
+            sqlite3_bind_text(del.get(), 1, ownerUsername.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(del.get()) != SQLITE_DONE) {
+                throw std::runtime_error(sqlite3_errmsg(db.get()));
+            }
+        }
+        const uint64_t now = nowUs();
+        for (const uint64_t streamId : streamIds) {
+            Stmt ins(db.get(),
+                     "INSERT INTO imu_stream_selection (stream_id, owner_username, created_at_us) "
+                     "VALUES (?1, ?2, ?3)");
+            sqlite3_bind_int64(ins.get(), 1, static_cast<sqlite3_int64>(streamId));
+            if (ownerUsername.empty()) {
+                sqlite3_bind_null(ins.get(), 2);
+            } else {
+                sqlite3_bind_text(ins.get(), 2, ownerUsername.c_str(), -1, SQLITE_TRANSIENT);
+            }
+            sqlite3_bind_int64(ins.get(), 3, static_cast<sqlite3_int64>(now));
+            if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+                throw std::runtime_error(sqlite3_errmsg(db.get()));
+            }
+        }
+    } catch (...) {
+        sqlite3_exec(db.get(), "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
+    }
+
+    if (sqlite3_exec(db.get(), "COMMIT", nullptr, nullptr, &error) != SQLITE_OK) {
+        const std::string message = error != nullptr ? error : "unknown sqlite error";
+        sqlite3_free(error);
+        throw std::runtime_error("Failed to commit the IMU selection: " + message);
+    }
+}
+
 }  // namespace tools
 }  // namespace nat

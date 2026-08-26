@@ -36,6 +36,7 @@
 #include "Auth.hpp"
 #include "CohortExport.hpp"
 #include "ParquetExport.hpp"
+#include "StreamAliases.hpp"
 
 #include <filesystem>
 
@@ -399,6 +400,29 @@ class ApiController : public drogon::HttpController<ApiController, false> {
         }
     }
 
+    /**
+     * Re-applies the selection saved by the last `set_streams`.
+     *
+     * ⚠️ Called once at construction. The selection is not derivable from
+     * anything else the backend knows — the streams are all present and all
+     * look alike — so without this a restart left the calibration readouts
+     * reporting "No IMU streams selected" on correctly-wired boards, and the
+     * only cure was for somebody to remember to go and re-pick them.
+     */
+    void restore_imu_streams() {
+        try {
+            const auto saved = nat::tools::ImuStreamSelectionStore::instance().selected();
+            if (saved.empty()) return;
+            std::cout << "Restoring " << saved.size() << " saved IMU stream(s)\n";
+            set_imu_streams(std::set<uint64_t>{saved.begin(), saved.end()});
+        } catch (const std::exception& error) {
+            // A failure here must not take the backend down: the rest of the
+            // API is unaffected and the selection can be made again by hand.
+            std::cerr << "WARN: could not restore the IMU stream selection: "
+                      << error.what() << '\n';
+        }
+    }
+
 public:
     // Macro to map routes to member functions.
     // This is how Drogon connects a URL path to your code.
@@ -416,7 +440,10 @@ public:
     METHOD_LIST_END
 
     ApiController(std::shared_ptr<nat::kafka::BrokerManager> manager, Config config)
-        : manager(std::move(manager)), config(config), recording_session(std::make_unique<RecordingSession>()) {}
+        : manager(std::move(manager)), config(config), recording_session(std::make_unique<RecordingSession>())
+    {
+        restore_imu_streams();
+    }
 
     ~ApiController() {
         // Stop recording thread if running
@@ -654,6 +681,15 @@ public:
                     ids.push_back(id);
                 }
                 set_imu_streams(std::set<uint64_t>{ids.begin(), ids.end()});
+                try {
+                    nat::tools::ImuStreamSelectionStore::instance().replace(ids);
+                } catch (const std::exception& error) {
+                    // The in-memory selection above already took effect, so this
+                    // is a durability failure, not a functional one — say so and
+                    // still report success for the request that was serviced.
+                    std::cerr << "WARN: could not persist the IMU stream selection: "
+                              << error.what() << '\n';
+                }
                 Json::Value resp_json;
                 resp_json["status"] = "success";
                 resp_json["message"] = "Stream configuration received.";
