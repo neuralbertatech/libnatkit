@@ -45,6 +45,65 @@ const char *toString(const CommandGate gate) {
     return "unknown";
 }
 
+nlohmann::json DeviceControlsSnapshot::toJson() const {
+    nlohmann::json out;
+    out["device_id"] = std::to_string(deviceId);
+    // ⚠️ Reported separately from `controls` being empty. "Never advertised" and
+    // "advertised nothing" are different states, and a UI that could not tell
+    // them apart would show a board with no controls the same way it shows a
+    // board running firmware too old to say — which is the confusion this whole
+    // feature removes.
+    out["has_advertisement"] = hasAdvertisement;
+    out["reachable"] = reachable;
+    out["since_heartbeat_ms"] = sinceHeartbeatMs;
+    if (advertiserDeviceId != 0 && advertiserDeviceId != deviceId) {
+        // A bridge spoke for this device. Worth surfacing: it is the case where
+        // a stale advertisement is possible at all.
+        out["advertised_by"] = std::to_string(advertiserDeviceId);
+    }
+    nlohmann::json list = nlohmann::json::array();
+    for (const auto &control : controls) {
+        nlohmann::json entry;
+        entry["id"] = control.controlId;
+        entry["kind"] = control.kind;
+        entry["write"] = control.writeCommand;
+        if (!control.readCommand.empty()) entry["read"] = control.readCommand;
+        if (!control.group.empty()) entry["group"] = control.group;
+        if (!control.field.empty()) entry["field"] = control.field;
+        if (!control.valueType.empty()) entry["type"] = control.valueType;
+        if (control.ranged) {
+            entry["min"] = control.minValue;
+            entry["max"] = control.maxValue;
+        }
+        // ⚠️ THE WORDS COME FROM THE REGISTRY, resolved here so the browser needs
+        // no descriptor table of its own. A third-party library that registered a
+        // descriptor is what makes its control readable, and an id nobody
+        // described falls through WITHOUT a label so the UI can render the raw id
+        // rather than an invented one.
+        const auto described =
+            nat::core::DeviceControlDescriptorRegistry::getDefault()
+                .findByControlId(control.controlId);
+        if (described.has_value()) {
+            entry["label"] = described.value()->getLabel();
+            if (!described.value()->getDescription().empty()) {
+                entry["description"] = described.value()->getDescription();
+            }
+            if (!described.value()->getUnit().empty()) {
+                entry["unit"] = described.value()->getUnit();
+            }
+        } else {
+            // The device's own words, if it carried any -- the escape hatch for
+            // hardware no library describes.
+            if (!control.label.empty()) entry["label"] = control.label;
+            if (!control.description.empty()) entry["description"] = control.description;
+            if (!control.unit.empty()) entry["unit"] = control.unit;
+        }
+        list.push_back(std::move(entry));
+    }
+    out["controls"] = std::move(list);
+    return out;
+}
+
 DeviceControlsService &DeviceControlsService::instance() {
     static DeviceControlsService service;
     return service;

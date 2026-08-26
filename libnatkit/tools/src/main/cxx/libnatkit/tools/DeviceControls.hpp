@@ -26,6 +26,8 @@
 #include <thread>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include <libnatkit-core.hpp>
 #include <libnatkit-kafka.hpp>
 
@@ -57,6 +59,8 @@ struct DeviceControlsSnapshot {
     bool reachable = false;
     /** How long since the last heartbeat, or 0 if none has ever arrived. */
     uint64_t sinceHeartbeatMs = 0;
+
+    nlohmann::json toJson() const;
 };
 
 class DeviceControlsService {

@@ -9643,6 +9643,12 @@ void StreamViewerWebSocket::deviceHealthThreadFunc(
     // would have depended on whether anybody happened to have the panel open.
     auto& service = nat::tools::DeviceHealthService::instance();
     service.start(broker_manager_);
+    // ⚠️ Carried on the SAME message rather than a second subscription: controls
+    // and health answer one question ("what is this device doing") and the pages
+    // that need one already subscribe to the other. A parallel push would mean a
+    // second thread per client for data that arrives on the same cadence.
+    auto& controlsService = nat::tools::DeviceControlsService::instance();
+    controlsService.start(broker_manager_);
 
     LOG_INFO << "Device health: pushing to a client (interval " << interval_ms
              << " ms, quiet after " << quiet_after_ms << " ms)";
@@ -9661,6 +9667,20 @@ void StreamViewerWebSocket::deviceHealthThreadFunc(
             devices.push_back(health.toJson(quiet_after_ms));
         }
         response["devices"] = std::move(devices);
+
+        // What each device says it can be asked to do, and whether it is
+        // reachable (TEC-NATKIT-10).
+        nlohmann::json controlsList = nlohmann::json::array();
+        for (const auto& snap : controlsService.snapshot()) {
+            controlsList.push_back(snap.toJson());
+        }
+        response["device_controls"] = std::move(controlsList);
+        // ⚠️ Surfaced so the migration is visible rather than folklore: how many
+        // commands were let through only because nothing was advertised is the
+        // evidence for when strict mode can be turned on.
+        response["controls_strict"] = controlsService.strictMode();
+        response["controls_unadvertised_allowed"] =
+            controlsService.unadvertisedAllowed();
 
         if (conn->connected()) {
             conn->send(response.dump());
