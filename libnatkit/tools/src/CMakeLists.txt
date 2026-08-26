@@ -80,6 +80,7 @@ if(BUILD_NATKIT_BACKEND)
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/Auth.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/CohortExport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeviceHealth.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeviceControls.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/NatKitBackend.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/ParquetExport.cpp
@@ -138,8 +139,10 @@ endif()
 if(BUILD_TESTING)
   add_executable(libnatkit-tools-unittest-cxx
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeviceHealth.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/DeviceControls.cpp
     ${LIBNATKIT_TOOLS_ROOT}/main/cxx/libnatkit/tools/InProcessTransport.cpp
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/DeviceHealthTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/DeviceControlsTest.cpp
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/GraphTopicResolutionTest.cpp
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/InProcessTransportTest.cpp
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/GraphTransportPlanTest.cpp

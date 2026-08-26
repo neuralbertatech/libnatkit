@@ -6,6 +6,7 @@
 #include "InProcessTransport.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
+#include "DeviceControls.hpp"
 #include "ParquetExport.hpp"
 #include "ReplaySource.hpp"
 
@@ -9318,6 +9319,50 @@ void StreamViewerWebSocket::handleSendDeviceCommand(
     if (command.size() > 32) {
         sendError(conn, "Command name is too long (32 characters max)", request_id);
         return;
+    }
+
+    // ⚠️ THE ADVERTISEMENT GATE (TEC-NATKIT-10). A command is permitted only if
+    // the device ADVERTISED it and is currently REACHABLE. Both halves are
+    // needed and neither is sufficient:
+    //
+    //   * the advertisement alone is not evidence anything is listening, because
+    //     it is RETAINED and therefore survives the board it describes;
+    //   * reachability alone would let any command through to a device that
+    //     never claimed to support it.
+    //
+    // ⚠️ Checked HERE rather than in the browser, for the same reason as the
+    // recording gate below: a check in the frontend is a suggestion, and the
+    // same command can be published straight to the broker.
+    {
+        auto &controls = nat::tools::DeviceControlsService::instance();
+        controls.start(broker_manager_);
+        const auto gate = controls.check(stream_id, command);
+        if (gate != nat::tools::CommandGate::kAllowed) {
+            // Each refusal says which half failed, because they send you to
+            // opposite ends of the rig: "not advertised" is firmware, and
+            // "unreachable" is power or radio.
+            std::string why;
+            switch (gate) {
+            case nat::tools::CommandGate::kNoAdvertisement:
+                why = "This device has not advertised what it supports, so no "
+                      "command can be verified against it. Its firmware may "
+                      "predate the control channel.";
+                break;
+            case nat::tools::CommandGate::kNotAdvertised:
+                why = "This device does not advertise the command \"" + command +
+                      "\". Its firmware does not implement it.";
+                break;
+            case nat::tools::CommandGate::kUnreachable:
+                why = "This device is not currently reachable — no heartbeat "
+                      "inside the window. It advertises this command, so this is "
+                      "power or radio rather than firmware.";
+                break;
+            case nat::tools::CommandGate::kAllowed:
+                break;
+            }
+            sendError(conn, why, request_id);
+            return;
+        }
     }
 
     // ⚠️ REFUSED WHILE A RECORDING IS RUNNING, for commands that change what a
