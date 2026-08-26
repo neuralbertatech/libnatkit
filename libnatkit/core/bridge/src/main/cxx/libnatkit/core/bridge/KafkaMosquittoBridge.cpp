@@ -408,10 +408,33 @@ void KafkaMosquittoBridge::onMosquittoMessageReceived(mosquitto::MosquittoClient
   }
   log_bridge_message("MQTT->Kafka", topicName, *encodedMessage, registry.get());
   {
+    // ⚠️ THE RECEIVING QUEUE, NOT THE SENDING ONE (TEC-NATKIT-100). This used to
+    // take `mosquittoBrokerRecievingQueueLock` and then push straight into
+    // `kafkaBrokerSendingQueue` -- the right lock for the wrong queue, which is
+    // what a copy/paste leaves behind, and the lock's own name is the evidence of
+    // what was intended.
+    //
+    // The consequence was a genuine data race, not a tidiness problem. This
+    // function runs on the MOSQUITTO NETWORK THREAD, while
+    // sendKafkaMessagesThreadSafe() drains `kafkaBrokerSendingQueue` on its own
+    // daemon thread under `kafkaBrokerSendingQueueLock`. Two threads mutated one
+    // std::queue with no mutex in common, and the damage landed in the std::string
+    // topic names the queue carries: on 2026-08-26 the broker grew
+    // `Data-13793649670644-Binary-NatImu` (a truncated
+    // "NatImuBulkDataSchema") and `Data-13793649670644-Binary-NaogV1` -- a SPLICE
+    // of that device's data topic with its own mangled `NatLogV1`. A truncation
+    // could be one bad length; a splice of two different names could only be
+    // concurrent mutation. Every message published to such a name is lost in
+    // silence, because no consumer subscribes to a topic that should not exist.
+    //
+    // Pushing to the receiving queue also revives it: it was only ever POPPED,
+    // never pushed, so moveMosquittoMessagesThreadSafe() has been shuffling an
+    // always-empty queue and the pipeline the other three functions implement was
+    // short-circuited. Costs at most the mover's 1 ms tick.
     const std::lock_guard<std::mutex> lock(
         mosquittoBrokerRecievingQueueLock);
-    kafkaBrokerSendingQueue.emplace(topicName,
-                                        std::move(encodedMessage));
+    mosquittoBrokerReceivingQueue.emplace(topicName,
+                                          std::move(encodedMessage));
   }
 }
 
