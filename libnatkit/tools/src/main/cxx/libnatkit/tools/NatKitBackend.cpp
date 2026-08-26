@@ -197,6 +197,23 @@ struct ImuAccuracies {
     int accelerometer = 0;
     int gyroscope = 0;
     int rotation = 0;
+    // ⚠️ The magnetometer has been on the wire since frame version 2 and was
+    // simply never read here, so every calibration surface showed three sensors
+    // out of four and nothing said a fourth existed. A v1 frame leaves
+    // wasDataSetForMagnetometer() false, so it stays 0 there rather than
+    // inventing a reading.
+    int magnetometer = 0;
+
+    // ⚠️ WHETHER THE SENSOR SPOKE AT ALL, which an accuracy of 0 cannot say: a
+    // sensor that is switched off and one that is on and badly calibrated both
+    // read 0. The calibration headline is the WORST case across sub-sensors, so
+    // without this a disabled magnetometer pinned every device to "Unreliable"
+    // no matter how well the other three were calibrated. Consumers exclude a
+    // silent sensor instead of counting it as bad.
+    bool sawAccelerometer = false;
+    bool sawGyroscope = false;
+    bool sawRotation = false;
+    bool sawMagnetometer = false;
 };
 
 class Config {
@@ -500,19 +517,28 @@ public:
                                             ImuAccuracies known) {
         if (imuData == nullptr) return known;
         if (imuData->wasDataSetForAcceleration()) {
+            known.sawAccelerometer = true;
             known.accelerometer =
                 nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
                     imuData->getAccelerationAccuracy());
         }
         if (imuData->wasDataSetForGryoscope()) {
+            known.sawGyroscope = true;
             known.gyroscope =
                 nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
                     imuData->getGyroscopeAccuracy());
         }
         if (imuData->wasDataSetForRotation()) {
+            known.sawRotation = true;
             known.rotation =
                 nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
                     imuData->getRotationAccuracy());
+        }
+        if (imuData->wasDataSetForMagnetometer()) {
+            known.sawMagnetometer = true;
+            known.magnetometer =
+                nat::core::NatImuDataSchema::convertSensorAccuracyToInt(
+                    imuData->getMagnetometerAccuracy());
         }
         return known;
     }
@@ -571,11 +597,18 @@ public:
                     }
                 }
                 
-                // Return all three accuracy values for each stream
+                // One entry per sensor the frame format can carry
                 Json::Value stream_accuracies;
                 stream_accuracies["accelerometer"] = accuracies.accelerometer;
                 stream_accuracies["gyroscope"] = accuracies.gyroscope;
                 stream_accuracies["rotation"] = accuracies.rotation;
+                stream_accuracies["magnetometer"] = accuracies.magnetometer;
+                Json::Value reporting;
+                reporting["accelerometer"] = accuracies.sawAccelerometer;
+                reporting["gyroscope"] = accuracies.sawGyroscope;
+                reporting["rotation"] = accuracies.sawRotation;
+                reporting["magnetometer"] = accuracies.sawMagnetometer;
+                stream_accuracies["reporting"] = reporting;
                 accuracies_json[std::to_string(id)] = stream_accuracies;
             }
         }
