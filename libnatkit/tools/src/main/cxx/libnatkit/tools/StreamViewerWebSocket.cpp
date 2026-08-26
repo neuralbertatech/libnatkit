@@ -6,6 +6,7 @@
 #include "InProcessTransport.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
+#include "DeviceControls.hpp"
 #include "ParquetExport.hpp"
 #include "ReplaySource.hpp"
 
@@ -9320,6 +9321,50 @@ void StreamViewerWebSocket::handleSendDeviceCommand(
         return;
     }
 
+    // ⚠️ THE ADVERTISEMENT GATE (TEC-NATKIT-10). A command is permitted only if
+    // the device ADVERTISED it and is currently REACHABLE. Both halves are
+    // needed and neither is sufficient:
+    //
+    //   * the advertisement alone is not evidence anything is listening, because
+    //     it is RETAINED and therefore survives the board it describes;
+    //   * reachability alone would let any command through to a device that
+    //     never claimed to support it.
+    //
+    // ⚠️ Checked HERE rather than in the browser, for the same reason as the
+    // recording gate below: a check in the frontend is a suggestion, and the
+    // same command can be published straight to the broker.
+    {
+        auto &controls = nat::tools::DeviceControlsService::instance();
+        controls.start(broker_manager_);
+        const auto gate = controls.check(stream_id, command);
+        if (gate != nat::tools::CommandGate::kAllowed) {
+            // Each refusal says which half failed, because they send you to
+            // opposite ends of the rig: "not advertised" is firmware, and
+            // "unreachable" is power or radio.
+            std::string why;
+            switch (gate) {
+            case nat::tools::CommandGate::kNoAdvertisement:
+                why = "This device has not advertised what it supports, so no "
+                      "command can be verified against it. Its firmware may "
+                      "predate the control channel.";
+                break;
+            case nat::tools::CommandGate::kNotAdvertised:
+                why = "This device does not advertise the command \"" + command +
+                      "\". Its firmware does not implement it.";
+                break;
+            case nat::tools::CommandGate::kUnreachable:
+                why = "This device is not currently reachable — no heartbeat "
+                      "inside the window. It advertises this command, so this is "
+                      "power or radio rather than firmware.";
+                break;
+            case nat::tools::CommandGate::kAllowed:
+                break;
+            }
+            sendError(conn, why, request_id);
+            return;
+        }
+    }
+
     // ⚠️ REFUSED WHILE A RECORDING IS RUNNING, for commands that change what a
     // node collects. Parquet has one column set per file, so reconfiguring a
     // sensor mid-recording changes a file's schema halfway through and nothing
@@ -9598,6 +9643,12 @@ void StreamViewerWebSocket::deviceHealthThreadFunc(
     // would have depended on whether anybody happened to have the panel open.
     auto& service = nat::tools::DeviceHealthService::instance();
     service.start(broker_manager_);
+    // ⚠️ Carried on the SAME message rather than a second subscription: controls
+    // and health answer one question ("what is this device doing") and the pages
+    // that need one already subscribe to the other. A parallel push would mean a
+    // second thread per client for data that arrives on the same cadence.
+    auto& controlsService = nat::tools::DeviceControlsService::instance();
+    controlsService.start(broker_manager_);
 
     LOG_INFO << "Device health: pushing to a client (interval " << interval_ms
              << " ms, quiet after " << quiet_after_ms << " ms)";
@@ -9616,6 +9667,20 @@ void StreamViewerWebSocket::deviceHealthThreadFunc(
             devices.push_back(health.toJson(quiet_after_ms));
         }
         response["devices"] = std::move(devices);
+
+        // What each device says it can be asked to do, and whether it is
+        // reachable (TEC-NATKIT-10).
+        nlohmann::json controlsList = nlohmann::json::array();
+        for (const auto& snap : controlsService.snapshot()) {
+            controlsList.push_back(snap.toJson());
+        }
+        response["device_controls"] = std::move(controlsList);
+        // ⚠️ Surfaced so the migration is visible rather than folklore: how many
+        // commands were let through only because nothing was advertised is the
+        // evidence for when strict mode can be turned on.
+        response["controls_strict"] = controlsService.strictMode();
+        response["controls_unadvertised_allowed"] =
+            controlsService.unadvertisedAllowed();
 
         if (conn->connected()) {
             conn->send(response.dump());
