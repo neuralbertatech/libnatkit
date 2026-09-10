@@ -147,6 +147,11 @@ if(BUILD_TESTING)
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/GraphTopicResolutionTest.cpp
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/InProcessTransportTest.cpp
     ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/GraphTransportPlanTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/CombineJoinTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/ThresholdDetectTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/SampleGateTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/MarkerOpsTest.cpp
+    ${LIBNATKIT_TOOLS_ROOT}/unittest/cxx/libnatkit/tools/ChannelActivityTest.cpp
   )
   add_gtest(libnatkit-tools-unittest-cxx)
   target_link_libraries(libnatkit-tools-unittest-cxx PRIVATE

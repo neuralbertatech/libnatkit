@@ -4,6 +4,11 @@
 #include "GraphTopicResolution.hpp"
 #include "GraphTransportPlan.hpp"
 #include "InProcessTransport.hpp"
+#include "CombineJoin.hpp"
+#include "ThresholdDetect.hpp"
+#include "SampleGate.hpp"
+#include "MarkerOps.hpp"
+#include "ChannelActivity.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
 #include "DeviceControls.hpp"
@@ -1404,6 +1409,12 @@ nlohmann::json buildNodeCatalogJson()
     }
 
     // Combine — fans in >=2 upstream frames into one flattened feature vector.
+    //
+    // The join policy is the node's one real parameter (TEC-NATKIT-103). Each
+    // option is a different answer to "these inputs did not arrive together,
+    // now what", and picking the wrong one is silently wrong rather than an
+    // error — hence the labels spelling out what each is FOR, not just what it
+    // is called. See CombineJoin.hpp for the semantics.
     nodes.push_back(
         {{"node_type", "combine"},
          {"kind", "combine"},
@@ -1413,8 +1424,44 @@ nlohmann::json buildNodeCatalogJson()
          {"description",
           "Fans in two or more upstream channel frames into one flattened "
           "feature-vector frame (e.g. several feature extractors into a model "
-          "input)."},
-         {"config_fields", nlohmann::json::array()},
+          "input). How mismatched cadences are reconciled is set by the join "
+          "policy."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "join_policy"},
+                {"label", "Join policy"},
+                {"type", "enum"},
+                {"required", true},
+                {"default_option", "zip"},
+                {"options",
+                 nlohmann::json::array({"zip", "combine_latest",
+                                        "with_latest_from", "sample"})},
+                {"option_labels",
+                 nlohmann::json::array(
+                     {"zip — lockstep, wait for laggards",
+                      "combine latest — emit on any input",
+                      "with latest from — input 1 is the clock",
+                      "sample — a fixed rate drives output"})}},
+               {{"id", "align_tolerance_ms"},
+                {"label", "Align tolerance (ms)"},
+                {"type", "number"},
+                {"required", false},
+                {"min", 0},
+                {"step", 1},
+                {"default_value", 50},
+                {"visible_when",
+                 {{"field", "join_policy"},
+                  {"equals", nlohmann::json::array({"zip"})}}}},
+               {{"id", "sample_rate_hz"},
+                {"label", "Output rate (Hz)"},
+                {"type", "number"},
+                {"required", false},
+                {"min", 0.1},
+                {"step", 1},
+                {"default_value", 10},
+                {"visible_when",
+                 {{"field", "join_policy"},
+                  {"equals", nlohmann::json::array({"sample"})}}}}})},
          {"input_ports", singleInputPort()},
          {"output_ports", singleOutputPort()},
          {"variadic_inputs", true}});
@@ -1467,6 +1514,10 @@ nlohmann::json buildNodeCatalogJson()
         return nlohmann::json::array(
             {{{"id", "markers"}, {"label", "Markers"}}});
     };
+    const auto markersInputPort = []() {
+        return nlohmann::json::array(
+            {{{"id", "markers"}, {"label", "Markers"}}});
+    };
     nodes.push_back(
         {{"node_type", "markers"},
          {"kind", "markers"},
@@ -1481,6 +1532,219 @@ nlohmann::json buildNodeCatalogJson()
           "board; bind one from the board header."},
          {"config_fields", nlohmann::json::array()},
          {"input_ports", nlohmann::json::array()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", false}});
+
+    // --- the two lane crossings (TEC-NATKIT-109) --------------------------
+    //
+    // Every other node stays in one lane: the sample-clocked DATA lane, or the
+    // unclocked MARKER lane. These two are the only nodes that cross, and there
+    // being exactly two is what makes the split enforceable — validation can
+    // state "an edge into a data input comes from a data output, `gate`
+    // excepted" precisely because no third crossing exists.
+
+    // Threshold — DATA in, MARKERS out. Muscle-onset detection as wiring.
+    nodes.push_back(
+        {{"node_type", "threshold"},
+         {"kind", "threshold"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Threshold"},
+         {"description",
+          "Emits a marker when a channel crosses a level and stays past it. "
+          "Turns an onset into a cue the rest of the graph can react to live — "
+          "wire it into a gate to capture only active periods, or into a viewer "
+          "to see detections on the trace. The marker is stamped at the "
+          "interpolated crossing time, not at the frame's."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "channel_index"},
+                {"label", "Channel"},
+                {"type", "number"},
+                {"required", true},
+                {"min", 0},
+                {"step", 1},
+                {"default_value", 0}},
+               {{"id", "level"},
+                {"label", "Level"},
+                {"type", "number"},
+                {"required", true},
+                {"step", 0.01},
+                {"default_value", 0}},
+               {{"id", "direction"},
+                {"label", "Direction"},
+                {"type", "enum"},
+                {"required", true},
+                {"default_option", "rising"},
+                {"options",
+                 nlohmann::json::array({"rising", "falling", "either"})},
+                {"option_labels",
+                 nlohmann::json::array({"rising — crossing upward",
+                                        "falling — crossing downward",
+                                        "either — both directions"})}},
+               {{"id", "dwell_ms"},
+                {"label", "Dwell (ms)"},
+                {"type", "number"},
+                {"required", false},
+                {"min", 0},
+                {"step", 1},
+                {"default_value", 0}},
+               {{"id", "refractory_ms"},
+                {"label", "Refractory (ms)"},
+                {"type", "number"},
+                {"required", false},
+                {"min", 0},
+                {"step", 1},
+                {"default_value", 0}}})},
+         {"input_ports", singleInputPort()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", false}});
+
+    // Gate — MARKERS + DATA in, DATA out. "Only the cue windows", as wiring.
+    nodes.push_back(
+        {{"node_type", "gate"},
+         {"kind", "gate"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Gate"},
+         {"description",
+          "Passes data only between an opening and a closing marker. This is "
+          "how \"only train on the cue windows\" becomes a wiring decision "
+          "instead of logic inside the experiment. Splits a frame at the sample "
+          "by default, so a window edge does not admit samples from outside it."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "open_label"},
+                {"label", "Opens on marker"},
+                {"type", "string"},
+                {"required", true}},
+               {{"id", "close_label"},
+                {"label", "Closes on marker"},
+                {"type", "string"},
+                {"required", true}},
+               {{"id", "edge_mode"},
+                {"label", "Frames at a window edge"},
+                {"type", "enum"},
+                {"required", true},
+                {"default_option", "split_at_sample"},
+                {"options",
+                 nlohmann::json::array({"split_at_sample", "pass_whole_frame",
+                                        "drop_partial_frame"})},
+                {"option_labels",
+                 nlohmann::json::array(
+                     {"split at the sample — exact, recommended",
+                      "pass the whole frame — admits outside samples",
+                      "drop the whole frame — loses edge data"})}}})},
+         // Two named inputs rather than one variadic: the lanes are not
+         // interchangeable here, and a port per lane is what lets validation
+         // check each one against the lane it must carry.
+         {"input_ports",
+          nlohmann::json::array({{{"id", "in"}, {"label", "Data"}},
+                                 {{"id", "markers"}, {"label", "Markers"}}})},
+         {"output_ports", singleOutputPort()},
+         {"variadic_inputs", false}});
+
+    // --- the marker-lane algebra (TEC-NATKIT-105) --------------------------
+    //
+    // Four FLAT operators. Rx's higher-order family (flatMap, switchMap,
+    // window-as-observable-of-observables) builds topology at run time, which a
+    // fixed node graph cannot draw; each of these has an obvious picture on a
+    // card. All four are marker-in/marker-out, so none of them crosses lanes.
+
+    nodes.push_back(
+        {{"node_type", "marker_merge"},
+         {"kind", "marker_merge"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Merge markers"},
+         {"description",
+          "Merges several marker streams into one, ordered by each marker's own "
+          "emitted time rather than by arrival. Use it to put an experiment's "
+          "cues and a threshold's detections on one timeline."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports", markersInputPort()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", true}});
+
+    nodes.push_back(
+        {{"node_type", "marker_filter"},
+         {"kind", "marker_filter"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Filter markers"},
+         {"description",
+          "Passes only the markers whose chosen field matches one of the given "
+          "values — \"just the cue onsets\", or everything except the rest "
+          "periods. Leave the values empty to pass everything."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "match_field"},
+                {"label", "Match on"},
+                {"type", "enum"},
+                {"required", true},
+                {"default_option", "label"},
+                {"options",
+                 nlohmann::json::array({"label", "event", "marker_type"})},
+                {"option_labels",
+                 nlohmann::json::array(
+                     {"label — the cue's name",
+                      "event — e.g. rising / falling / onset",
+                      "marker type — e.g. experiment / threshold"})}},
+               {{"id", "match_values"},
+                {"label", "Values (comma-separated)"},
+                {"type", "string"},
+                {"required", false}},
+               {{"id", "mode"},
+                {"label", "Mode"},
+                {"type", "enum"},
+                {"required", true},
+                {"default_option", "include"},
+                {"options", nlohmann::json::array({"include", "exclude"})},
+                {"option_labels",
+                 nlohmann::json::array({"include — keep only these",
+                                        "exclude — keep everything else"})}}})},
+         {"input_ports", markersInputPort()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", false}});
+
+    nodes.push_back(
+        {{"node_type", "marker_debounce"},
+         {"kind", "marker_debounce"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Debounce markers"},
+         {"description",
+          "Suppresses markers arriving within the window of the last one "
+          "passed. This is what makes a physical button or a jittery cue source "
+          "usable as a graph input at all."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "window_ms"},
+                {"label", "Window (ms)"},
+                {"type", "number"},
+                {"required", true},
+                {"min", 0},
+                {"step", 1},
+                {"default_value", 100}}})},
+         {"input_ports", markersInputPort()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", false}});
+
+    nodes.push_back(
+        {{"node_type", "marker_take_until"},
+         {"kind", "marker_take_until"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Take until"},
+         {"description",
+          "Passes markers from its first input until a marker arrives on "
+          "`until`, then stops for good. \"Until\" means by the markers' own "
+          "timestamps, not by arrival order, so the cut lands in the same place "
+          "on a replay as it did live."},
+         {"config_fields", nlohmann::json::array()},
+         {"input_ports",
+          nlohmann::json::array({{{"id", "markers"}, {"label", "Markers"}},
+                                 {{"id", "until"}, {"label", "Until"}}})},
          {"output_ports", markersOutputPort()},
          {"variadic_inputs", false}});
 
@@ -1593,7 +1857,58 @@ inline bool isProvenanceEdge(const StreamGraphEdge& edge)
 // markers as an unresolvable data input.
 inline bool isMarkerSourceKind(const std::string& kind)
 {
-    return kind == "markers" || kind == "experiment";
+    // `threshold` is the DATA -> MARKER crossing (TEC-NATKIT-109): it consumes
+    // channel frames and its output channel carries only MarkerEventV1, so to
+    // every downstream consumer it is a marker source exactly like `markers`.
+    //
+    // The four marker-lane operators (TEC-NATKIT-105) are marker sources too:
+    // they consume markers and emit markers, so they never leave the lane.
+    return kind == "markers" || kind == "experiment" || kind == "threshold" ||
+        kind == "marker_merge" || kind == "marker_filter" ||
+        kind == "marker_debounce" || kind == "marker_take_until";
+}
+
+// The marker-lane operators, which are marker-in/marker-out (TEC-NATKIT-105).
+// Grouped because every wiring site treats them identically: same port lanes,
+// same output topic shape, same validation.
+inline bool isMarkerOperatorKind(const std::string& kind)
+{
+    return kind == "marker_merge" || kind == "marker_filter" ||
+        kind == "marker_debounce" || kind == "marker_take_until";
+}
+
+// The lane a node kind's OUTPUT channel carries, and the lane each of its input
+// ports must be fed. Together these make the data/marker split enforceable
+// rather than merely intended: an edge is checked against the lane its target
+// port actually consumes.
+//
+// ⚠️ EXACTLY TWO KINDS CROSS LANES — `threshold` (data in, markers out) and
+// `gate` (markers + data in, data out). A third crossing must not be added
+// without revisiting this rule; that constraint is the point, because a node
+// which quietly accepts either lane is how the split stops meaning anything.
+enum class ChannelLane { Data, Marker };
+
+// Which lane a given input port of `kind` requires, or nullopt when the port
+// accepts either (a viewer renders both; combine and export are per-type
+// mergers that classify their own inputs).
+inline std::optional<ChannelLane> requiredInputLane(
+    const std::string& kind, const std::string& port_id)
+{
+    if (kind == "threshold") {
+        // Its whole job is reading a numeric channel; markers have no level to
+        // cross.
+        return ChannelLane::Data;
+    }
+    if (kind == "gate") {
+        return port_id == "markers" ? ChannelLane::Marker : ChannelLane::Data;
+    }
+    // Every port of every marker operator takes markers, including
+    // take-until's `until` lane. Wiring data into one is refused rather than
+    // silently ignored.
+    if (isMarkerOperatorKind(kind)) {
+        return ChannelLane::Marker;
+    }
+    return std::nullopt;
 }
 
 struct StreamGraphDefinition {
@@ -1681,7 +1996,37 @@ struct StreamGraphNodeRuntimeStatus {
     // construction. When present it includes the DATA topic id equal to
     // outputStreamId for the one-topic (backward-compat) case.
     std::vector<StreamGraphOutputTopic> outputTopics{};
+    // Combine only: frames the join discarded and the policy that discarded
+    // them, so "why is my output slower than my inputs" is answerable from the
+    // status rather than by reading the join code.
+    uint64_t framesDropped = 0;
+    std::string joinPolicy{};
+    // Per-lane marble-strip activity (TEC-NATKIT-106). A lane with total == 0 is
+    // absent rather than idle: a transform has no marker lane at all, and
+    // drawing an empty row for one would claim its markers had stopped.
+    nat::tools::ActivitySnapshot dataActivity{};
+    nat::tools::ActivitySnapshot markerActivity{};
 };
+
+// One lane's activity as the wire sees it. Offsets and buckets are relative to
+// `base_us`, so the payload is small integers rather than 19-digit absolute
+// microseconds -- this rides a 1 Hz status poll for every node at once.
+inline nlohmann::json activityToJson(const nat::tools::ActivitySnapshot& activity)
+{
+    nlohmann::json json;
+    json["window_us"] = activity.windowUs;
+    json["bucket_us"] = activity.bucketUs;
+    json["base_us"] = std::to_string(activity.baseUs);
+    json["total"] = activity.total;
+    if (activity.mode == nat::tools::ActivityMode::Exact) {
+        json["mode"] = "exact";
+        json["offsets_us"] = activity.offsetsUs;
+    } else {
+        json["mode"] = "density";
+        json["buckets"] = activity.buckets;
+    }
+    return json;
+}
 
 // Build one output-channel topic entry directly (used where no worker exists,
 // e.g. an experiment's MARKER output, a raw source's DATA topic, or the combine
@@ -1711,6 +2056,17 @@ struct LiveTransformWorkerSnapshot {
     uint64_t lastFrameAtUs = 0;
     std::string workerId{};
     std::string threadSlotId{};
+    // Combine only (TEC-NATKIT-103): frames the join discarded, and which policy
+    // discarded them. Zero and empty for a transform worker, which has one input
+    // and therefore nothing to reconcile. Kept last so the existing 4-field
+    // aggregate initializers still compile.
+    uint64_t framesDropped = 0;
+    std::string joinPolicy{};
+    // Per-lane marble-strip activity (TEC-NATKIT-106). A lane with total == 0 is
+    // absent rather than idle: a transform has no marker lane at all, and
+    // drawing an empty row for one would claim its markers had stopped.
+    nat::tools::ActivitySnapshot dataActivity{};
+    nat::tools::ActivitySnapshot markerActivity{};
 };
 
 std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
@@ -2001,6 +2357,19 @@ void to_json(nlohmann::json& json, const StreamGraphNodeRuntimeStatus& value)
     if (value.threadSlotId.has_value()) {
         json["thread_slot_id"] = value.threadSlotId.value();
     }
+    if (!value.joinPolicy.empty()) {
+        json["join_policy"] = value.joinPolicy;
+        json["frames_dropped"] = value.framesDropped;
+    }
+    // Marble-strip activity (TEC-NATKIT-106). Omitted entirely when a lane has
+    // never carried anything, so the renderer draws no row rather than an empty
+    // one -- an empty row reads as "this stopped", which is a different claim.
+    if (value.dataActivity.total > 0) {
+        json["data_activity"] = activityToJson(value.dataActivity);
+    }
+    if (value.markerActivity.total > 0) {
+        json["marker_activity"] = activityToJson(value.markerActivity);
+    }
     if (value.message.has_value()) {
         json["message"] = value.message.value();
     }
@@ -2174,7 +2543,9 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
                 std::optional<std::string>("Source stream is available to downstream nodes.")};
             continue;
         }
-        if ((node.kind == "transform" || node.kind == "combine") &&
+        if ((node.kind == "transform" || node.kind == "combine" ||
+             node.kind == "threshold" || node.kind == "gate" ||
+             isMarkerOperatorKind(node.kind)) &&
             node.outputStreamId.has_value()) {
             json["node_statuses"][node.id] = StreamGraphNodeRuntimeStatus{
                 "stopped",
@@ -2215,6 +2586,10 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
             status.lastFrameAtUs = live_worker->lastFrameAtUs;
             status.workerId = live_worker->workerId;
             status.threadSlotId = live_worker->threadSlotId;
+            status.framesDropped = live_worker->framesDropped;
+            status.joinPolicy = live_worker->joinPolicy;
+            status.dataActivity = live_worker->dataActivity;
+            status.markerActivity = live_worker->markerActivity;
             status.state =
                 classifyTransformWorkerStatus(1, status.lastFrameAtUs);
         }
@@ -3495,7 +3870,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             node.kind != "viewer" && node.kind != "sink" &&
             node.kind != "combine" && node.kind != "markers" &&
             node.kind != "experiment" && node.kind != "train" &&
-            node.kind != "export") {
+            node.kind != "export" && node.kind != "threshold" &&
+            node.kind != "gate" && !isMarkerOperatorKind(node.kind)) {
             addGraphDiagnostic(
                 result,
                 result.nodeDiagnostics[node.id],
@@ -3602,6 +3978,153 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     result.nodeDiagnostics[node.id],
                     "invalid_combine_output_ports",
                     "combine nodes must expose exactly one output port in V1.");
+            }
+            // Reported here rather than at start time: the runtime falls back to
+            // `zip` for an unrecognised policy (a graph that will not run is
+            // worse than one that runs as it used to), so validation is the only
+            // place the author is told the value did not take effect.
+            if (node.config.is_object() && node.config.contains("join_policy")) {
+                const auto requested =
+                    node.config.value("join_policy", std::string{});
+                if (!nat::tools::parseCombineJoinPolicy(requested).has_value()) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "unknown_combine_join_policy",
+                        "join_policy must be one of zip, combine_latest, "
+                        "with_latest_from, sample (got '" + requested + "').");
+                }
+            }
+        } else if (node.kind == "threshold" || node.kind == "gate" ||
+                   isMarkerOperatorKind(node.kind)) {
+            // Everything here publishes a topic, so everything here needs an
+            // identifier to publish it under, on the same rules as combine and
+            // transform.
+            if (!node.outputIdentifier.has_value() ||
+                node.outputIdentifier->empty()) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "missing_output_identifier",
+                    node.kind + " nodes require output_identifier.");
+            } else if (!isValidTopicIdentifier(node.outputIdentifier.value())) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "invalid_output_identifier",
+                    "output_identifier must match ^[A-Za-z0-9][A-Za-z0-9_-]*$.");
+            }
+            if (node.outputPortIds.size() != 1U) {
+                addGraphDiagnostic(
+                    result,
+                    result.nodeDiagnostics[node.id],
+                    "invalid_output_ports",
+                    node.kind + " nodes expose exactly one output port.");
+            }
+            if (isMarkerOperatorKind(node.kind)) {
+                // take-until's two inputs are not interchangeable, and merge
+                // needs something to merge; both are refused here rather than
+                // producing a node that runs and emits nothing.
+                const auto input_count = std::count_if(
+                    graph.edges.begin(),
+                    graph.edges.end(),
+                    [&node](const StreamGraphEdge& edge) {
+                        return edge.targetNodeId == node.id &&
+                            !isProvenanceEdge(edge);
+                    });
+                if (node.kind == "marker_merge" && input_count < 2) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "too_few_inputs",
+                        "marker_merge needs at least two connected inputs.");
+                }
+                if (node.kind == "marker_take_until") {
+                    const auto has_port = [&](const std::string& port_id) {
+                        return std::any_of(
+                            graph.edges.begin(),
+                            graph.edges.end(),
+                            [&](const StreamGraphEdge& edge) {
+                                return edge.targetNodeId == node.id &&
+                                    !isProvenanceEdge(edge) &&
+                                    edge.targetPort == port_id;
+                            });
+                    };
+                    if (!has_port("markers") || !has_port("until")) {
+                        addGraphDiagnostic(
+                            result,
+                            result.nodeDiagnostics[node.id],
+                            "missing_take_until_input",
+                            "marker_take_until needs both a 'markers' input and "
+                            "an 'until' input; with only one it either passes "
+                            "everything or nothing.");
+                    }
+                }
+                if (node.kind == "marker_filter" && node.config.is_object() &&
+                    node.config.contains("match_field")) {
+                    const auto requested =
+                        node.config.value("match_field", std::string{});
+                    if (!nat::tools::parseMarkerMatchField(requested)
+                             .has_value()) {
+                        addGraphDiagnostic(
+                            result,
+                            result.nodeDiagnostics[node.id],
+                            "unknown_marker_match_field",
+                            "match_field must be one of label, event, "
+                            "marker_type (got '" + requested + "').");
+                    }
+                }
+            } else if (node.kind == "threshold") {
+                // Reported rather than corrected: an unrecognised direction
+                // falls back to `rising` at runtime, so validation is the only
+                // place the author learns the value did not take effect. Same
+                // rule as combine's join_policy.
+                if (node.config.is_object() && node.config.contains("direction")) {
+                    const auto requested =
+                        node.config.value("direction", std::string{});
+                    if (!nat::tools::parseThresholdDirection(requested)
+                             .has_value()) {
+                        addGraphDiagnostic(
+                            result,
+                            result.nodeDiagnostics[node.id],
+                            "unknown_threshold_direction",
+                            "direction must be one of rising, falling, either "
+                            "(got '" + requested + "').");
+                    }
+                }
+            } else {
+                if (node.config.is_object() && node.config.contains("edge_mode")) {
+                    const auto requested =
+                        node.config.value("edge_mode", std::string{});
+                    if (!nat::tools::parseGateEdgeMode(requested).has_value()) {
+                        addGraphDiagnostic(
+                            result,
+                            result.nodeDiagnostics[node.id],
+                            "unknown_gate_edge_mode",
+                            "edge_mode must be one of split_at_sample, "
+                            "pass_whole_frame, drop_partial_frame (got '" +
+                                requested + "').");
+                    }
+                }
+                // A gate with no marker to open on passes nothing, for ever --
+                // a graph that runs and produces silence, which is the failure
+                // mode hardest to notice. Refused at authoring time instead.
+                const auto open_label =
+                    node.config.is_object()
+                        ? node.config.value("open_label", std::string{})
+                        : std::string{};
+                const auto close_label =
+                    node.config.is_object()
+                        ? node.config.value("close_label", std::string{})
+                        : std::string{};
+                if (open_label.empty() || close_label.empty()) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "missing_gate_labels",
+                        "gate nodes need both an opening and a closing marker "
+                        "label; without them the gate never opens.");
+                }
             }
         } else if (node.kind == "markers" || node.kind == "experiment") {
             // A markers node exposes exactly one output port, `markers` (the
@@ -3742,6 +4265,34 @@ StreamGraphValidationResult validateStreamGraphDefinition(
         if (isProvenanceEdge(edge)) {
             continue;
         }
+
+        // THE LANE RULE (TEC-NATKIT-109). A port that consumes one lane must be
+        // fed that lane. Only ports which genuinely require one are checked —
+        // a viewer renders either, and combine and export are per-type mergers
+        // that classify their own inputs — so this constrains exactly the nodes
+        // whose correctness depends on it, and says so when it refuses.
+        //
+        // Without this, the data/marker split is a design intention with
+        // nothing enforcing it: wiring markers into a threshold's level input
+        // would be accepted at author time and produce silence at run time.
+        if (const auto required =
+                requiredInputLane(target_node.kind, edge.targetPort)) {
+            const bool source_is_marker = isMarkerSourceKind(source_node.kind);
+            const auto source_lane =
+                source_is_marker ? ChannelLane::Marker : ChannelLane::Data;
+            if (source_lane != required.value()) {
+                const bool wants_marker = required.value() == ChannelLane::Marker;
+                addGraphDiagnostic(
+                    result,
+                    result.edgeDiagnostics[edge.id],
+                    wants_marker ? "expected_marker_input" : "expected_data_input",
+                    target_node.kind + "'s '" + edge.targetPort + "' port takes " +
+                        (wants_marker ? "MARKERS" : "DATA") + ", but '" +
+                        source_node.id + "' (" + source_node.kind + ") emits " +
+                        (wants_marker ? "data" : "markers") + ".");
+            }
+        }
+
         adjacency[edge.sourceNodeId].push_back(edge.targetNodeId);
         indegree[edge.targetNodeId] += 1;
     }
@@ -3829,6 +4380,38 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             }
             resolved_output_descriptors[node.id] = descriptor_maybe.value();
             node_output_schema_names[node.id] = source_topic->schemaName;
+            continue;
+        }
+
+        // A gate passes its input through, minus the samples outside the window,
+        // so its output descriptor IS its input's — a gated waveform is still
+        // that waveform. Propagating it is what lets a transform wired
+        // downstream of a gate validate its input contract at author time
+        // instead of failing at run time. (TEC-NATKIT-109.)
+        //
+        // `threshold` needs no entry here: its output is markers, and
+        // isMarkerSourceKind() is how consumers classify it.
+        if (node.kind == "gate") {
+            for (const auto& edge : graph.edges) {
+                if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                    continue;
+                }
+                if (edge.targetPort == "markers") {
+                    continue;
+                }
+                const auto upstream =
+                    resolved_output_descriptors.find(edge.sourceNodeId);
+                if (upstream != resolved_output_descriptors.end() &&
+                    upstream->second != nullptr) {
+                    resolved_output_descriptors[node.id] = upstream->second;
+                    const auto schema =
+                        node_output_schema_names.find(edge.sourceNodeId);
+                    if (schema != node_output_schema_names.end()) {
+                        node_output_schema_names[node.id] = schema->second;
+                    }
+                }
+                break;
+            }
             continue;
         }
 
@@ -5393,6 +5976,15 @@ public:
         return framesProcessed.load();
     }
 
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getDataActivity() const
+    {
+        return dataActivity.snapshot(dataActivity.newestUs());
+    }
 private:
     uint64_t sourceStreamId;
     std::string outputIdentifier;
@@ -5418,6 +6010,10 @@ private:
     std::atomic<uint64_t> lastFrameAtUs{0};
     std::atomic<uint64_t> framesProcessed{0};
     std::thread workerThread;
+    // Marble-strip activity for this worker's output lane (TEC-NATKIT-106).
+    // Records one timestamp per emitted frame into fixed storage -- deliberately
+    // not the frames, which is what keeps the strip off the data path.
+    nat::tools::ChannelActivity dataActivity{};
 
     void ensureChannelStates(size_t channel_count)
     {
@@ -6243,6 +6839,7 @@ private:
 
                 for (const auto& transformed_record : transformed_records) {
                     outputMessenger->sendMessage(transformed_record);
+                    dataActivity.record(transformed_record.getDeviceTsUs());
                 }
                 framesProcessed.fetch_add(transformed_records.size());
                 lastFrameAtUs.store(nowUs());
@@ -6277,6 +6874,9 @@ std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
         search->second->getLastFrameAtUs(),
         "natkit-local-transform-worker",
         search->second->getThreadSlotId(),
+        0,
+        std::string{},
+        search->second->getDataActivity(),
     };
 }
 
@@ -6306,6 +6906,15 @@ std::optional<size_t> findAvailableTransformSlotIndex()
 // createTransformWorker() (which precedes that registry) can fall back to it.
 std::shared_ptr<nat::core::BasicTopicInformation>
 findGraphInternalOutputTopicForStream(uint64_t stream_id);
+// The lane-crossing workers' output topics (TEC-NATKIT-109). Defined with their
+// workers, far below; declared here because the two resolvers above consult
+// every worker registry and are themselves needed by createTransformWorker.
+std::shared_ptr<nat::core::BasicTopicInformation> findGateOutputTopicForStream(
+    uint64_t stream_id);
+std::shared_ptr<nat::core::BasicTopicInformation>
+findThresholdMarkerTopicForStream(uint64_t stream_id);
+std::shared_ptr<nat::core::BasicTopicInformation> findMarkerOpTopicForStream(
+    uint64_t stream_id);
 
 // Buffering policy for graph in-process channels. Graph edges carry real-time
 // signal frames, so a full channel drops its oldest frame (matches the
@@ -6588,19 +7197,24 @@ bool stopTransformWorkerByOutputStreamId(
     return true;
 }
 
-// A `combine` node fans in N ≥ 2 upstream streams into one. Each upstream is
-// expected to already be frame-cadence-aligned with the others (e.g. several
-// feature-extraction transforms all deriving from the same sliding_window),
-// so alignment is a simple per-input FIFO: once every input has ≥1 queued
-// frame, pop one from each and concatenate. This is not general time-sync —
-// mismatched cadences will silently misalign.
+// A `combine` node fans in N ≥ 2 upstream streams into one.
+//
+// HOW the inputs are reconciled is a per-node choice, not a property of this
+// class: see CombineJoinPolicy in CombineJoin.hpp for the four policies and what
+// each is right for. This worker owns the I/O and delegates every alignment
+// decision to CombineJoiner, which is why the policies are unit-testable without
+// a broker (CombineJoinTest.cpp).
+//
+// Before TEC-NATKIT-103 there was one policy — arrival-order FIFO, later a
+// timestamp window with a hardcoded 50 ms tolerance — and no way to select
+// another, so mixed-cadence inputs misaligned silently. `zip` is still the
+// default, so a graph saved before this change behaves exactly as it did.
 struct CombineInputState {
     uint64_t sourceStreamId = 0;
     std::shared_ptr<nat::core::BasicTopicInformation> sourceTopic;
     std::unique_ptr<nat::core::TopicMessenger> sourceMessenger;
     std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
         descriptorMaybe{};
-    std::deque<NormalizedNumericChannelFrame> queue{};
 };
 
 // Topic-aware channels (Part B): a combine input can carry a MARKER topic. The
@@ -6622,7 +7236,8 @@ public:
         const std::shared_ptr<nat::core::BasicTopicInformation>& output_topic,
         std::unique_ptr<nat::core::TopicMessenger>&& output_messenger,
         const std::shared_ptr<nat::core::BasicTopicInformation>& marker_output_topic,
-        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger)
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger,
+        const nat::tools::CombineJoinConfig& join_config)
         : outputIdentifier(output_identifier),
           slotIndex(slot_index),
           inputs(std::move(inputs)),
@@ -6630,7 +7245,9 @@ public:
           outputTopic(output_topic),
           outputMessenger(std::move(output_messenger)),
           markerOutputTopic(marker_output_topic),
-          markerOutputMessenger(std::move(marker_output_messenger))
+          markerOutputMessenger(std::move(marker_output_messenger)),
+          joinConfig(join_config),
+          joiner(this->inputs.size(), join_config)
     {
     }
 
@@ -6718,13 +7335,34 @@ public:
         return framesProcessed.load();
     }
 
-private:
-    static constexpr size_t kMaxQueuedFramesPerInput = 64;
-    // Two frames align if their device_ts_us differ by <= this (Phase 5). ~half
-    // a typical windowed-feature cadence; tolerant enough for jittered live
-    // frames, tight enough that replay pairs the right frames across streams.
-    static constexpr uint64_t kAlignToleranceUs = 50'000;  // 50 ms
+    // Frames the join discarded rather than emitted. Reported on the node's
+    // status so a policy that drops is LOUD about it — silent dropping is the
+    // whole complaint TEC-NATKIT-103 was filed about, and a policy that drops
+    // visibly is a legitimate choice.
+    uint64_t getFramesDropped() const
+    {
+        return framesDropped.load();
+    }
 
+    const char* getJoinPolicyName() const
+    {
+        return nat::tools::combineJoinPolicyName(joinConfig.policy);
+    }
+
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getDataActivity() const
+    {
+        return dataActivity.snapshot(dataActivity.newestUs());
+    }
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
+private:
     std::string outputIdentifier;
     size_t slotIndex;
     std::vector<CombineInputState> inputs;
@@ -6738,15 +7376,30 @@ private:
     std::atomic<uint64_t> startedAtUs{0};
     std::atomic<uint64_t> lastFrameAtUs{0};
     std::atomic<uint64_t> framesProcessed{0};
+    std::atomic<uint64_t> framesDropped{0};
     std::thread workerThread;
+    // ⚠️ MUST be declared after `inputs`: the constructor sizes the joiner from
+    // inputs.size(), and members initialize in declaration order.
+    nat::tools::CombineJoinConfig joinConfig{};
+    nat::tools::CombineJoiner<NormalizedNumericChannelFrame> joiner;
+    // Combine is the one worker with BOTH lanes: it merges data and interleaves
+    // markers, and the strip showing them as two rows is how a marker lane's
+    // behaviour becomes visible at all.
+    nat::tools::ChannelActivity dataActivity{};
+    nat::tools::ChannelActivity markerActivity{};
 
     // Flattens every input frame down to one scalar per (channel, sample)
     // pair and concatenates them all into a single samplesPerChannel==1
     // output frame — a flat feature vector regardless of how many samples
     // per channel each individual input carried (e.g. mixing mav's 1-per-
     // channel output with ar_coeffs' ar_order-per-channel output).
+    // `output_ts_us` is the joiner's decision, not this function's: which clock
+    // stamps a merged frame differs per policy (the group's lead under zip, the
+    // newest constituent under combineLatest, the primary's under
+    // withLatestFrom, the tick's under sample). See CombineJoin.hpp.
     nat::core::NatSignalFrameDataSchemaV1 concatenate(
-        const std::vector<NormalizedNumericChannelFrame>& frames)
+        const std::vector<NormalizedNumericChannelFrame>& frames,
+        uint64_t output_ts_us)
     {
         std::vector<std::string> labels{};
         std::vector<float> samples{};
@@ -6779,7 +7432,7 @@ private:
         return nat::core::NatSignalFrameDataSchemaV1(
             lead.deviceId,
             outputSeqNo++,
-            lead.deviceTsUs,
+            output_ts_us,
             lead.sampleRateHz,
             labels,
             samples,
@@ -6791,12 +7444,13 @@ private:
     // samples-per-channel, so a raw waveform stays a waveform instead of being
     // flattened into a one-sample-per-channel feature vector by concatenate().
     nat::core::NatSignalFrameDataSchemaV1 passThrough(
-        const NormalizedNumericChannelFrame& frame)
+        const NormalizedNumericChannelFrame& frame,
+        uint64_t output_ts_us)
     {
         return nat::core::NatSignalFrameDataSchemaV1(
             frame.deviceId,
             outputSeqNo++,
-            frame.deviceTsUs,
+            output_ts_us,
             frame.sampleRateHz,
             frame.channelLabels,
             frame.samples,
@@ -6806,12 +7460,15 @@ private:
     void run()
     {
         LOG_INFO << "StreamViewer: Starting combine worker inputs=" << inputs.size()
-                 << " output=" << getOutputTopic();
+                 << " output=" << getOutputTopic()
+                 << " join=" << getJoinPolicyName();
 
         while (active.load()) {
             try {
                 bool made_progress = false;
-                for (auto& input : inputs) {
+                for (size_t input_index = 0; input_index < inputs.size();
+                     ++input_index) {
+                    auto& input = inputs[input_index];
                     const auto message_maybe = input.sourceMessenger->tryGetNexMessage();
                     if (!message_maybe.has_value()) {
                         continue;
@@ -6830,10 +7487,7 @@ private:
                     if (!normalized.has_value()) {
                         continue;
                     }
-                    input.queue.push_back(normalized.value());
-                    while (input.queue.size() > kMaxQueuedFramesPerInput) {
-                        input.queue.pop_front();
-                    }
+                    joiner.push(input_index, normalized.value());
                 }
 
                 // Marker lane (Part B): forward every MarkerEventV1 from each
@@ -6858,73 +7512,35 @@ private:
                         continue;  // not a marker event; skip defensively
                     }
                     markerOutputMessenger->sendMessage(*record);
+                    markerActivity.record(record->getTimestampUs());
                     framesProcessed.fetch_add(1);
                     lastFrameAtUs.store(nowUs());
                 }
 
-                bool all_ready = !inputs.empty();
-                for (const auto& input : inputs) {
-                    if (input.queue.empty()) {
-                        all_ready = false;
+                // Drain, do not poll once: CombineLatest can owe several
+                // emissions after one polling pass (one per arrival), and Sample
+                // can owe several ticks after a fast replay advances the data
+                // clock. Emitting at most one per pass would silently rate-limit
+                // the output to the poll loop's cadence.
+                while (const auto emission = joiner.tryEmit()) {
+                    const auto& frames = emission->frames;
+                    if (frames.empty()) {
                         break;
                     }
+                    // One data input (e.g. data+markers "stream"): pass it
+                    // through so the waveform is preserved. Two or more: concat
+                    // into a feature vector (the genuine numeric merge).
+                    outputMessenger->sendMessage(
+                        frames.size() == 1
+                            ? passThrough(frames.front(), emission->outputTsUs)
+                            : concatenate(frames, emission->outputTsUs));
+                    dataActivity.record(emission->outputTsUs);
+                    framesProcessed.fetch_add(1);
+                    lastFrameAtUs.store(nowUs());
+                    made_progress = true;
                 }
-
-                if (all_ready) {
-                    // Timestamp-aligned combine (Phase 5, Part E): align inputs
-                    // by device_ts_us, not arrival order. FIFO ("pop the front
-                    // of each") silently misaligns mismatched cadences and is
-                    // wrong for replay; here we emit one concatenated frame per
-                    // aligned timestamp group. Each queue is time-ordered, so the
-                    // front is the oldest unconsumed frame per input.
-                    //
-                    // target = the newest of the per-input fronts: every input
-                    // must have reached at least this time to align here.
-                    uint64_t target_ts = 0;
-                    for (const auto& input : inputs) {
-                        target_ts =
-                            std::max(target_ts, input.queue.front().deviceTsUs);
-                    }
-                    // Drop unmatchably-old frames (a faster input's frames with
-                    // no counterpart near target), keeping at least one.
-                    for (auto& input : inputs) {
-                        while (input.queue.size() > 1 &&
-                               input.queue.front().deviceTsUs +
-                                       kAlignToleranceUs <
-                                   target_ts) {
-                            input.queue.pop_front();
-                        }
-                    }
-                    // Aligned only if every input's front is within tolerance of
-                    // the target; otherwise wait for a lagging input to catch up.
-                    bool aligned_ready = true;
-                    for (const auto& input : inputs) {
-                        const uint64_t ts = input.queue.front().deviceTsUs;
-                        const uint64_t diff =
-                            ts > target_ts ? ts - target_ts : target_ts - ts;
-                        if (diff > kAlignToleranceUs) {
-                            aligned_ready = false;
-                            break;
-                        }
-                    }
-                    if (aligned_ready) {
-                        std::vector<NormalizedNumericChannelFrame> aligned{};
-                        aligned.reserve(inputs.size());
-                        for (auto& input : inputs) {
-                            aligned.push_back(input.queue.front());
-                            input.queue.pop_front();
-                        }
-                        // One data input (e.g. data+markers "stream"): pass it
-                        // through so the waveform is preserved. Two or more: concat
-                        // into a feature vector (the genuine numeric merge).
-                        outputMessenger->sendMessage(
-                            aligned.size() == 1 ? passThrough(aligned.front())
-                                                : concatenate(aligned));
-                        framesProcessed.fetch_add(1);
-                        lastFrameAtUs.store(nowUs());
-                        made_progress = true;
-                    }
-                }
+                framesDropped.store(
+                    joiner.droppedUnmatched() + joiner.droppedOverflow());
 
                 if (!made_progress) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -6966,6 +7582,13 @@ findGraphInternalOutputTopicForStream(uint64_t stream_id)
             return search->second->getOutputTopicInfo();
         }
     }
+    // A gate's output is a DATA topic like any other derived stream, so a node
+    // wired downstream of one must be able to resolve it before the gate has
+    // published its first admitted frame -- which, for a gate, may be a long
+    // time after the graph starts. (TEC-NATKIT-109.)
+    if (const auto gate_topic = findGateOutputTopicForStream(stream_id)) {
+        return gate_topic;
+    }
     return nullptr;
 }
 
@@ -6976,10 +7599,24 @@ findGraphInternalOutputTopicForStream(uint64_t stream_id)
 std::shared_ptr<nat::core::BasicTopicInformation>
 findGraphInternalMarkerTopicForStream(uint64_t stream_id)
 {
-    std::lock_guard<std::mutex> lock(g_combine_mutex);
-    const auto search = g_combine_workers.find(stream_id);
-    if (search != g_combine_workers.end() && search->second) {
-        return search->second->getMarkerOutputTopicInfo();
+    {
+        std::lock_guard<std::mutex> lock(g_combine_mutex);
+        const auto search = g_combine_workers.find(stream_id);
+        if (search != g_combine_workers.end() && search->second) {
+            return search->second->getMarkerOutputTopicInfo();
+        }
+    }
+    // Same race, sharper: a threshold publishes nothing until the signal
+    // actually crosses its level, so a gate wired to one would otherwise fail to
+    // bind its marker input on every graph start. (TEC-NATKIT-109.)
+    if (const auto threshold_topic = findThresholdMarkerTopicForStream(stream_id)) {
+        return threshold_topic;
+    }
+    // And a marker operator's own output, for operators chained together --
+    // filter into debounce into take-until is the expected shape, and each link
+    // has the same "publishes nothing yet" problem.
+    if (const auto marker_op_topic = findMarkerOpTopicForStream(stream_id)) {
+        return marker_op_topic;
     }
     return nullptr;
 }
@@ -6998,17 +7635,45 @@ std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
         search->second->getLastFrameAtUs(),
         "natkit-local-combine-worker",
         search->second->getThreadSlotId(),
+        search->second->getFramesDropped(),
+        search->second->getJoinPolicyName(),
+        search->second->getDataActivity(),
+        search->second->getMarkerActivity(),
     };
 }
+
+std::optional<LiveTransformWorkerSnapshot> getLiveThresholdWorkerSnapshot(
+    uint64_t output_stream_id);
+std::optional<LiveTransformWorkerSnapshot> getLiveGateWorkerSnapshot(
+    uint64_t output_stream_id);
+std::optional<LiveTransformWorkerSnapshot> getLiveMarkerOpWorkerSnapshot(
+    uint64_t output_stream_id);
 
 std::optional<LiveTransformWorkerSnapshot> getLiveGraphWorkerSnapshot(
     uint64_t output_stream_id)
 {
+    // A node's output_stream_id lives in exactly one registry. Every worker kind
+    // must be listed here: a kind that is missing reports no live worker at all,
+    // and makeGraphStatusJson then downgrades a perfectly healthy node to
+    // "blocked" -- a lie that looks like a runtime fault.
     const auto transform_snapshot = getLiveTransformWorkerSnapshot(output_stream_id);
     if (transform_snapshot.has_value()) {
         return transform_snapshot;
     }
-    return getLiveCombineWorkerSnapshot(output_stream_id);
+    const auto combine_snapshot = getLiveCombineWorkerSnapshot(output_stream_id);
+    if (combine_snapshot.has_value()) {
+        return combine_snapshot;
+    }
+    const auto threshold_snapshot =
+        getLiveThresholdWorkerSnapshot(output_stream_id);
+    if (threshold_snapshot.has_value()) {
+        return threshold_snapshot;
+    }
+    const auto gate_snapshot = getLiveGateWorkerSnapshot(output_stream_id);
+    if (gate_snapshot.has_value()) {
+        return gate_snapshot;
+    }
+    return getLiveMarkerOpWorkerSnapshot(output_stream_id);
 }
 
 struct CreateCombineWorkerResult {
@@ -7033,11 +7698,49 @@ struct CombineWorkerInput {
     int64_t startOffset = -1;
 };
 
+// Reads a combine node's join policy out of its generic node config. Unknown or
+// malformed values fall back to the historical behaviour rather than refusing to
+// start, because a graph that will not run is a worse outcome than one that runs
+// as it did before — validation (validateStreamGraph) is where a bad policy is
+// reported to the author, and it runs before this does.
+nat::tools::CombineJoinConfig parseCombineJoinConfig(const nlohmann::json& config)
+{
+    nat::tools::CombineJoinConfig join_config;
+    if (!config.is_object()) {
+        return join_config;
+    }
+    const auto policy_maybe = nat::tools::parseCombineJoinPolicy(
+        config.value("join_policy", std::string{"zip"}));
+    if (policy_maybe.has_value()) {
+        join_config.policy = policy_maybe.value();
+    }
+    // Milliseconds on the wire (what the inspector shows), microseconds
+    // internally (what device_ts_us is in). A zero tolerance is legitimate —
+    // it means "exact timestamp equality" — so only a negative is rejected.
+    if (config.contains("align_tolerance_ms") &&
+        config["align_tolerance_ms"].is_number()) {
+        const double ms = config["align_tolerance_ms"].get<double>();
+        if (ms >= 0.0) {
+            join_config.alignToleranceUs = static_cast<uint64_t>(ms * 1000.0);
+        }
+    }
+    if (config.contains("sample_rate_hz") &&
+        config["sample_rate_hz"].is_number()) {
+        const double hz = config["sample_rate_hz"].get<double>();
+        if (hz > 0.0) {
+            join_config.samplePeriodUs =
+                static_cast<uint64_t>(1'000'000.0 / hz);
+        }
+    }
+    return join_config;
+}
+
 CreateCombineWorkerResult createCombineWorker(
     const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
     const std::vector<CombineWorkerInput>& input_channels,
     const std::string& output_identifier,
-    bool output_in_process = false)
+    bool output_in_process = false,
+    const nat::tools::CombineJoinConfig& join_config = {})
 {
     CreateCombineWorkerResult result;
     result.outputIdentifier = output_identifier;
@@ -7237,7 +7940,8 @@ CreateCombineWorkerResult createCombineWorker(
             out_data_topic,
             std::move(out_data_messenger),
             out_marker_topic,
-            std::move(out_marker_messenger));
+            std::move(out_marker_messenger),
+            join_config);
         g_combine_workers.emplace(output_stream_id, worker);
     }
     worker->start();
@@ -7246,6 +7950,1151 @@ CreateCombineWorkerResult createCombineWorker(
     result.threadSlotId = worker->getThreadSlotId();
     return result;
 }
+
+
+// ===== The two lane-crossing workers (TEC-NATKIT-109) =====================
+//
+// threshold: DATA in  -> MARKER out
+// gate:      DATA + MARKER in -> DATA out
+//
+// Every alignment/detection decision lives in ThresholdDetect.hpp and
+// SampleGate.hpp, which know nothing about transports; these classes are the I/O
+// shells around them. Same split as CombineWorker/CombineJoiner, for the same
+// reason: the logic worth testing is testable without a broker.
+
+// Reads a threshold node's detector settings out of its generic node config.
+// Milliseconds on the wire (what the inspector shows), microseconds internally
+// (what device_ts_us is in). An unrecognised direction falls back to rising and
+// is reported by validation, never silently at run time.
+struct ThresholdWorkerSettings {
+    nat::tools::ThresholdConfig detect{};
+    std::string markerLabel{};
+};
+
+ThresholdWorkerSettings parseThresholdSettings(
+    const nlohmann::json& config, const std::string& fallback_label)
+{
+    ThresholdWorkerSettings settings;
+    settings.markerLabel = fallback_label;
+    if (!config.is_object()) {
+        return settings;
+    }
+    if (config.contains("level") && config["level"].is_number()) {
+        settings.detect.level = config["level"].get<double>();
+    }
+    if (const auto direction = nat::tools::parseThresholdDirection(
+            config.value("direction", std::string{"rising"}))) {
+        settings.detect.direction = direction.value();
+    }
+    if (config.contains("dwell_ms") && config["dwell_ms"].is_number()) {
+        const double ms = config["dwell_ms"].get<double>();
+        if (ms > 0.0) settings.detect.dwellUs = static_cast<uint64_t>(ms * 1000.0);
+    }
+    if (config.contains("refractory_ms") && config["refractory_ms"].is_number()) {
+        const double ms = config["refractory_ms"].get<double>();
+        if (ms > 0.0) {
+            settings.detect.refractoryUs = static_cast<uint64_t>(ms * 1000.0);
+        }
+    }
+    if (config.contains("channel_index") && config["channel_index"].is_number()) {
+        const double index = config["channel_index"].get<double>();
+        if (index >= 0.0) {
+            settings.detect.channelIndex = static_cast<size_t>(index);
+        }
+    }
+    const auto label = config.value("marker_label", std::string{});
+    if (!label.empty()) {
+        settings.markerLabel = label;
+    }
+    return settings;
+}
+
+class ThresholdWorker {
+public:
+    ThresholdWorker(
+        const std::string& output_identifier,
+        size_t slot_index,
+        uint64_t source_stream_id,
+        std::unique_ptr<nat::core::TopicMessenger>&& source_messenger,
+        std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
+            descriptor_maybe,
+        const std::shared_ptr<nat::core::BasicTopicInformation>& marker_output_topic,
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger,
+        const ThresholdWorkerSettings& settings)
+        : outputIdentifier(output_identifier),
+          slotIndex(slot_index),
+          sourceStreamId(source_stream_id),
+          sourceMessenger(std::move(source_messenger)),
+          descriptorMaybe(std::move(descriptor_maybe)),
+          markerOutputTopic(marker_output_topic),
+          markerOutputMessenger(std::move(marker_output_messenger)),
+          settings(settings),
+          detector(settings.detect)
+    {
+    }
+
+    ~ThresholdWorker() { stop(); }
+
+    void start()
+    {
+        if (workerThread.joinable()) return;
+        active = true;
+        startedAtUs.store(nowUs());
+        workerThread = std::thread(&ThresholdWorker::run, this);
+    }
+
+    void stop()
+    {
+        active = false;
+        if (workerThread.joinable()) workerThread.join();
+    }
+
+    uint64_t getOutputStreamId() const
+    {
+        return markerOutputTopic ? markerOutputTopic->id : 0;
+    }
+    std::string getOutputTopic() const
+    {
+        return markerOutputTopic ? markerOutputTopic->toTopicString() : std::string{};
+    }
+    std::shared_ptr<nat::core::BasicTopicInformation> getMarkerOutputTopicInfo() const
+    {
+        return markerOutputTopic;
+    }
+    const std::string& getOutputIdentifier() const { return outputIdentifier; }
+    size_t getSlotIndex() const { return slotIndex; }
+    std::string getThreadSlotId() const
+    {
+        std::ostringstream stream;
+        stream << "natkit-local-threshold-worker:slot-";
+        stream << std::setw(2) << std::setfill('0') << (slotIndex + 1);
+        return stream.str();
+    }
+    uint64_t getStartedAtUs() const { return startedAtUs.load(); }
+    uint64_t getLastFrameAtUs() const { return lastFrameAtUs.load(); }
+    uint64_t getFramesProcessed() const { return framesProcessed.load(); }
+    // Crossings the refractory window swallowed. A rising count is the signal
+    // that the level sits inside the noise floor, which is the difference
+    // between a detector that works and one that is merely quiet.
+    uint64_t getFramesDropped() const { return suppressed.load(); }
+
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
+private:
+    void run()
+    {
+        LOG_INFO << "StreamViewer: Starting threshold worker source="
+                 << sourceStreamId << " output=" << getOutputTopic()
+                 << " level=" << settings.detect.level
+                 << " direction="
+                 << nat::tools::thresholdDirectionName(settings.detect.direction);
+
+        while (active.load()) {
+            try {
+                const auto message_maybe = sourceMessenger->tryGetNexMessage();
+                if (!message_maybe.has_value()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+                std::unique_ptr<nat::core::Schema> message =
+                    std::move(message_maybe.value());
+                if (!descriptorMaybe.has_value() || !descriptorMaybe.value()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    continue;
+                }
+                const auto normalized = tryNormalizeNumericChannelFrame(
+                    *message, *descriptorMaybe.value(), std::nullopt,
+                    sourceStreamId);
+                if (!normalized.has_value()) continue;
+
+                const auto& frame = normalized.value();
+                // Samples are channel-major: channel c's run starts at
+                // c * samplesPerChannel.
+                const size_t per_channel = frame.samplesPerChannel;
+                if (per_channel == 0) continue;
+                const size_t base = settings.detect.channelIndex * per_channel;
+                std::vector<float> channel;
+                channel.reserve(per_channel);
+                for (size_t index = 0; index < per_channel; ++index) {
+                    channel.push_back(
+                        base + index < frame.samples.size()
+                            ? frame.samples[base + index]
+                            : 0.0f);
+                }
+
+                const auto crossings =
+                    detector.push(frame.deviceTsUs, frame.sampleRateHz, channel);
+                for (const auto& crossing : crossings) {
+                    markerOutputMessenger->sendMessage(buildMarker(frame, crossing));
+                    markerActivity.record(crossing.atUs);
+                    framesProcessed.fetch_add(1);
+                    lastFrameAtUs.store(nowUs());
+                }
+                suppressed.store(detector.suppressedByRefractory());
+            } catch (const std::exception& ex) {
+                LOG_ERROR << "StreamViewer: threshold worker error: " << ex.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+
+        LOG_INFO << "StreamViewer: Stopped threshold worker output="
+                 << getOutputTopic();
+    }
+
+    nat::core::MarkerEventV1 buildMarker(
+        const NormalizedNumericChannelFrame& frame,
+        const nat::tools::ThresholdCrossing& crossing)
+    {
+        // `event` is the direction and `label` is the user's name for this
+        // detector. A gate matches on EITHER, which is what lets one threshold
+        // in `either` mode open a gate on its rising edge and close it on its
+        // falling edge -- "capture while active", with two nodes.
+        nlohmann::json attributes;
+        attributes["level"] = crossing.level;
+        attributes["value"] = crossing.value;
+        attributes["channel_index"] =
+            static_cast<uint64_t>(settings.detect.channelIndex);
+        if (settings.detect.channelIndex < frame.channelLabels.size()) {
+            attributes["channel_label"] =
+                frame.channelLabels[settings.detect.channelIndex];
+        }
+        attributes["source_device_id"] = frame.deviceId;
+        std::ostringstream marker_id;
+        marker_id << outputIdentifier << "-" << (++markerSeqNo);
+        return nat::core::MarkerEventV1(
+            outputIdentifier,
+            "threshold",
+            marker_id.str(),
+            crossing.rising ? "rising" : "falling",
+            settings.markerLabel,
+            crossing.atUs,
+            attributes.dump());
+    }
+
+    std::string outputIdentifier;
+    size_t slotIndex;
+    uint64_t sourceStreamId = 0;
+    std::unique_ptr<nat::core::TopicMessenger> sourceMessenger;
+    std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
+        descriptorMaybe{};
+    std::shared_ptr<nat::core::BasicTopicInformation> markerOutputTopic;
+    std::unique_ptr<nat::core::TopicMessenger> markerOutputMessenger;
+    ThresholdWorkerSettings settings{};
+    nat::tools::ThresholdDetector detector;
+    nat::tools::ChannelActivity markerActivity{};
+    uint64_t markerSeqNo = 0;
+    std::atomic<bool> active{false};
+    std::atomic<uint64_t> startedAtUs{0};
+    std::atomic<uint64_t> lastFrameAtUs{0};
+    std::atomic<uint64_t> framesProcessed{0};
+    std::atomic<uint64_t> suppressed{0};
+    std::thread workerThread;
+};
+
+std::mutex g_threshold_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<ThresholdWorker>> g_threshold_workers;
+
+std::optional<LiveTransformWorkerSnapshot> getLiveThresholdWorkerSnapshot(
+    uint64_t output_stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_threshold_mutex);
+    const auto search = g_threshold_workers.find(output_stream_id);
+    if (search == g_threshold_workers.end() || !search->second) {
+        return std::nullopt;
+    }
+    return LiveTransformWorkerSnapshot{
+        search->second->getFramesProcessed(),
+        search->second->getLastFrameAtUs(),
+        "natkit-local-threshold-worker",
+        search->second->getThreadSlotId(),
+        search->second->getFramesDropped(),
+        std::string{},
+        nat::tools::ActivitySnapshot{},
+        search->second->getMarkerActivity(),
+    };
+}
+
+std::shared_ptr<nat::core::BasicTopicInformation>
+findThresholdMarkerTopicForStream(uint64_t stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_threshold_mutex);
+    const auto search = g_threshold_workers.find(stream_id);
+    if (search != g_threshold_workers.end() && search->second) {
+        return search->second->getMarkerOutputTopicInfo();
+    }
+    return nullptr;
+}
+
+bool stopThresholdWorkerByOutputStreamId(uint64_t output_stream_id)
+{
+    std::shared_ptr<ThresholdWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_threshold_mutex);
+        const auto search = g_threshold_workers.find(output_stream_id);
+        if (search == g_threshold_workers.end()) return false;
+        worker = search->second;
+        g_threshold_workers.erase(search);
+    }
+    if (worker) worker->stop();
+    return true;
+}
+
+struct CreateLaneWorkerResult {
+    bool ok = false;
+    bool alreadyExists = false;
+    std::string error{};
+    uint64_t outputStreamId = 0;
+    std::string outputIdentifier{};
+    std::string workerId{};
+    std::string threadSlotId{};
+    std::vector<StreamGraphOutputTopic> outputTopics{};
+};
+
+CreateLaneWorkerResult createThresholdWorker(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    uint64_t source_stream_id,
+    const std::string& output_identifier,
+    const nlohmann::json& node_config,
+    bool input_in_process,
+    int64_t source_start_offset)
+{
+    CreateLaneWorkerResult result;
+    result.outputIdentifier = output_identifier;
+    result.workerId = "natkit-local-threshold-worker";
+    if (!broker_manager) {
+        result.error = "Broker manager not available";
+        return result;
+    }
+
+    auto source_topic = nat::tools::resolveGraphSourceTopic(
+        source_stream_id,
+        [&](uint64_t id) {
+            return findTransformSourceTopicForStream(broker_manager, id);
+        },
+        findGraphInternalOutputTopicForStream);
+    if (source_topic == nullptr) {
+        result.error = "Could not locate a DATA topic for the threshold's input";
+        return result;
+    }
+    auto descriptor_maybe =
+        nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
+            source_topic->schemaName);
+    if (!descriptor_maybe.has_value()) {
+        result.error = "No descriptor is available for the threshold's input";
+        return result;
+    }
+
+    // Markers never ride an in-process channel (meta/marker topics are always
+    // Kafka), so only the INPUT side can take the fast path.
+    const auto marker_output_topic = createTopicInfo(
+        nat::core::StreamType::MARKER, "threshold", output_identifier,
+        nat::core::MarkerEventV1::name);
+    if (marker_output_topic == nullptr) {
+        result.error = "Failed to create topic information for threshold";
+        return result;
+    }
+    const uint64_t output_stream_id = marker_output_topic->id;
+    result.outputStreamId = output_stream_id;
+
+    std::shared_ptr<ThresholdWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_threshold_mutex);
+        const auto duplicate = g_threshold_workers.find(output_stream_id);
+        if (duplicate != g_threshold_workers.end() && duplicate->second) {
+            result.ok = true;
+            result.alreadyExists = true;
+            result.threadSlotId = duplicate->second->getThreadSlotId();
+            result.outputTopics.push_back(makeChannelTopic(
+                nat::core::StreamType::MARKER, output_stream_id,
+                nat::core::MarkerEventV1::name));
+            return result;
+        }
+        worker = std::make_shared<ThresholdWorker>(
+            output_identifier,
+            g_threshold_workers.size(),
+            source_stream_id,
+            makeGraphSourceMessenger(
+                broker_manager, source_topic, input_in_process,
+                source_start_offset),
+            descriptor_maybe.value(),
+            marker_output_topic,
+            makeGraphOutputMessenger(broker_manager, marker_output_topic, false),
+            parseThresholdSettings(node_config, output_identifier));
+        g_threshold_workers.emplace(output_stream_id, worker);
+    }
+    worker->start();
+
+    result.ok = true;
+    result.threadSlotId = worker->getThreadSlotId();
+    result.outputTopics.push_back(makeChannelTopic(
+        nat::core::StreamType::MARKER, output_stream_id,
+        nat::core::MarkerEventV1::name));
+    return result;
+}
+
+// --- gate -----------------------------------------------------------------
+
+struct GateWorkerSettings {
+    nat::tools::SampleGateConfig gate{};
+    std::string openLabel{};
+    std::string closeLabel{};
+};
+
+GateWorkerSettings parseGateSettings(const nlohmann::json& config)
+{
+    GateWorkerSettings settings;
+    if (!config.is_object()) return settings;
+    if (const auto mode = nat::tools::parseGateEdgeMode(
+            config.value("edge_mode", std::string{"split_at_sample"}))) {
+        settings.gate.edgeMode = mode.value();
+    }
+    settings.openLabel = config.value("open_label", std::string{});
+    settings.closeLabel = config.value("close_label", std::string{});
+    return settings;
+}
+
+class GateWorker {
+public:
+    GateWorker(
+        const std::string& output_identifier,
+        size_t slot_index,
+        uint64_t data_source_stream_id,
+        std::unique_ptr<nat::core::TopicMessenger>&& data_messenger,
+        std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
+            descriptor_maybe,
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_messenger,
+        const std::shared_ptr<nat::core::BasicTopicInformation>& data_output_topic,
+        std::unique_ptr<nat::core::TopicMessenger>&& data_output_messenger,
+        const GateWorkerSettings& settings)
+        : outputIdentifier(output_identifier),
+          slotIndex(slot_index),
+          dataSourceStreamId(data_source_stream_id),
+          dataMessenger(std::move(data_messenger)),
+          descriptorMaybe(std::move(descriptor_maybe)),
+          markerMessenger(std::move(marker_messenger)),
+          dataOutputTopic(data_output_topic),
+          dataOutputMessenger(std::move(data_output_messenger)),
+          settings(settings),
+          gate(settings.gate)
+    {
+    }
+
+    ~GateWorker() { stop(); }
+
+    void start()
+    {
+        if (workerThread.joinable()) return;
+        active = true;
+        startedAtUs.store(nowUs());
+        workerThread = std::thread(&GateWorker::run, this);
+    }
+
+    void stop()
+    {
+        active = false;
+        if (workerThread.joinable()) workerThread.join();
+    }
+
+    uint64_t getOutputStreamId() const
+    {
+        return dataOutputTopic ? dataOutputTopic->id : 0;
+    }
+    std::string getOutputTopic() const
+    {
+        return dataOutputTopic ? dataOutputTopic->toTopicString() : std::string{};
+    }
+    std::shared_ptr<nat::core::BasicTopicInformation> getOutputTopicInfo() const
+    {
+        return dataOutputTopic;
+    }
+    const std::string& getOutputIdentifier() const { return outputIdentifier; }
+    size_t getSlotIndex() const { return slotIndex; }
+    std::string getThreadSlotId() const
+    {
+        std::ostringstream stream;
+        stream << "natkit-local-gate-worker:slot-";
+        stream << std::setw(2) << std::setfill('0') << (slotIndex + 1);
+        return stream.str();
+    }
+    uint64_t getStartedAtUs() const { return startedAtUs.load(); }
+    uint64_t getLastFrameAtUs() const { return lastFrameAtUs.load(); }
+    uint64_t getFramesProcessed() const { return framesProcessed.load(); }
+    // Samples the gate refused. Reported in SAMPLES, not frames: once a frame is
+    // split at the sample, a frame-granular count means nothing.
+    uint64_t getFramesDropped() const { return rejected.load(); }
+
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getDataActivity() const
+    {
+        return dataActivity.snapshot(dataActivity.newestUs());
+    }
+private:
+    void run()
+    {
+        LOG_INFO << "StreamViewer: Starting gate worker source="
+                 << dataSourceStreamId << " output=" << getOutputTopic()
+                 << " opens_on='" << settings.openLabel << "' closes_on='"
+                 << settings.closeLabel << "' edge="
+                 << nat::tools::gateEdgeModeName(settings.gate.edgeMode);
+
+        while (active.load()) {
+            try {
+                bool made_progress = false;
+
+                // Markers first: lifting the watermark before feeding data lets
+                // buffered frames be answered in the same pass.
+                if (markerMessenger != nullptr) {
+                    const auto marker_maybe = markerMessenger->tryGetNexMessage();
+                    if (marker_maybe.has_value()) {
+                        made_progress = true;
+                        std::unique_ptr<nat::core::Schema> record =
+                            std::move(marker_maybe.value());
+                        auto* marker =
+                            dynamic_cast<nat::core::MarkerEventV1*>(record.get());
+                        if (marker != nullptr) {
+                            applyMarker(*marker);
+                        }
+                    }
+                }
+
+                const auto message_maybe = dataMessenger->tryGetNexMessage();
+                if (message_maybe.has_value()) {
+                    made_progress = true;
+                    std::unique_ptr<nat::core::Schema> message =
+                        std::move(message_maybe.value());
+                    if (descriptorMaybe.has_value() && descriptorMaybe.value()) {
+                        const auto normalized = tryNormalizeNumericChannelFrame(
+                            *message, *descriptorMaybe.value(), std::nullopt,
+                            dataSourceStreamId);
+                        if (normalized.has_value()) {
+                            gate.pushFrame(normalized.value());
+                        }
+                    }
+                }
+
+                // Drain: one frame can yield several spans when a window opens
+                // and closes inside it.
+                while (const auto span = gate.tryEmit()) {
+                    dataOutputMessenger->sendMessage(slice(*span));
+                    dataActivity.record(span->startTsUs);
+                    framesProcessed.fetch_add(1);
+                    lastFrameAtUs.store(nowUs());
+                    made_progress = true;
+                }
+                rejected.store(gate.samplesRejected());
+
+                if (!made_progress) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            } catch (const std::exception& ex) {
+                LOG_ERROR << "StreamViewer: gate worker error: " << ex.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+
+        LOG_INFO << "StreamViewer: Stopped gate worker output="
+                 << getOutputTopic();
+    }
+
+    // A marker opens or closes the gate when its LABEL or its EVENT matches.
+    // Matching both is what makes one config work for an experiment's cues
+    // (which carry a cue name in `label`) and for a threshold's crossings
+    // (which carry "rising"/"falling" in `event`).
+    void applyMarker(const nat::core::MarkerEventV1& marker)
+    {
+        const auto matches = [&](const std::string& wanted) {
+            return !wanted.empty() &&
+                (marker.getLabel() == wanted || marker.getEvent() == wanted);
+        };
+        if (matches(settings.openLabel)) {
+            gate.pushMarker(marker.getEmittedAtUs(), true);
+        } else if (matches(settings.closeLabel)) {
+            gate.pushMarker(marker.getEmittedAtUs(), false);
+        }
+    }
+
+    nat::core::NatSignalFrameDataSchemaV1 slice(
+        const nat::tools::GatedSpan<NormalizedNumericChannelFrame>& span)
+    {
+        const auto& frame = span.frame;
+        const size_t per_channel = frame.samplesPerChannel;
+        const size_t channel_count = frame.channelLabels.size();
+        std::vector<float> samples;
+        samples.reserve(channel_count * span.sampleCount);
+        for (size_t channel = 0; channel < channel_count; ++channel) {
+            const size_t base = channel * per_channel;
+            for (size_t index = 0; index < span.sampleCount; ++index) {
+                const size_t offset = base + span.firstSample + index;
+                samples.push_back(
+                    offset < frame.samples.size() ? frame.samples[offset] : 0.0f);
+            }
+        }
+        // The emitted frame's device_ts_us is the time of the FIRST ADMITTED
+        // SAMPLE, not the original frame's. Keeping the original would put the
+        // window's data at the wrong time, which is the whole error the
+        // split-at-sample default exists to avoid.
+        return nat::core::NatSignalFrameDataSchemaV1(
+            frame.deviceId,
+            outputSeqNo++,
+            span.startTsUs,
+            frame.sampleRateHz,
+            frame.channelLabels,
+            samples,
+            static_cast<uint32_t>(span.sampleCount));
+    }
+
+    std::string outputIdentifier;
+    size_t slotIndex;
+    uint64_t dataSourceStreamId = 0;
+    std::unique_ptr<nat::core::TopicMessenger> dataMessenger;
+    std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
+        descriptorMaybe{};
+    std::unique_ptr<nat::core::TopicMessenger> markerMessenger;
+    std::shared_ptr<nat::core::BasicTopicInformation> dataOutputTopic;
+    std::unique_ptr<nat::core::TopicMessenger> dataOutputMessenger;
+    GateWorkerSettings settings{};
+    nat::tools::SampleGate<NormalizedNumericChannelFrame> gate;
+    nat::tools::ChannelActivity dataActivity{};
+    uint64_t outputSeqNo = 0;
+    std::atomic<bool> active{false};
+    std::atomic<uint64_t> startedAtUs{0};
+    std::atomic<uint64_t> lastFrameAtUs{0};
+    std::atomic<uint64_t> framesProcessed{0};
+    std::atomic<uint64_t> rejected{0};
+    std::thread workerThread;
+};
+
+std::mutex g_gate_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<GateWorker>> g_gate_workers;
+
+std::optional<LiveTransformWorkerSnapshot> getLiveGateWorkerSnapshot(
+    uint64_t output_stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_gate_mutex);
+    const auto search = g_gate_workers.find(output_stream_id);
+    if (search == g_gate_workers.end() || !search->second) {
+        return std::nullopt;
+    }
+    return LiveTransformWorkerSnapshot{
+        search->second->getFramesProcessed(),
+        search->second->getLastFrameAtUs(),
+        "natkit-local-gate-worker",
+        search->second->getThreadSlotId(),
+        search->second->getFramesDropped(),
+        std::string{},
+        search->second->getDataActivity(),
+    };
+}
+
+std::shared_ptr<nat::core::BasicTopicInformation> findGateOutputTopicForStream(
+    uint64_t stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_gate_mutex);
+    const auto search = g_gate_workers.find(stream_id);
+    if (search != g_gate_workers.end() && search->second) {
+        return search->second->getOutputTopicInfo();
+    }
+    return nullptr;
+}
+
+bool stopGateWorkerByOutputStreamId(uint64_t output_stream_id)
+{
+    std::shared_ptr<GateWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_gate_mutex);
+        const auto search = g_gate_workers.find(output_stream_id);
+        if (search == g_gate_workers.end()) return false;
+        worker = search->second;
+        g_gate_workers.erase(search);
+    }
+    if (worker) worker->stop();
+    return true;
+}
+
+CreateLaneWorkerResult createGateWorker(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    uint64_t data_source_stream_id,
+    const std::shared_ptr<nat::core::BasicTopicInformation>& marker_source_topic,
+    const std::string& output_identifier,
+    const nlohmann::json& node_config,
+    bool input_in_process,
+    bool output_in_process,
+    int64_t source_start_offset)
+{
+    CreateLaneWorkerResult result;
+    result.outputIdentifier = output_identifier;
+    result.workerId = "natkit-local-gate-worker";
+    if (!broker_manager) {
+        result.error = "Broker manager not available";
+        return result;
+    }
+    if (marker_source_topic == nullptr) {
+        result.error = "gate nodes require a markers input";
+        return result;
+    }
+
+    auto source_topic = nat::tools::resolveGraphSourceTopic(
+        data_source_stream_id,
+        [&](uint64_t id) {
+            return findTransformSourceTopicForStream(broker_manager, id);
+        },
+        findGraphInternalOutputTopicForStream);
+    if (source_topic == nullptr) {
+        result.error = "Could not locate a DATA topic for the gate's input";
+        return result;
+    }
+    auto descriptor_maybe =
+        nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
+            source_topic->schemaName);
+    if (!descriptor_maybe.has_value()) {
+        result.error = "No descriptor is available for the gate's input";
+        return result;
+    }
+
+    // The gate passes its input through unchanged apart from which samples
+    // survive, so its output carries the SAME schema as its input -- a gated
+    // waveform is still that waveform.
+    const auto data_output_topic = createTopicInfo(
+        nat::core::StreamType::DATA, "gate", output_identifier,
+        nat::core::NatSignalFrameDataSchemaV1::name);
+    if (data_output_topic == nullptr) {
+        result.error = "Failed to create topic information for gate";
+        return result;
+    }
+    const uint64_t output_stream_id = data_output_topic->id;
+    result.outputStreamId = output_stream_id;
+
+    std::shared_ptr<GateWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_gate_mutex);
+        const auto duplicate = g_gate_workers.find(output_stream_id);
+        if (duplicate != g_gate_workers.end() && duplicate->second) {
+            result.ok = true;
+            result.alreadyExists = true;
+            result.threadSlotId = duplicate->second->getThreadSlotId();
+            result.outputTopics.push_back(makeChannelTopic(
+                nat::core::StreamType::DATA, output_stream_id,
+                nat::core::NatSignalFrameDataSchemaV1::name));
+            return result;
+        }
+        worker = std::make_shared<GateWorker>(
+            output_identifier,
+            g_gate_workers.size(),
+            data_source_stream_id,
+            makeGraphSourceMessenger(
+                broker_manager, source_topic, input_in_process,
+                source_start_offset),
+            descriptor_maybe.value(),
+            // Markers are always Kafka, so the marker input never takes the
+            // in-process fast path even when the data input does.
+            makeGraphSourceMessenger(broker_manager, marker_source_topic, false, -1),
+            data_output_topic,
+            makeGraphOutputMessenger(
+                broker_manager, data_output_topic, output_in_process),
+            parseGateSettings(node_config));
+        g_gate_workers.emplace(output_stream_id, worker);
+    }
+    worker->start();
+
+    result.ok = true;
+    result.threadSlotId = worker->getThreadSlotId();
+    result.outputTopics.push_back(makeChannelTopic(
+        nat::core::StreamType::DATA, output_stream_id,
+        nat::core::NatSignalFrameDataSchemaV1::name));
+    return result;
+}
+
+// ===== The marker-lane operator worker (TEC-NATKIT-105) ===================
+//
+// ONE worker for all four operators, because they are the same shape: N marker
+// inputs, one marker output, and a decision object from MarkerOps.hpp. Four
+// near-identical classes would drift, and every wiring site already groups them
+// through isMarkerOperatorKind().
+
+struct MarkerOpSettings {
+    std::string kind{};
+    nat::tools::MarkerFilterConfig filter{};
+    uint64_t debounceWindowUs = 0;
+};
+
+MarkerOpSettings parseMarkerOpSettings(
+    const std::string& kind, const nlohmann::json& config)
+{
+    MarkerOpSettings settings;
+    settings.kind = kind;
+    if (!config.is_object()) {
+        return settings;
+    }
+    if (const auto field = nat::tools::parseMarkerMatchField(
+            config.value("match_field", std::string{"label"}))) {
+        settings.filter.field = field.value();
+    }
+    settings.filter.exclude = config.value("mode", std::string{"include"}) ==
+        "exclude";
+    settings.filter.values = nat::tools::parseMarkerMatchValues(
+        config.value("match_values", std::string{}));
+
+    if (config.contains("window_ms") && config["window_ms"].is_number()) {
+        const double ms = config["window_ms"].get<double>();
+        if (ms > 0.0) {
+            settings.debounceWindowUs = static_cast<uint64_t>(ms * 1000.0);
+        }
+    }
+    return settings;
+}
+
+class MarkerOpWorker {
+public:
+    MarkerOpWorker(
+        const std::string& output_identifier,
+        size_t slot_index,
+        std::vector<std::unique_ptr<nat::core::TopicMessenger>>&& lane_messengers,
+        const std::shared_ptr<nat::core::BasicTopicInformation>& marker_output_topic,
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger,
+        const MarkerOpSettings& settings)
+        : outputIdentifier(output_identifier),
+          slotIndex(slot_index),
+          laneMessengers(std::move(lane_messengers)),
+          markerOutputTopic(marker_output_topic),
+          markerOutputMessenger(std::move(marker_output_messenger)),
+          settings(settings),
+          filter(settings.filter),
+          debounce(settings.debounceWindowUs),
+          merge(std::max<size_t>(this->laneMessengers.size(), 1))
+    {
+    }
+
+    ~MarkerOpWorker() { stop(); }
+
+    void start()
+    {
+        if (workerThread.joinable()) return;
+        active = true;
+        startedAtUs.store(nowUs());
+        workerThread = std::thread(&MarkerOpWorker::run, this);
+    }
+
+    void stop()
+    {
+        active = false;
+        if (workerThread.joinable()) workerThread.join();
+    }
+
+    uint64_t getOutputStreamId() const
+    {
+        return markerOutputTopic ? markerOutputTopic->id : 0;
+    }
+    std::string getOutputTopic() const
+    {
+        return markerOutputTopic ? markerOutputTopic->toTopicString() : std::string{};
+    }
+    std::shared_ptr<nat::core::BasicTopicInformation> getMarkerOutputTopicInfo() const
+    {
+        return markerOutputTopic;
+    }
+    const std::string& getOutputIdentifier() const { return outputIdentifier; }
+    size_t getSlotIndex() const { return slotIndex; }
+    std::string getThreadSlotId() const
+    {
+        std::ostringstream stream;
+        stream << "natkit-local-" << settings.kind << "-worker:slot-";
+        stream << std::setw(2) << std::setfill('0') << (slotIndex + 1);
+        return stream.str();
+    }
+    uint64_t getStartedAtUs() const { return startedAtUs.load(); }
+    uint64_t getLastFrameAtUs() const { return lastFrameAtUs.load(); }
+    uint64_t getFramesProcessed() const { return framesProcessed.load(); }
+    // Markers the operator refused: filtered out, debounced away, or arriving
+    // after a take-until stopped. Reported so "my markers vanished" is
+    // answerable from the node status instead of by reading the config back.
+    uint64_t getFramesDropped() const { return dropped.load(); }
+
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
+private:
+    void run()
+    {
+        LOG_INFO << "StreamViewer: Starting " << settings.kind << " worker lanes="
+                 << laneMessengers.size() << " output=" << getOutputTopic();
+
+        while (active.load()) {
+            try {
+                bool made_progress = false;
+                for (size_t lane = 0; lane < laneMessengers.size(); ++lane) {
+                    if (laneMessengers[lane] == nullptr) continue;
+                    const auto record_maybe =
+                        laneMessengers[lane]->tryGetNexMessage();
+                    if (!record_maybe.has_value()) continue;
+                    made_progress = true;
+                    std::unique_ptr<nat::core::Schema> record =
+                        std::move(record_maybe.value());
+                    auto* marker =
+                        dynamic_cast<nat::core::MarkerEventV1*>(record.get());
+                    if (marker == nullptr) {
+                        continue;  // not a marker event; skip defensively
+                    }
+                    consume(lane, *marker);
+                }
+
+                // Merge and take-until buffer behind a watermark, so they owe
+                // output only after an input advances -- drain rather than poll
+                // once, or a burst would be released one marker per pass.
+                if (settings.kind == "marker_merge") {
+                    while (const auto out = merge.tryEmit()) {
+                        publish(out.value());
+                        made_progress = true;
+                    }
+                } else if (settings.kind == "marker_take_until") {
+                    while (const auto out = takeUntil.tryEmit()) {
+                        publish(out.value());
+                        made_progress = true;
+                    }
+                    dropped.store(takeUntil.droppedAfterStop());
+                }
+
+                if (!made_progress) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            } catch (const std::exception& ex) {
+                LOG_ERROR << "StreamViewer: " << settings.kind
+                          << " worker error: " << ex.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+
+        LOG_INFO << "StreamViewer: Stopped " << settings.kind
+                 << " worker output=" << getOutputTopic();
+    }
+
+    void consume(size_t lane, const nat::core::MarkerEventV1& marker)
+    {
+        if (settings.kind == "marker_filter") {
+            nat::tools::MarkerEventView view;
+            view.atUs = marker.getEmittedAtUs();
+            view.label = marker.getLabel();
+            view.event = marker.getEvent();
+            view.markerType = marker.getMarkerType();
+            if (filter.passes(view)) {
+                publish(marker);
+            } else {
+                dropped.fetch_add(1);
+            }
+            return;
+        }
+        if (settings.kind == "marker_debounce") {
+            if (debounce.admit(marker.getEmittedAtUs())) {
+                publish(marker);
+            } else {
+                dropped.store(debounce.suppressed());
+            }
+            return;
+        }
+        if (settings.kind == "marker_merge") {
+            merge.push(lane, marker, marker.getEmittedAtUs());
+            return;
+        }
+        if (settings.kind == "marker_take_until") {
+            // Lane 0 is the primary and lane 1 is `until`, fixed by the port
+            // order the catalog advertises.
+            if (lane == 0) {
+                takeUntil.pushPrimary(marker, marker.getEmittedAtUs());
+            } else {
+                takeUntil.pushStop(marker, marker.getEmittedAtUs());
+            }
+            return;
+        }
+    }
+
+    // Republished under THIS node's session id and marker id, with the event,
+    // label, type, time and attributes preserved. The marker's identity as an
+    // event is what downstream consumers match on; where it was republished is
+    // provenance, and overwriting the former would break every filter and gate
+    // downstream of an operator.
+    void publish(const nat::core::MarkerEventV1& marker)
+    {
+        if (markerOutputMessenger == nullptr) return;
+        std::ostringstream marker_id;
+        marker_id << outputIdentifier << "-" << (++outputSeqNo);
+        const nat::core::MarkerEventV1 out(
+            marker.getSessionId(),
+            marker.getMarkerType(),
+            marker_id.str(),
+            marker.getEvent(),
+            marker.getLabel(),
+            marker.getEmittedAtUs(),
+            marker.getAttributesJson());
+        markerOutputMessenger->sendMessage(out);
+        markerActivity.record(marker.getEmittedAtUs());
+        framesProcessed.fetch_add(1);
+        lastFrameAtUs.store(nowUs());
+    }
+
+    std::string outputIdentifier;
+    size_t slotIndex;
+    std::vector<std::unique_ptr<nat::core::TopicMessenger>> laneMessengers;
+    std::shared_ptr<nat::core::BasicTopicInformation> markerOutputTopic;
+    std::unique_ptr<nat::core::TopicMessenger> markerOutputMessenger;
+    MarkerOpSettings settings{};
+    nat::tools::MarkerFilter filter;
+    nat::tools::MarkerDebounce debounce;
+    nat::tools::MarkerMerge<nat::core::MarkerEventV1> merge;
+    nat::tools::MarkerTakeUntil<nat::core::MarkerEventV1> takeUntil{};
+    nat::tools::ChannelActivity markerActivity{};
+    uint64_t outputSeqNo = 0;
+    std::atomic<bool> active{false};
+    std::atomic<uint64_t> startedAtUs{0};
+    std::atomic<uint64_t> lastFrameAtUs{0};
+    std::atomic<uint64_t> framesProcessed{0};
+    std::atomic<uint64_t> dropped{0};
+    std::thread workerThread;
+};
+
+std::mutex g_marker_op_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<MarkerOpWorker>> g_marker_op_workers;
+
+std::optional<LiveTransformWorkerSnapshot> getLiveMarkerOpWorkerSnapshot(
+    uint64_t output_stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_marker_op_mutex);
+    const auto search = g_marker_op_workers.find(output_stream_id);
+    if (search == g_marker_op_workers.end() || !search->second) {
+        return std::nullopt;
+    }
+    return LiveTransformWorkerSnapshot{
+        search->second->getFramesProcessed(),
+        search->second->getLastFrameAtUs(),
+        "natkit-local-marker-op-worker",
+        search->second->getThreadSlotId(),
+        search->second->getFramesDropped(),
+        std::string{},
+        nat::tools::ActivitySnapshot{},
+        search->second->getMarkerActivity(),
+    };
+}
+
+std::shared_ptr<nat::core::BasicTopicInformation> findMarkerOpTopicForStream(
+    uint64_t stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_marker_op_mutex);
+    const auto search = g_marker_op_workers.find(stream_id);
+    if (search != g_marker_op_workers.end() && search->second) {
+        return search->second->getMarkerOutputTopicInfo();
+    }
+    return nullptr;
+}
+
+bool stopMarkerOpWorkerByOutputStreamId(uint64_t output_stream_id)
+{
+    std::shared_ptr<MarkerOpWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_marker_op_mutex);
+        const auto search = g_marker_op_workers.find(output_stream_id);
+        if (search == g_marker_op_workers.end()) return false;
+        worker = search->second;
+        g_marker_op_workers.erase(search);
+    }
+    if (worker) worker->stop();
+    return true;
+}
+
+// `marker_source_topics` is in PORT ORDER: for take-until, lane 0 is the
+// primary and lane 1 is `until`. Passing them in the wrong order silently swaps
+// which stream stops the other, so the caller resolves by port, never by
+// whichever edge it happened to see first.
+CreateLaneWorkerResult createMarkerOpWorker(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    const std::string& kind,
+    const std::vector<std::shared_ptr<nat::core::BasicTopicInformation>>&
+        marker_source_topics,
+    const std::string& output_identifier,
+    const nlohmann::json& node_config)
+{
+    CreateLaneWorkerResult result;
+    result.outputIdentifier = output_identifier;
+    result.workerId = "natkit-local-marker-op-worker";
+    if (!broker_manager) {
+        result.error = "Broker manager not available";
+        return result;
+    }
+    if (marker_source_topics.empty()) {
+        result.error = kind + " requires at least one markers input";
+        return result;
+    }
+    for (const auto& topic : marker_source_topics) {
+        if (topic == nullptr) {
+            result.error = "Could not locate a MARKER topic for one of " + kind +
+                "'s inputs";
+            return result;
+        }
+    }
+
+    const auto marker_output_topic = createTopicInfo(
+        nat::core::StreamType::MARKER, kind, output_identifier,
+        nat::core::MarkerEventV1::name);
+    if (marker_output_topic == nullptr) {
+        result.error = "Failed to create topic information for " + kind;
+        return result;
+    }
+    const uint64_t output_stream_id = marker_output_topic->id;
+    result.outputStreamId = output_stream_id;
+
+    std::shared_ptr<MarkerOpWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_marker_op_mutex);
+        const auto duplicate = g_marker_op_workers.find(output_stream_id);
+        if (duplicate != g_marker_op_workers.end() && duplicate->second) {
+            result.ok = true;
+            result.alreadyExists = true;
+            result.threadSlotId = duplicate->second->getThreadSlotId();
+            result.outputTopics.push_back(makeChannelTopic(
+                nat::core::StreamType::MARKER, output_stream_id,
+                nat::core::MarkerEventV1::name));
+            return result;
+        }
+        std::vector<std::unique_ptr<nat::core::TopicMessenger>> lanes;
+        lanes.reserve(marker_source_topics.size());
+        for (const auto& topic : marker_source_topics) {
+            // Markers are always Kafka; there is no in-process marker channel.
+            lanes.push_back(
+                makeGraphSourceMessenger(broker_manager, topic, false, -1));
+        }
+        worker = std::make_shared<MarkerOpWorker>(
+            output_identifier,
+            g_marker_op_workers.size(),
+            std::move(lanes),
+            marker_output_topic,
+            makeGraphOutputMessenger(broker_manager, marker_output_topic, false),
+            parseMarkerOpSettings(kind, node_config));
+        g_marker_op_workers.emplace(output_stream_id, worker);
+    }
+    worker->start();
+
+    result.ok = true;
+    result.threadSlotId = worker->getThreadSlotId();
+    result.outputTopics.push_back(makeChannelTopic(
+        nat::core::StreamType::MARKER, output_stream_id,
+        nat::core::MarkerEventV1::name));
+    return result;
+}
+
 
 bool stopCombineWorkerByOutputStreamId(uint64_t output_stream_id)
 {
@@ -7269,11 +9118,25 @@ bool stopCombineWorkerByOutputStreamId(uint64_t output_stream_id)
 // to either a `transform` or a `combine` node.
 bool stopGraphWorkerByOutputStreamId(uint64_t output_stream_id)
 {
+    // ⚠️ EVERY WORKER REGISTRY MUST BE LISTED HERE. A kind that is missing keeps
+    // its thread and its subscription alive after the graph is stopped, so the
+    // node reads as stopped while it is still consuming and still publishing --
+    // and a restart then finds a duplicate and silently reuses the stale worker,
+    // with the OLD config.
     size_t remaining_active_count = 0;
     if (stopTransformWorkerByOutputStreamId(output_stream_id, remaining_active_count)) {
         return true;
     }
-    return stopCombineWorkerByOutputStreamId(output_stream_id);
+    if (stopCombineWorkerByOutputStreamId(output_stream_id)) {
+        return true;
+    }
+    if (stopThresholdWorkerByOutputStreamId(output_stream_id)) {
+        return true;
+    }
+    if (stopGateWorkerByOutputStreamId(output_stream_id)) {
+        return true;
+    }
+    return stopMarkerOpWorkerByOutputStreamId(output_stream_id);
 }
 
 } // namespace
@@ -10681,6 +12544,257 @@ void executeStreamGraphStart(
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
         }
+        // --- the marker-lane operators (TEC-NATKIT-105) --------------------
+        if (isMarkerOperatorKind(node.kind)) {
+            // Resolved in PORT ORDER, which for take-until is load-bearing:
+            // lane 0 is the primary and lane 1 is `until`, and taking whichever
+            // edge was stored first would silently swap which stream stops the
+            // other. merge is variadic, so its lanes are every inbound edge.
+            std::vector<std::shared_ptr<nat::core::BasicTopicInformation>>
+                lane_topics{};
+            std::optional<std::string> blocking_upstream{};
+            const auto laneFor = [&](const std::string& port_id) {
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                        continue;
+                    }
+                    if (edge.targetPort != port_id) {
+                        continue;
+                    }
+                    std::optional<uint64_t> upstream_id{};
+                    const auto upstream_search =
+                        nodes_by_id.find(edge.sourceNodeId);
+                    if (upstream_search != nodes_by_id.end() &&
+                        upstream_search->second->kind == "stream_source" &&
+                        upstream_search->second->streamId.has_value()) {
+                        upstream_id = upstream_search->second->streamId.value();
+                    } else {
+                        const auto resolved =
+                            resolved_output_stream_ids.find(edge.sourceNodeId);
+                        if (resolved != resolved_output_stream_ids.end()) {
+                            upstream_id = resolved->second;
+                        }
+                    }
+                    if (!upstream_id.has_value()) {
+                        blocking_upstream = edge.sourceNodeId;
+                        return std::shared_ptr<nat::core::BasicTopicInformation>{};
+                    }
+                    // In-memory first: an upstream operator or threshold has
+                    // published nothing yet, so its topic is absent from broker
+                    // metadata until its first marker.
+                    auto topic = findGraphInternalMarkerTopicForStream(
+                        upstream_id.value());
+                    if (topic == nullptr) {
+                        topic = findMarkerOrMetaTopicForStreamId(
+                            broker_manager, upstream_id.value());
+                    }
+                    if (topic == nullptr) {
+                        blocking_upstream = edge.sourceNodeId;
+                    }
+                    return topic;
+                }
+                return std::shared_ptr<nat::core::BasicTopicInformation>{};
+            };
+
+            if (node.kind == "marker_take_until") {
+                auto primary = laneFor("markers");
+                auto until = laneFor("until");
+                if (primary != nullptr && until != nullptr) {
+                    lane_topics.push_back(primary);
+                    lane_topics.push_back(until);
+                }
+            } else {
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                        continue;
+                    }
+                    auto topic = laneFor(edge.targetPort);
+                    if (topic == nullptr) {
+                        lane_topics.clear();
+                        break;
+                    }
+                    lane_topics.push_back(topic);
+                }
+            }
+
+            if (lane_topics.empty()) {
+                const StreamGraphNodeRuntimeStatus status{
+                    "blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                    std::optional<std::string>(
+                        blocking_upstream.has_value()
+                            ? "Blocked: waiting on upstream '" +
+                                  blocking_upstream.value() + "'."
+                            : "Blocked: marker inputs not resolved yet.")};
+                if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                    aborted = true;
+                    break;
+                }
+                pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                continue;
+            }
+
+            const auto create_result = createMarkerOpWorker(
+                broker_manager, node.kind, lane_topics,
+                node.outputIdentifier.value_or(node.id), node.config);
+            if (!create_result.ok) {
+                encountered_error = true;
+                const StreamGraphNodeRuntimeStatus status{
+                    "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                    create_result.error};
+                if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                    aborted = true;
+                    break;
+                }
+                pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                continue;
+            }
+
+            resolved_output_stream_ids[node.id] = create_result.outputStreamId;
+            resolved_output_channels[node.id] = create_result.outputTopics;
+            StreamGraphNodeRuntimeStatus status{
+                "running",
+                create_result.outputStreamId,
+                create_result.workerId,
+                create_result.threadSlotId,
+                0,
+                0,
+                std::optional<std::string>("Operating on its marker inputs.")};
+            status.outputTopics = create_result.outputTopics;
+            if (!commitNodeStatus(node.id, status, create_result.outputStreamId)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
+        // --- the lane crossings (TEC-NATKIT-109) ---------------------------
+        //
+        // Resolved by PORT, not by "the first inbound edge": a gate's two inputs
+        // are not interchangeable, and picking whichever edge happened to be
+        // stored first would silently swap the signal for the cues.
+        if (node.kind == "threshold" || node.kind == "gate") {
+            const auto resolvePort =
+                [&](const std::string& port_id) -> ResolvedInput {
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                        continue;
+                    }
+                    // A single-input node's port id may be empty on an older
+                    // board; treat that as the data port.
+                    const bool matches = edge.targetPort == port_id ||
+                        (port_id == "in" && edge.targetPort.empty());
+                    if (!matches) {
+                        continue;
+                    }
+                    const auto upstream_search = nodes_by_id.find(edge.sourceNodeId);
+                    if (upstream_search == nodes_by_id.end()) {
+                        return ResolvedInput{std::nullopt, edge.sourceNodeId};
+                    }
+                    if (upstream_search->second->kind == "stream_source" &&
+                        upstream_search->second->streamId.has_value()) {
+                        return ResolvedInput{
+                            upstream_search->second->streamId.value(),
+                            edge.sourceNodeId};
+                    }
+                    const auto resolved =
+                        resolved_output_stream_ids.find(edge.sourceNodeId);
+                    if (resolved == resolved_output_stream_ids.end()) {
+                        return ResolvedInput{std::nullopt, edge.sourceNodeId};
+                    }
+                    return ResolvedInput{resolved->second, edge.sourceNodeId};
+                }
+                return ResolvedInput{std::nullopt, std::nullopt};
+            };
+
+            const auto data_input = resolvePort("in");
+            if (!data_input.streamId.has_value()) {
+                const StreamGraphNodeRuntimeStatus status{
+                    "blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                    std::optional<std::string>(
+                        "Blocked: the data input is not resolved yet.")};
+                if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                    aborted = true;
+                    break;
+                }
+                pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                continue;
+            }
+
+            const bool input_in_process = data_input.upstreamNodeId.has_value() &&
+                outputInProcess(data_input.upstreamNodeId.value());
+            const auto identifier = node.outputIdentifier.value_or(node.id);
+
+            CreateLaneWorkerResult create_result;
+            if (node.kind == "threshold") {
+                create_result = createThresholdWorker(
+                    broker_manager, data_input.streamId.value(), identifier,
+                    node.config, input_in_process,
+                    sourceOffsetFor(data_input.streamId.value()));
+            } else {
+                const auto marker_input = resolvePort("markers");
+                if (!marker_input.streamId.has_value()) {
+                    const StreamGraphNodeRuntimeStatus status{
+                        "blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                        std::optional<std::string>(
+                            "Blocked: the markers input is not resolved yet.")};
+                    if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                        aborted = true;
+                        break;
+                    }
+                    pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                    continue;
+                }
+                // In-memory first: a threshold upstream has published nothing
+                // until the signal crosses, so its MARKER topic is not in broker
+                // metadata yet and only its worker knows it exists.
+                auto marker_topic = findGraphInternalMarkerTopicForStream(
+                    marker_input.streamId.value());
+                if (marker_topic == nullptr) {
+                    marker_topic = findMarkerOrMetaTopicForStreamId(
+                        broker_manager, marker_input.streamId.value());
+                }
+                create_result = createGateWorker(
+                    broker_manager, data_input.streamId.value(), marker_topic,
+                    identifier, node.config, input_in_process,
+                    outputInProcess(node.id),
+                    sourceOffsetFor(data_input.streamId.value()));
+            }
+
+            if (!create_result.ok) {
+                encountered_error = true;
+                const StreamGraphNodeRuntimeStatus status{
+                    "error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                    create_result.error};
+                if (!commitNodeStatus(node.id, status, std::nullopt)) {
+                    aborted = true;
+                    break;
+                }
+                pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+                continue;
+            }
+
+            resolved_output_stream_ids[node.id] = create_result.outputStreamId;
+            resolved_output_channels[node.id] = create_result.outputTopics;
+            StreamGraphNodeRuntimeStatus status{
+                "running",
+                create_result.outputStreamId,
+                create_result.workerId,
+                create_result.threadSlotId,
+                0,
+                0,
+                std::optional<std::string>(
+                    node.kind == "threshold"
+                        ? "Watching for crossings; markers publish as they occur."
+                        : "Gating data on its marker window.")};
+            status.outputTopics = create_result.outputTopics;
+            if (!commitNodeStatus(
+                    node.id, status, create_result.outputStreamId)) {
+                aborted = true;
+                break;
+            }
+            pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
+            continue;
+        }
         if (node.kind == "combine") {
             std::vector<CombineWorkerInput> input_channels{};
             std::optional<std::string> blocking_upstream{};
@@ -10768,7 +12882,8 @@ void executeStreamGraphStart(
 
             const auto create_result = createCombineWorker(
                 broker_manager, input_channels,
-                node.outputIdentifier.value_or(node.id), outputInProcess(node.id));
+                node.outputIdentifier.value_or(node.id), outputInProcess(node.id),
+                parseCombineJoinConfig(node.config));
             if (!create_result.ok) {
                 encountered_error = true;
                 const StreamGraphNodeRuntimeStatus status{
@@ -11364,7 +13479,8 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
             continue;
         }
         const auto& kind = search->second->kind;
-        if (kind != "transform" && kind != "combine") {
+        if (kind != "transform" && kind != "combine" && kind != "threshold" &&
+            kind != "gate" && !isMarkerOperatorKind(kind)) {
             continue;
         }
         const auto out_search = output_stream_ids.find(affected_id);
@@ -11437,6 +13553,151 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                         status = {"running", create_result.outputStreamId,
                                   create_result.workerId, create_result.threadSlotId, 0, 0,
                                   std::optional<std::string>("Restarted with updated config.")};
+                    }
+                }
+            }
+        } else if (isMarkerOperatorKind(node.kind)) {
+            // Restart re-reads the filter values, the debounce window and the
+            // take-until wiring. The operator's state (a debounce's last-passed
+            // time, a take-until's stopped flag, buffered lanes) belongs to the
+            // old settings and is discarded with the old worker.
+            std::vector<std::shared_ptr<nat::core::BasicTopicInformation>>
+                lane_topics{};
+            const auto laneFor = [&](const std::string& port_id)
+                -> std::shared_ptr<nat::core::BasicTopicInformation> {
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge) ||
+                        edge.targetPort != port_id) {
+                        continue;
+                    }
+                    const auto up = output_stream_ids.find(edge.sourceNodeId);
+                    if (up == output_stream_ids.end()) {
+                        return nullptr;
+                    }
+                    auto topic = findGraphInternalMarkerTopicForStream(up->second);
+                    if (topic == nullptr) {
+                        topic = findMarkerOrMetaTopicForStreamId(
+                            broker_manager_, up->second);
+                    }
+                    return topic;
+                }
+                return nullptr;
+            };
+            if (node.kind == "marker_take_until") {
+                auto primary = laneFor("markers");
+                auto until = laneFor("until");
+                if (primary != nullptr && until != nullptr) {
+                    lane_topics = {primary, until};
+                }
+            } else {
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                        continue;
+                    }
+                    auto topic = laneFor(edge.targetPort);
+                    if (topic == nullptr) {
+                        lane_topics.clear();
+                        break;
+                    }
+                    lane_topics.push_back(topic);
+                }
+            }
+            if (lane_topics.empty()) {
+                status = {"blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                          std::optional<std::string>(
+                              "Blocked: marker inputs not resolved.")};
+            } else {
+                const auto create_result = createMarkerOpWorker(
+                    broker_manager_, node.kind, lane_topics,
+                    node.outputIdentifier.value_or(node.id), node.config);
+                if (!create_result.ok) {
+                    status = {"error", std::nullopt, std::nullopt, std::nullopt,
+                              0, 0, create_result.error};
+                } else {
+                    new_output_id = create_result.outputStreamId;
+                    output_stream_ids[node.id] = create_result.outputStreamId;
+                    status = {"running", create_result.outputStreamId,
+                              create_result.workerId,
+                              create_result.threadSlotId, 0, 0,
+                              std::optional<std::string>(
+                                  "Restarted with updated config.")};
+                    status.outputTopics = create_result.outputTopics;
+                }
+            }
+        } else if (node.kind == "threshold" || node.kind == "gate") {
+            // Restart applies a new level/dwell/window in place. The detector
+            // and the gate both carry state (a pending candidate, an open
+            // window, buffered frames), and that state belongs to the old
+            // settings, so it is discarded with the old worker rather than
+            // re-policied -- the same reason a transform restarts rather than
+            // mutating its filter.
+            const auto resolvePort =
+                [&](const std::string& port_id) -> std::optional<uint64_t> {
+                for (const auto& edge : graph.edges) {
+                    if (edge.targetNodeId != node.id || isProvenanceEdge(edge)) {
+                        continue;
+                    }
+                    const bool matches = edge.targetPort == port_id ||
+                        (port_id == "in" && edge.targetPort.empty());
+                    if (!matches) {
+                        continue;
+                    }
+                    const auto up = output_stream_ids.find(edge.sourceNodeId);
+                    if (up != output_stream_ids.end()) {
+                        return up->second;
+                    }
+                    return std::nullopt;
+                }
+                return std::nullopt;
+            };
+
+            const auto data_input = resolvePort("in");
+            if (!data_input.has_value()) {
+                status = {"blocked", std::nullopt, std::nullopt, std::nullopt, 0, 0,
+                          std::optional<std::string>(
+                              "Blocked: the data input is not resolved.")};
+            } else {
+                const auto identifier = node.outputIdentifier.value_or(node.id);
+                CreateLaneWorkerResult create_result;
+                bool resolved = true;
+                if (node.kind == "threshold") {
+                    create_result = createThresholdWorker(
+                        broker_manager_, data_input.value(), identifier,
+                        node.config, false, -1);
+                } else {
+                    const auto marker_input = resolvePort("markers");
+                    if (!marker_input.has_value()) {
+                        resolved = false;
+                        status = {"blocked", std::nullopt, std::nullopt,
+                                  std::nullopt, 0, 0,
+                                  std::optional<std::string>(
+                                      "Blocked: the markers input is not resolved.")};
+                    } else {
+                        auto marker_topic = findGraphInternalMarkerTopicForStream(
+                            marker_input.value());
+                        if (marker_topic == nullptr) {
+                            marker_topic = findMarkerOrMetaTopicForStreamId(
+                                broker_manager_, marker_input.value());
+                        }
+                        create_result = createGateWorker(
+                            broker_manager_, data_input.value(), marker_topic,
+                            identifier, node.config, false,
+                            outputInProcess(node.id), -1);
+                    }
+                }
+                if (resolved) {
+                    if (!create_result.ok) {
+                        status = {"error", std::nullopt, std::nullopt, std::nullopt,
+                                  0, 0, create_result.error};
+                    } else {
+                        new_output_id = create_result.outputStreamId;
+                        output_stream_ids[node.id] = create_result.outputStreamId;
+                        status = {"running", create_result.outputStreamId,
+                                  create_result.workerId,
+                                  create_result.threadSlotId, 0, 0,
+                                  std::optional<std::string>(
+                                      "Restarted with updated config.")};
+                        status.outputTopics = create_result.outputTopics;
                     }
                 }
             }
@@ -11515,7 +13776,8 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                 const auto create_result = createCombineWorker(
                     broker_manager_, input_channels,
                     node.outputIdentifier.value_or(node.id),
-                    outputInProcess(node.id));
+                    outputInProcess(node.id),
+                    parseCombineJoinConfig(node.config));
                 if (!create_result.ok) {
                     status = {"error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                               create_result.error};
