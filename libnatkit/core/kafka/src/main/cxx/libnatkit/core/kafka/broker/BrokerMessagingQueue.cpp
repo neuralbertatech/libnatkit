@@ -181,10 +181,18 @@ void BrokerMessagingQueue::sendMessage(std::unique_ptr<core::message_t> message)
   const auto stringMessage = byteArrayToString(*message);
   /*std::cout << "Attempting to send the following message to broker: "
             << stringMessage << '\n';*/
+  // KEYED BY TOPIC NAME, deliberately (TEC-NATKIT-108). With a null key
+  // librdkafka's default partitioner picks a partition AT RANDOM PER MESSAGE, so
+  // a multi-partition topic loses all ordering -- and this stack's consumers
+  // assume a topic's messages arrive in the order they were produced. Keying by
+  // the topic name puts every message of one topic in one partition, so that
+  // order is preserved whatever the partition count. Each device+schema already
+  // has its own topic, so parallelism comes from having many topics rather than
+  // from splitting one.
   const auto err = producer->produce(
       topicName, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
-      const_cast<char *>(stringMessage.c_str()), stringMessage.size(), NULL,
-      0, 0, NULL, NULL);
+      const_cast<char *>(stringMessage.c_str()), stringMessage.size(),
+      topicName.c_str(), topicName.size(), 0, NULL, NULL);
   if (err != RdKafka::ERR_NO_ERROR) {
     std::cout << "Error: " << RdKafka::err2str(err) << '\n';
   } else {
@@ -200,27 +208,78 @@ void BrokerMessagingQueue::sendMessage(std::unique_ptr<core::message_t> message)
 }
 
 void BrokerMessagingQueue::readMessages() {
-  doesBrokerHaveMoreMessagesForReading = true;
-  do {
-    if (consumer->consume_callback(topicHandle.get(), partition, kConsumerPollTimeoutMs,
-                                   consumerCallback.get(), nullptr) < 1) {
-      doesBrokerHaveMoreMessagesForReading = false;
-    }
-  } while (doesBrokerHaveMoreMessagesForReading);
+  // Drain every partition, not just the first. A partition left unread is data
+  // that never arrives, with nothing anywhere reporting it.
+  for (const auto partition : partitions) {
+    doesBrokerHaveMoreMessagesForReading = true;
+    do {
+      if (consumer->consume_callback(topicHandle.get(), partition, kConsumerPollTimeoutMs,
+                                     consumerCallback.get(), nullptr) < 1) {
+        doesBrokerHaveMoreMessagesForReading = false;
+      }
+    } while (doesBrokerHaveMoreMessagesForReading);
+  }
   pollResources();
 }
 
-void BrokerMessagingQueue::startConsumer(int64_t startOffset) {
-  RdKafka::ErrorCode resp =
-      consumer->start(topicHandle.get(), partition, startOffset);
-  if (resp != RdKafka::ERR_NO_ERROR) {
-    std::cerr << "Failed to start consumer: " << RdKafka::err2str(resp)
+void BrokerMessagingQueue::discoverPartitions() {
+  partitions.clear();
+  RdKafka::Metadata *raw_metadata = nullptr;
+  const auto err = consumer->metadata(false, topicHandle.get(), &raw_metadata, 5000);
+  const std::unique_ptr<RdKafka::Metadata> metadata{raw_metadata};
+  if (err == RdKafka::ERR_NO_ERROR && metadata != nullptr) {
+    for (auto topic = metadata->topics()->begin();
+         topic != metadata->topics()->end(); ++topic) {
+      if ((*topic)->topic() != topicName) {
+        continue;
+      }
+      for (auto part = (*topic)->partitions()->begin();
+           part != (*topic)->partitions()->end(); ++part) {
+        partitions.push_back((*part)->id());
+      }
+    }
+  }
+  if (partitions.empty()) {
+    // Metadata was unavailable, or the topic does not exist yet (it is
+    // auto-created on first produce). Partition 0 is the old behaviour and the
+    // only partition a default broker creates, so this keeps working -- but it
+    // is a guess, and a guess about which data we can see should be visible.
+    std::cerr << "% Could not read partition metadata for topic " << topicName
+              << " (" << RdKafka::err2str(err)
+              << "); assuming a single partition. If this topic in fact has "
+                 "more, messages on the others will not be read."
               << std::endl;
-    exit(1);
+    partitions.push_back(0);
+  } else if (partitions.size() > 1) {
+    // Handled correctly now, but worth saying out loud: cross-partition
+    // ORDERING is not guaranteed by Kafka, and this stack relies on per-topic
+    // order. Keyed production keeps one topic in one partition, so a count
+    // above one means somebody pre-created the topic with more.
+    std::cerr << "% Topic " << topicName << " has " << partitions.size()
+              << " partitions; consuming all of them. Note that production is "
+                 "keyed by topic, so only one will normally carry data."
+              << std::endl;
   }
 }
 
-void BrokerMessagingQueue::stopConsumer() { consumer->stop(topicHandle.get(), partition); }
+void BrokerMessagingQueue::startConsumer(int64_t startOffset) {
+  discoverPartitions();
+  for (const auto partition : partitions) {
+    RdKafka::ErrorCode resp =
+        consumer->start(topicHandle.get(), partition, startOffset);
+    if (resp != RdKafka::ERR_NO_ERROR) {
+      std::cerr << "Failed to start consumer for " << topicName << " partition "
+                << partition << ": " << RdKafka::err2str(resp) << std::endl;
+      exit(1);
+    }
+  }
+}
+
+void BrokerMessagingQueue::stopConsumer() {
+  for (const auto partition : partitions) {
+    consumer->stop(topicHandle.get(), partition);
+  }
+}
 
 void BrokerMessagingQueue::defaultOnMessageRecieved(std::unique_ptr<core::message_t> &&msg) {
   {

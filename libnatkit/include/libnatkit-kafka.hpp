@@ -96,7 +96,12 @@ class BrokerMessagingQueue : public core::MessagingQueue {
   std::unique_ptr<ConsumerCallback> consumerCallback;
   std::function<void(std::unique_ptr<core::message_t> &&)> onMessageRecieved;
   std::jthread thread;
-  int partition{0};
+  // EVERY partition this topic has, discovered from broker metadata at
+  // construction (TEC-NATKIT-108). This used to be a single `int partition{0}`,
+  // so a topic with more than one partition had all but the first silently
+  // ignored: the stream simply thinned, at random, with no error anywhere --
+  // indistinguishable from radio packet loss.
+  std::vector<int32_t> partitions{};
   bool doesBrokerHaveMoreMessagesForReading{false};
   bool running{true};
 
@@ -126,6 +131,10 @@ private:
   void readMessages();
   void startConsumer(int64_t startOffset = -1);  // -1 = OFFSET_END (start from latest)
   void stopConsumer();
+  // Reads the topic's partition list from broker metadata. Falls back to {0} if
+  // metadata is unavailable, which preserves the old behaviour rather than
+  // refusing to consume at all -- but says so, loudly.
+  void discoverPartitions();
   void defaultOnMessageRecieved(std::unique_ptr<core::message_t> &&msg);
 };
 
