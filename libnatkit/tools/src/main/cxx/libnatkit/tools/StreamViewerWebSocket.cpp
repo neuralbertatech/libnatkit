@@ -8,6 +8,7 @@
 #include "ThresholdDetect.hpp"
 #include "SampleGate.hpp"
 #include "MarkerOps.hpp"
+#include "ChannelActivity.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
 #include "DeviceControls.hpp"
@@ -2000,7 +2001,32 @@ struct StreamGraphNodeRuntimeStatus {
     // status rather than by reading the join code.
     uint64_t framesDropped = 0;
     std::string joinPolicy{};
+    // Per-lane marble-strip activity (TEC-NATKIT-106). A lane with total == 0 is
+    // absent rather than idle: a transform has no marker lane at all, and
+    // drawing an empty row for one would claim its markers had stopped.
+    nat::tools::ActivitySnapshot dataActivity{};
+    nat::tools::ActivitySnapshot markerActivity{};
 };
+
+// One lane's activity as the wire sees it. Offsets and buckets are relative to
+// `base_us`, so the payload is small integers rather than 19-digit absolute
+// microseconds -- this rides a 1 Hz status poll for every node at once.
+inline nlohmann::json activityToJson(const nat::tools::ActivitySnapshot& activity)
+{
+    nlohmann::json json;
+    json["window_us"] = activity.windowUs;
+    json["bucket_us"] = activity.bucketUs;
+    json["base_us"] = std::to_string(activity.baseUs);
+    json["total"] = activity.total;
+    if (activity.mode == nat::tools::ActivityMode::Exact) {
+        json["mode"] = "exact";
+        json["offsets_us"] = activity.offsetsUs;
+    } else {
+        json["mode"] = "density";
+        json["buckets"] = activity.buckets;
+    }
+    return json;
+}
 
 // Build one output-channel topic entry directly (used where no worker exists,
 // e.g. an experiment's MARKER output, a raw source's DATA topic, or the combine
@@ -2036,6 +2062,11 @@ struct LiveTransformWorkerSnapshot {
     // aggregate initializers still compile.
     uint64_t framesDropped = 0;
     std::string joinPolicy{};
+    // Per-lane marble-strip activity (TEC-NATKIT-106). A lane with total == 0 is
+    // absent rather than idle: a transform has no marker lane at all, and
+    // drawing an empty row for one would claim its markers had stopped.
+    nat::tools::ActivitySnapshot dataActivity{};
+    nat::tools::ActivitySnapshot markerActivity{};
 };
 
 std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
@@ -2330,6 +2361,15 @@ void to_json(nlohmann::json& json, const StreamGraphNodeRuntimeStatus& value)
         json["join_policy"] = value.joinPolicy;
         json["frames_dropped"] = value.framesDropped;
     }
+    // Marble-strip activity (TEC-NATKIT-106). Omitted entirely when a lane has
+    // never carried anything, so the renderer draws no row rather than an empty
+    // one -- an empty row reads as "this stopped", which is a different claim.
+    if (value.dataActivity.total > 0) {
+        json["data_activity"] = activityToJson(value.dataActivity);
+    }
+    if (value.markerActivity.total > 0) {
+        json["marker_activity"] = activityToJson(value.markerActivity);
+    }
     if (value.message.has_value()) {
         json["message"] = value.message.value();
     }
@@ -2548,6 +2588,8 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
             status.threadSlotId = live_worker->threadSlotId;
             status.framesDropped = live_worker->framesDropped;
             status.joinPolicy = live_worker->joinPolicy;
+            status.dataActivity = live_worker->dataActivity;
+            status.markerActivity = live_worker->markerActivity;
             status.state =
                 classifyTransformWorkerStatus(1, status.lastFrameAtUs);
         }
@@ -5934,6 +5976,15 @@ public:
         return framesProcessed.load();
     }
 
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getDataActivity() const
+    {
+        return dataActivity.snapshot(dataActivity.newestUs());
+    }
 private:
     uint64_t sourceStreamId;
     std::string outputIdentifier;
@@ -5959,6 +6010,10 @@ private:
     std::atomic<uint64_t> lastFrameAtUs{0};
     std::atomic<uint64_t> framesProcessed{0};
     std::thread workerThread;
+    // Marble-strip activity for this worker's output lane (TEC-NATKIT-106).
+    // Records one timestamp per emitted frame into fixed storage -- deliberately
+    // not the frames, which is what keeps the strip off the data path.
+    nat::tools::ChannelActivity dataActivity{};
 
     void ensureChannelStates(size_t channel_count)
     {
@@ -6784,6 +6839,7 @@ private:
 
                 for (const auto& transformed_record : transformed_records) {
                     outputMessenger->sendMessage(transformed_record);
+                    dataActivity.record(transformed_record.getDeviceTsUs());
                 }
                 framesProcessed.fetch_add(transformed_records.size());
                 lastFrameAtUs.store(nowUs());
@@ -6818,6 +6874,9 @@ std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
         search->second->getLastFrameAtUs(),
         "natkit-local-transform-worker",
         search->second->getThreadSlotId(),
+        0,
+        std::string{},
+        search->second->getDataActivity(),
     };
 }
 
@@ -7290,6 +7349,19 @@ public:
         return nat::tools::combineJoinPolicyName(joinConfig.policy);
     }
 
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getDataActivity() const
+    {
+        return dataActivity.snapshot(dataActivity.newestUs());
+    }
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
 private:
     std::string outputIdentifier;
     size_t slotIndex;
@@ -7310,6 +7382,11 @@ private:
     // inputs.size(), and members initialize in declaration order.
     nat::tools::CombineJoinConfig joinConfig{};
     nat::tools::CombineJoiner<NormalizedNumericChannelFrame> joiner;
+    // Combine is the one worker with BOTH lanes: it merges data and interleaves
+    // markers, and the strip showing them as two rows is how a marker lane's
+    // behaviour becomes visible at all.
+    nat::tools::ChannelActivity dataActivity{};
+    nat::tools::ChannelActivity markerActivity{};
 
     // Flattens every input frame down to one scalar per (channel, sample)
     // pair and concatenates them all into a single samplesPerChannel==1
@@ -7435,6 +7512,7 @@ private:
                         continue;  // not a marker event; skip defensively
                     }
                     markerOutputMessenger->sendMessage(*record);
+                    markerActivity.record(record->getTimestampUs());
                     framesProcessed.fetch_add(1);
                     lastFrameAtUs.store(nowUs());
                 }
@@ -7456,6 +7534,7 @@ private:
                         frames.size() == 1
                             ? passThrough(frames.front(), emission->outputTsUs)
                             : concatenate(frames, emission->outputTsUs));
+                    dataActivity.record(emission->outputTsUs);
                     framesProcessed.fetch_add(1);
                     lastFrameAtUs.store(nowUs());
                     made_progress = true;
@@ -7558,6 +7637,8 @@ std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
         search->second->getThreadSlotId(),
         search->second->getFramesDropped(),
         search->second->getJoinPolicyName(),
+        search->second->getDataActivity(),
+        search->second->getMarkerActivity(),
     };
 }
 
@@ -7997,6 +8078,15 @@ public:
     // between a detector that works and one that is merely quiet.
     uint64_t getFramesDropped() const { return suppressed.load(); }
 
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
 private:
     void run()
     {
@@ -8043,6 +8133,7 @@ private:
                     detector.push(frame.deviceTsUs, frame.sampleRateHz, channel);
                 for (const auto& crossing : crossings) {
                     markerOutputMessenger->sendMessage(buildMarker(frame, crossing));
+                    markerActivity.record(crossing.atUs);
                     framesProcessed.fetch_add(1);
                     lastFrameAtUs.store(nowUs());
                 }
@@ -8097,6 +8188,7 @@ private:
     std::unique_ptr<nat::core::TopicMessenger> markerOutputMessenger;
     ThresholdWorkerSettings settings{};
     nat::tools::ThresholdDetector detector;
+    nat::tools::ChannelActivity markerActivity{};
     uint64_t markerSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -8124,6 +8216,8 @@ std::optional<LiveTransformWorkerSnapshot> getLiveThresholdWorkerSnapshot(
         search->second->getThreadSlotId(),
         search->second->getFramesDropped(),
         std::string{},
+        nat::tools::ActivitySnapshot{},
+        search->second->getMarkerActivity(),
     };
 }
 
@@ -8336,6 +8430,15 @@ public:
     // split at the sample, a frame-granular count means nothing.
     uint64_t getFramesDropped() const { return rejected.load(); }
 
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getDataActivity() const
+    {
+        return dataActivity.snapshot(dataActivity.newestUs());
+    }
 private:
     void run()
     {
@@ -8384,6 +8487,7 @@ private:
                 // and closes inside it.
                 while (const auto span = gate.tryEmit()) {
                     dataOutputMessenger->sendMessage(slice(*span));
+                    dataActivity.record(span->startTsUs);
                     framesProcessed.fetch_add(1);
                     lastFrameAtUs.store(nowUs());
                     made_progress = true;
@@ -8461,6 +8565,7 @@ private:
     std::unique_ptr<nat::core::TopicMessenger> dataOutputMessenger;
     GateWorkerSettings settings{};
     nat::tools::SampleGate<NormalizedNumericChannelFrame> gate;
+    nat::tools::ChannelActivity dataActivity{};
     uint64_t outputSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -8488,6 +8593,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGateWorkerSnapshot(
         search->second->getThreadSlotId(),
         search->second->getFramesDropped(),
         std::string{},
+        search->second->getDataActivity(),
     };
 }
 
@@ -8714,6 +8820,15 @@ public:
     // answerable from the node status instead of by reading the config back.
     uint64_t getFramesDropped() const { return dropped.load(); }
 
+
+    // Marble-strip activity (TEC-NATKIT-106), snapshotted relative to this
+    // lane's own newest event. The frontend aligns rows on the newest base
+    // across the graph, because a SHARED time axis is what makes two rows
+    // comparable -- which is the entire point of drawing them together.
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
 private:
     void run()
     {
@@ -8827,6 +8942,7 @@ private:
             marker.getEmittedAtUs(),
             marker.getAttributesJson());
         markerOutputMessenger->sendMessage(out);
+        markerActivity.record(marker.getEmittedAtUs());
         framesProcessed.fetch_add(1);
         lastFrameAtUs.store(nowUs());
     }
@@ -8841,6 +8957,7 @@ private:
     nat::tools::MarkerDebounce debounce;
     nat::tools::MarkerMerge<nat::core::MarkerEventV1> merge;
     nat::tools::MarkerTakeUntil<nat::core::MarkerEventV1> takeUntil{};
+    nat::tools::ChannelActivity markerActivity{};
     uint64_t outputSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -8868,6 +8985,8 @@ std::optional<LiveTransformWorkerSnapshot> getLiveMarkerOpWorkerSnapshot(
         search->second->getThreadSlotId(),
         search->second->getFramesDropped(),
         std::string{},
+        nat::tools::ActivitySnapshot{},
+        search->second->getMarkerActivity(),
     };
 }
 
