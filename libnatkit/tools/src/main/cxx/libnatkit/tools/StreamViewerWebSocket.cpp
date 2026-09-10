@@ -1612,9 +1612,11 @@ nlohmann::json buildNodeCatalogJson()
           "Emits a marker when consecutive frames arrive further apart than "
           "they should. Decided from the frames' own timestamps, so it replays "
           "identically — it detects a DROPOUT in the data, not a quiet "
-          "network. The marker says whether frames were lost or the producer "
-          "paused, which is what seq_no is for. Wire it into a gate to capture "
-          "only while the sensor is healthy."},
+          "network. The marker is stamped where the data STOPPED and says "
+          "whether frames were lost or the producer paused. NOTE: it fires when "
+          "data RESUMES - a gap is the distance between two frames, so a "
+          "dropout still in progress shows as a stalled node rather than a "
+          "marker. Wire it into a gate to capture only healthy stretches."},
          {"config_fields",
           nlohmann::json::array(
               {{{"id", "gap_ms"},
@@ -1895,6 +1897,26 @@ inline bool isMarkerSourceKind(const std::string& kind)
         kind == "gap_detect" || kind == "marker_merge" ||
         kind == "marker_filter" || kind == "marker_debounce" ||
         kind == "marker_take_until";
+}
+
+// ⚠️ TWO DIFFERENT QUESTIONS, AND CONFLATING THEM BREAKS SIX NODE KINDS.
+//
+// isMarkerSourceKind() answers "does this node's OUTPUT carry markers", which
+// is what a downstream consumer needs in order to classify an inbound edge. It
+// is true of threshold, gap_detect and all four marker operators.
+//
+// This answers "is this node the markers/experiment node that republishes the
+// board's experiment timeline", which is what the START PATH needs in order to
+// dispatch. It is true of exactly two kinds.
+//
+// They were the same function for a while, and because the start path's markers
+// branch runs BEFORE the operator branches, every kind added to the classifier
+// was silently claimed by it: the node reported "running" with the markers
+// node's own status message and did nothing at all. Every unit test still
+// passed, because the logic was never the problem. Keep them separate.
+inline bool isExperimentMarkerNode(const std::string& kind)
+{
+    return kind == "markers" || kind == "experiment";
 }
 
 // The DATA -> MARKER crossings. `threshold` fires on a level; `gap_detect`
@@ -12812,7 +12834,7 @@ void executeStreamGraphStart(
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
         }
-        if (isMarkerSourceKind(node.kind)) {
+        if (isExperimentMarkerNode(node.kind)) {
             // Recording is driven client-side (the browser runs the protocol
             // timeline and publishes the session bundle via
             // publish_session_bundle). The runtime just marks the node ready. A

@@ -18,6 +18,17 @@
 // worker as `stalled` from the wall clock, in the status layer. This file is
 // the data-time half only, and it must stay that way.
 //
+// ⚠️ IT FIRES WHEN DATA RESUMES, NOT WHEN IT STOPS. A gap is the distance
+// between two consecutive frames, so it is only measurable once the second one
+// arrives: a dropout that NEVER recovers produces no marker at all. That is not
+// an oversight, it is the same boundary again -- knowing that a silence is still
+// going on requires a clock the data cannot supply -- but it is a sharp edge,
+// because "gap detector" sounds like it should fire on the silence itself. A
+// dropout in progress shows up as a STALLED node (classifyTransformWorkerStatus)
+// and on the marble strips as a lane gone quiet; a dropout that recovered shows
+// up here, with its duration and cause. Both surfaces are needed and neither
+// replaces the other.
+//
 // Transport-free like ThresholdDetect.hpp: the worker owns the I/O.
 
 #include <cmath>
