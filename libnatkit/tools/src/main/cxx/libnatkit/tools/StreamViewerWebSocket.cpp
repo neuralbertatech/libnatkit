@@ -4,6 +4,7 @@
 #include "GraphTopicResolution.hpp"
 #include "GraphTransportPlan.hpp"
 #include "InProcessTransport.hpp"
+#include "CombineJoin.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
 #include "DeviceControls.hpp"
@@ -1404,6 +1405,12 @@ nlohmann::json buildNodeCatalogJson()
     }
 
     // Combine — fans in >=2 upstream frames into one flattened feature vector.
+    //
+    // The join policy is the node's one real parameter (TEC-NATKIT-103). Each
+    // option is a different answer to "these inputs did not arrive together,
+    // now what", and picking the wrong one is silently wrong rather than an
+    // error — hence the labels spelling out what each is FOR, not just what it
+    // is called. See CombineJoin.hpp for the semantics.
     nodes.push_back(
         {{"node_type", "combine"},
          {"kind", "combine"},
@@ -1413,8 +1420,44 @@ nlohmann::json buildNodeCatalogJson()
          {"description",
           "Fans in two or more upstream channel frames into one flattened "
           "feature-vector frame (e.g. several feature extractors into a model "
-          "input)."},
-         {"config_fields", nlohmann::json::array()},
+          "input). How mismatched cadences are reconciled is set by the join "
+          "policy."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "join_policy"},
+                {"label", "Join policy"},
+                {"type", "enum"},
+                {"required", true},
+                {"default_option", "zip"},
+                {"options",
+                 nlohmann::json::array({"zip", "combine_latest",
+                                        "with_latest_from", "sample"})},
+                {"option_labels",
+                 nlohmann::json::array(
+                     {"zip — lockstep, wait for laggards",
+                      "combine latest — emit on any input",
+                      "with latest from — input 1 is the clock",
+                      "sample — a fixed rate drives output"})}},
+               {{"id", "align_tolerance_ms"},
+                {"label", "Align tolerance (ms)"},
+                {"type", "number"},
+                {"required", false},
+                {"min", 0},
+                {"step", 1},
+                {"default_value", 50},
+                {"visible_when",
+                 {{"field", "join_policy"},
+                  {"equals", nlohmann::json::array({"zip"})}}}},
+               {{"id", "sample_rate_hz"},
+                {"label", "Output rate (Hz)"},
+                {"type", "number"},
+                {"required", false},
+                {"min", 0.1},
+                {"step", 1},
+                {"default_value", 10},
+                {"visible_when",
+                 {{"field", "join_policy"},
+                  {"equals", nlohmann::json::array({"sample"})}}}}})},
          {"input_ports", singleInputPort()},
          {"output_ports", singleOutputPort()},
          {"variadic_inputs", true}});
@@ -1681,6 +1724,11 @@ struct StreamGraphNodeRuntimeStatus {
     // construction. When present it includes the DATA topic id equal to
     // outputStreamId for the one-topic (backward-compat) case.
     std::vector<StreamGraphOutputTopic> outputTopics{};
+    // Combine only: frames the join discarded and the policy that discarded
+    // them, so "why is my output slower than my inputs" is answerable from the
+    // status rather than by reading the join code.
+    uint64_t framesDropped = 0;
+    std::string joinPolicy{};
 };
 
 // Build one output-channel topic entry directly (used where no worker exists,
@@ -1711,6 +1759,12 @@ struct LiveTransformWorkerSnapshot {
     uint64_t lastFrameAtUs = 0;
     std::string workerId{};
     std::string threadSlotId{};
+    // Combine only (TEC-NATKIT-103): frames the join discarded, and which policy
+    // discarded them. Zero and empty for a transform worker, which has one input
+    // and therefore nothing to reconcile. Kept last so the existing 4-field
+    // aggregate initializers still compile.
+    uint64_t framesDropped = 0;
+    std::string joinPolicy{};
 };
 
 std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
@@ -2001,6 +2055,10 @@ void to_json(nlohmann::json& json, const StreamGraphNodeRuntimeStatus& value)
     if (value.threadSlotId.has_value()) {
         json["thread_slot_id"] = value.threadSlotId.value();
     }
+    if (!value.joinPolicy.empty()) {
+        json["join_policy"] = value.joinPolicy;
+        json["frames_dropped"] = value.framesDropped;
+    }
     if (value.message.has_value()) {
         json["message"] = value.message.value();
     }
@@ -2215,6 +2273,8 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
             status.lastFrameAtUs = live_worker->lastFrameAtUs;
             status.workerId = live_worker->workerId;
             status.threadSlotId = live_worker->threadSlotId;
+            status.framesDropped = live_worker->framesDropped;
+            status.joinPolicy = live_worker->joinPolicy;
             status.state =
                 classifyTransformWorkerStatus(1, status.lastFrameAtUs);
         }
@@ -3602,6 +3662,22 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     result.nodeDiagnostics[node.id],
                     "invalid_combine_output_ports",
                     "combine nodes must expose exactly one output port in V1.");
+            }
+            // Reported here rather than at start time: the runtime falls back to
+            // `zip` for an unrecognised policy (a graph that will not run is
+            // worse than one that runs as it used to), so validation is the only
+            // place the author is told the value did not take effect.
+            if (node.config.is_object() && node.config.contains("join_policy")) {
+                const auto requested =
+                    node.config.value("join_policy", std::string{});
+                if (!nat::tools::parseCombineJoinPolicy(requested).has_value()) {
+                    addGraphDiagnostic(
+                        result,
+                        result.nodeDiagnostics[node.id],
+                        "unknown_combine_join_policy",
+                        "join_policy must be one of zip, combine_latest, "
+                        "with_latest_from, sample (got '" + requested + "').");
+                }
             }
         } else if (node.kind == "markers" || node.kind == "experiment") {
             // A markers node exposes exactly one output port, `markers` (the
@@ -6588,19 +6664,24 @@ bool stopTransformWorkerByOutputStreamId(
     return true;
 }
 
-// A `combine` node fans in N ≥ 2 upstream streams into one. Each upstream is
-// expected to already be frame-cadence-aligned with the others (e.g. several
-// feature-extraction transforms all deriving from the same sliding_window),
-// so alignment is a simple per-input FIFO: once every input has ≥1 queued
-// frame, pop one from each and concatenate. This is not general time-sync —
-// mismatched cadences will silently misalign.
+// A `combine` node fans in N ≥ 2 upstream streams into one.
+//
+// HOW the inputs are reconciled is a per-node choice, not a property of this
+// class: see CombineJoinPolicy in CombineJoin.hpp for the four policies and what
+// each is right for. This worker owns the I/O and delegates every alignment
+// decision to CombineJoiner, which is why the policies are unit-testable without
+// a broker (CombineJoinTest.cpp).
+//
+// Before TEC-NATKIT-103 there was one policy — arrival-order FIFO, later a
+// timestamp window with a hardcoded 50 ms tolerance — and no way to select
+// another, so mixed-cadence inputs misaligned silently. `zip` is still the
+// default, so a graph saved before this change behaves exactly as it did.
 struct CombineInputState {
     uint64_t sourceStreamId = 0;
     std::shared_ptr<nat::core::BasicTopicInformation> sourceTopic;
     std::unique_ptr<nat::core::TopicMessenger> sourceMessenger;
     std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
         descriptorMaybe{};
-    std::deque<NormalizedNumericChannelFrame> queue{};
 };
 
 // Topic-aware channels (Part B): a combine input can carry a MARKER topic. The
@@ -6622,7 +6703,8 @@ public:
         const std::shared_ptr<nat::core::BasicTopicInformation>& output_topic,
         std::unique_ptr<nat::core::TopicMessenger>&& output_messenger,
         const std::shared_ptr<nat::core::BasicTopicInformation>& marker_output_topic,
-        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger)
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger,
+        const nat::tools::CombineJoinConfig& join_config)
         : outputIdentifier(output_identifier),
           slotIndex(slot_index),
           inputs(std::move(inputs)),
@@ -6630,7 +6712,9 @@ public:
           outputTopic(output_topic),
           outputMessenger(std::move(output_messenger)),
           markerOutputTopic(marker_output_topic),
-          markerOutputMessenger(std::move(marker_output_messenger))
+          markerOutputMessenger(std::move(marker_output_messenger)),
+          joinConfig(join_config),
+          joiner(this->inputs.size(), join_config)
     {
     }
 
@@ -6718,13 +6802,21 @@ public:
         return framesProcessed.load();
     }
 
-private:
-    static constexpr size_t kMaxQueuedFramesPerInput = 64;
-    // Two frames align if their device_ts_us differ by <= this (Phase 5). ~half
-    // a typical windowed-feature cadence; tolerant enough for jittered live
-    // frames, tight enough that replay pairs the right frames across streams.
-    static constexpr uint64_t kAlignToleranceUs = 50'000;  // 50 ms
+    // Frames the join discarded rather than emitted. Reported on the node's
+    // status so a policy that drops is LOUD about it — silent dropping is the
+    // whole complaint TEC-NATKIT-103 was filed about, and a policy that drops
+    // visibly is a legitimate choice.
+    uint64_t getFramesDropped() const
+    {
+        return framesDropped.load();
+    }
 
+    const char* getJoinPolicyName() const
+    {
+        return nat::tools::combineJoinPolicyName(joinConfig.policy);
+    }
+
+private:
     std::string outputIdentifier;
     size_t slotIndex;
     std::vector<CombineInputState> inputs;
@@ -6738,15 +6830,25 @@ private:
     std::atomic<uint64_t> startedAtUs{0};
     std::atomic<uint64_t> lastFrameAtUs{0};
     std::atomic<uint64_t> framesProcessed{0};
+    std::atomic<uint64_t> framesDropped{0};
     std::thread workerThread;
+    // ⚠️ MUST be declared after `inputs`: the constructor sizes the joiner from
+    // inputs.size(), and members initialize in declaration order.
+    nat::tools::CombineJoinConfig joinConfig{};
+    nat::tools::CombineJoiner<NormalizedNumericChannelFrame> joiner;
 
     // Flattens every input frame down to one scalar per (channel, sample)
     // pair and concatenates them all into a single samplesPerChannel==1
     // output frame — a flat feature vector regardless of how many samples
     // per channel each individual input carried (e.g. mixing mav's 1-per-
     // channel output with ar_coeffs' ar_order-per-channel output).
+    // `output_ts_us` is the joiner's decision, not this function's: which clock
+    // stamps a merged frame differs per policy (the group's lead under zip, the
+    // newest constituent under combineLatest, the primary's under
+    // withLatestFrom, the tick's under sample). See CombineJoin.hpp.
     nat::core::NatSignalFrameDataSchemaV1 concatenate(
-        const std::vector<NormalizedNumericChannelFrame>& frames)
+        const std::vector<NormalizedNumericChannelFrame>& frames,
+        uint64_t output_ts_us)
     {
         std::vector<std::string> labels{};
         std::vector<float> samples{};
@@ -6779,7 +6881,7 @@ private:
         return nat::core::NatSignalFrameDataSchemaV1(
             lead.deviceId,
             outputSeqNo++,
-            lead.deviceTsUs,
+            output_ts_us,
             lead.sampleRateHz,
             labels,
             samples,
@@ -6791,12 +6893,13 @@ private:
     // samples-per-channel, so a raw waveform stays a waveform instead of being
     // flattened into a one-sample-per-channel feature vector by concatenate().
     nat::core::NatSignalFrameDataSchemaV1 passThrough(
-        const NormalizedNumericChannelFrame& frame)
+        const NormalizedNumericChannelFrame& frame,
+        uint64_t output_ts_us)
     {
         return nat::core::NatSignalFrameDataSchemaV1(
             frame.deviceId,
             outputSeqNo++,
-            frame.deviceTsUs,
+            output_ts_us,
             frame.sampleRateHz,
             frame.channelLabels,
             frame.samples,
@@ -6806,12 +6909,15 @@ private:
     void run()
     {
         LOG_INFO << "StreamViewer: Starting combine worker inputs=" << inputs.size()
-                 << " output=" << getOutputTopic();
+                 << " output=" << getOutputTopic()
+                 << " join=" << getJoinPolicyName();
 
         while (active.load()) {
             try {
                 bool made_progress = false;
-                for (auto& input : inputs) {
+                for (size_t input_index = 0; input_index < inputs.size();
+                     ++input_index) {
+                    auto& input = inputs[input_index];
                     const auto message_maybe = input.sourceMessenger->tryGetNexMessage();
                     if (!message_maybe.has_value()) {
                         continue;
@@ -6830,10 +6936,7 @@ private:
                     if (!normalized.has_value()) {
                         continue;
                     }
-                    input.queue.push_back(normalized.value());
-                    while (input.queue.size() > kMaxQueuedFramesPerInput) {
-                        input.queue.pop_front();
-                    }
+                    joiner.push(input_index, normalized.value());
                 }
 
                 // Marker lane (Part B): forward every MarkerEventV1 from each
@@ -6862,69 +6965,29 @@ private:
                     lastFrameAtUs.store(nowUs());
                 }
 
-                bool all_ready = !inputs.empty();
-                for (const auto& input : inputs) {
-                    if (input.queue.empty()) {
-                        all_ready = false;
+                // Drain, do not poll once: CombineLatest can owe several
+                // emissions after one polling pass (one per arrival), and Sample
+                // can owe several ticks after a fast replay advances the data
+                // clock. Emitting at most one per pass would silently rate-limit
+                // the output to the poll loop's cadence.
+                while (const auto emission = joiner.tryEmit()) {
+                    const auto& frames = emission->frames;
+                    if (frames.empty()) {
                         break;
                     }
+                    // One data input (e.g. data+markers "stream"): pass it
+                    // through so the waveform is preserved. Two or more: concat
+                    // into a feature vector (the genuine numeric merge).
+                    outputMessenger->sendMessage(
+                        frames.size() == 1
+                            ? passThrough(frames.front(), emission->outputTsUs)
+                            : concatenate(frames, emission->outputTsUs));
+                    framesProcessed.fetch_add(1);
+                    lastFrameAtUs.store(nowUs());
+                    made_progress = true;
                 }
-
-                if (all_ready) {
-                    // Timestamp-aligned combine (Phase 5, Part E): align inputs
-                    // by device_ts_us, not arrival order. FIFO ("pop the front
-                    // of each") silently misaligns mismatched cadences and is
-                    // wrong for replay; here we emit one concatenated frame per
-                    // aligned timestamp group. Each queue is time-ordered, so the
-                    // front is the oldest unconsumed frame per input.
-                    //
-                    // target = the newest of the per-input fronts: every input
-                    // must have reached at least this time to align here.
-                    uint64_t target_ts = 0;
-                    for (const auto& input : inputs) {
-                        target_ts =
-                            std::max(target_ts, input.queue.front().deviceTsUs);
-                    }
-                    // Drop unmatchably-old frames (a faster input's frames with
-                    // no counterpart near target), keeping at least one.
-                    for (auto& input : inputs) {
-                        while (input.queue.size() > 1 &&
-                               input.queue.front().deviceTsUs +
-                                       kAlignToleranceUs <
-                                   target_ts) {
-                            input.queue.pop_front();
-                        }
-                    }
-                    // Aligned only if every input's front is within tolerance of
-                    // the target; otherwise wait for a lagging input to catch up.
-                    bool aligned_ready = true;
-                    for (const auto& input : inputs) {
-                        const uint64_t ts = input.queue.front().deviceTsUs;
-                        const uint64_t diff =
-                            ts > target_ts ? ts - target_ts : target_ts - ts;
-                        if (diff > kAlignToleranceUs) {
-                            aligned_ready = false;
-                            break;
-                        }
-                    }
-                    if (aligned_ready) {
-                        std::vector<NormalizedNumericChannelFrame> aligned{};
-                        aligned.reserve(inputs.size());
-                        for (auto& input : inputs) {
-                            aligned.push_back(input.queue.front());
-                            input.queue.pop_front();
-                        }
-                        // One data input (e.g. data+markers "stream"): pass it
-                        // through so the waveform is preserved. Two or more: concat
-                        // into a feature vector (the genuine numeric merge).
-                        outputMessenger->sendMessage(
-                            aligned.size() == 1 ? passThrough(aligned.front())
-                                                : concatenate(aligned));
-                        framesProcessed.fetch_add(1);
-                        lastFrameAtUs.store(nowUs());
-                        made_progress = true;
-                    }
-                }
+                framesDropped.store(
+                    joiner.droppedUnmatched() + joiner.droppedOverflow());
 
                 if (!made_progress) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -6998,6 +7061,8 @@ std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
         search->second->getLastFrameAtUs(),
         "natkit-local-combine-worker",
         search->second->getThreadSlotId(),
+        search->second->getFramesDropped(),
+        search->second->getJoinPolicyName(),
     };
 }
 
@@ -7033,11 +7098,49 @@ struct CombineWorkerInput {
     int64_t startOffset = -1;
 };
 
+// Reads a combine node's join policy out of its generic node config. Unknown or
+// malformed values fall back to the historical behaviour rather than refusing to
+// start, because a graph that will not run is a worse outcome than one that runs
+// as it did before — validation (validateStreamGraph) is where a bad policy is
+// reported to the author, and it runs before this does.
+nat::tools::CombineJoinConfig parseCombineJoinConfig(const nlohmann::json& config)
+{
+    nat::tools::CombineJoinConfig join_config;
+    if (!config.is_object()) {
+        return join_config;
+    }
+    const auto policy_maybe = nat::tools::parseCombineJoinPolicy(
+        config.value("join_policy", std::string{"zip"}));
+    if (policy_maybe.has_value()) {
+        join_config.policy = policy_maybe.value();
+    }
+    // Milliseconds on the wire (what the inspector shows), microseconds
+    // internally (what device_ts_us is in). A zero tolerance is legitimate —
+    // it means "exact timestamp equality" — so only a negative is rejected.
+    if (config.contains("align_tolerance_ms") &&
+        config["align_tolerance_ms"].is_number()) {
+        const double ms = config["align_tolerance_ms"].get<double>();
+        if (ms >= 0.0) {
+            join_config.alignToleranceUs = static_cast<uint64_t>(ms * 1000.0);
+        }
+    }
+    if (config.contains("sample_rate_hz") &&
+        config["sample_rate_hz"].is_number()) {
+        const double hz = config["sample_rate_hz"].get<double>();
+        if (hz > 0.0) {
+            join_config.samplePeriodUs =
+                static_cast<uint64_t>(1'000'000.0 / hz);
+        }
+    }
+    return join_config;
+}
+
 CreateCombineWorkerResult createCombineWorker(
     const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
     const std::vector<CombineWorkerInput>& input_channels,
     const std::string& output_identifier,
-    bool output_in_process = false)
+    bool output_in_process = false,
+    const nat::tools::CombineJoinConfig& join_config = {})
 {
     CreateCombineWorkerResult result;
     result.outputIdentifier = output_identifier;
@@ -7237,7 +7340,8 @@ CreateCombineWorkerResult createCombineWorker(
             out_data_topic,
             std::move(out_data_messenger),
             out_marker_topic,
-            std::move(out_marker_messenger));
+            std::move(out_marker_messenger),
+            join_config);
         g_combine_workers.emplace(output_stream_id, worker);
     }
     worker->start();
@@ -10768,7 +10872,8 @@ void executeStreamGraphStart(
 
             const auto create_result = createCombineWorker(
                 broker_manager, input_channels,
-                node.outputIdentifier.value_or(node.id), outputInProcess(node.id));
+                node.outputIdentifier.value_or(node.id), outputInProcess(node.id),
+                parseCombineJoinConfig(node.config));
             if (!create_result.ok) {
                 encountered_error = true;
                 const StreamGraphNodeRuntimeStatus status{
@@ -11515,7 +11620,8 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                 const auto create_result = createCombineWorker(
                     broker_manager_, input_channels,
                     node.outputIdentifier.value_or(node.id),
-                    outputInProcess(node.id));
+                    outputInProcess(node.id),
+                    parseCombineJoinConfig(node.config));
                 if (!create_result.ok) {
                     status = {"error", std::nullopt, std::nullopt, std::nullopt, 0, 0,
                               create_result.error};
