@@ -8,6 +8,7 @@
 #include "ThresholdDetect.hpp"
 #include "SampleGate.hpp"
 #include "MarkerOps.hpp"
+#include "GapDetect.hpp"
 #include "ChannelActivity.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
@@ -1600,6 +1601,35 @@ nlohmann::json buildNodeCatalogJson()
          {"output_ports", markersOutputPort()},
          {"variadic_inputs", false}});
 
+    // Gap detector — DATA in, MARKERS out. Silence becomes an event.
+    nodes.push_back(
+        {{"node_type", "gap_detect"},
+         {"kind", "gap_detect"},
+         {"category", "transform"},
+         {"runner", "cpp_dsp"},
+         {"label", "Gap detector"},
+         {"description",
+          "Emits a marker when consecutive frames arrive further apart than "
+          "they should. Decided from the frames' own timestamps, so it replays "
+          "identically — it detects a DROPOUT in the data, not a quiet "
+          "network. The marker is stamped where the data STOPPED and says "
+          "whether frames were lost or the producer paused. NOTE: it fires when "
+          "data RESUMES - a gap is the distance between two frames, so a "
+          "dropout still in progress shows as a stalled node rather than a "
+          "marker. Wire it into a gate to capture only healthy stretches."},
+         {"config_fields",
+          nlohmann::json::array(
+              {{{"id", "gap_ms"},
+                {"label", "Gap (ms)"},
+                {"type", "number"},
+                {"required", true},
+                {"min", 1},
+                {"step", 1},
+                {"default_value", 250}}})},
+         {"input_ports", singleInputPort()},
+         {"output_ports", markersOutputPort()},
+         {"variadic_inputs", false}});
+
     // Gate — MARKERS + DATA in, DATA out. "Only the cue windows", as wiring.
     nodes.push_back(
         {{"node_type", "gate"},
@@ -1864,8 +1894,38 @@ inline bool isMarkerSourceKind(const std::string& kind)
     // The four marker-lane operators (TEC-NATKIT-105) are marker sources too:
     // they consume markers and emit markers, so they never leave the lane.
     return kind == "markers" || kind == "experiment" || kind == "threshold" ||
-        kind == "marker_merge" || kind == "marker_filter" ||
-        kind == "marker_debounce" || kind == "marker_take_until";
+        kind == "gap_detect" || kind == "marker_merge" ||
+        kind == "marker_filter" || kind == "marker_debounce" ||
+        kind == "marker_take_until";
+}
+
+// ⚠️ TWO DIFFERENT QUESTIONS, AND CONFLATING THEM BREAKS SIX NODE KINDS.
+//
+// isMarkerSourceKind() answers "does this node's OUTPUT carry markers", which
+// is what a downstream consumer needs in order to classify an inbound edge. It
+// is true of threshold, gap_detect and all four marker operators.
+//
+// This answers "is this node the markers/experiment node that republishes the
+// board's experiment timeline", which is what the START PATH needs in order to
+// dispatch. It is true of exactly two kinds.
+//
+// They were the same function for a while, and because the start path's markers
+// branch runs BEFORE the operator branches, every kind added to the classifier
+// was silently claimed by it: the node reported "running" with the markers
+// node's own status message and did nothing at all. Every unit test still
+// passed, because the logic was never the problem. Keep them separate.
+inline bool isExperimentMarkerNode(const std::string& kind)
+{
+    return kind == "markers" || kind == "experiment";
+}
+
+// The DATA -> MARKER crossings. `threshold` fires on a level; `gap_detect`
+// fires on silence. They are otherwise identical in shape -- one data input,
+// one marker output, one output port -- so every wiring site treats them the
+// same and says so through this rather than by listing both.
+inline bool isDataToMarkerKind(const std::string& kind)
+{
+    return kind == "threshold" || kind == "gap_detect";
 }
 
 // The marker-lane operators, which are marker-in/marker-out (TEC-NATKIT-105).
@@ -1894,9 +1954,9 @@ enum class ChannelLane { Data, Marker };
 inline std::optional<ChannelLane> requiredInputLane(
     const std::string& kind, const std::string& port_id)
 {
-    if (kind == "threshold") {
-        // Its whole job is reading a numeric channel; markers have no level to
-        // cross.
+    if (isDataToMarkerKind(kind)) {
+        // Their whole job is reading a numeric channel: markers have no level
+        // to cross and no frame cadence to fall behind.
         return ChannelLane::Data;
     }
     if (kind == "gate") {
@@ -2545,7 +2605,7 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
         }
         if ((node.kind == "transform" || node.kind == "combine" ||
              node.kind == "threshold" || node.kind == "gate" ||
-             isMarkerOperatorKind(node.kind)) &&
+             node.kind == "gap_detect" || isMarkerOperatorKind(node.kind)) &&
             node.outputStreamId.has_value()) {
             json["node_statuses"][node.id] = StreamGraphNodeRuntimeStatus{
                 "stopped",
@@ -3871,7 +3931,8 @@ StreamGraphValidationResult validateStreamGraphDefinition(
             node.kind != "combine" && node.kind != "markers" &&
             node.kind != "experiment" && node.kind != "train" &&
             node.kind != "export" && node.kind != "threshold" &&
-            node.kind != "gate" && !isMarkerOperatorKind(node.kind)) {
+            node.kind != "gate" && node.kind != "gap_detect" &&
+            !isMarkerOperatorKind(node.kind)) {
             addGraphDiagnostic(
                 result,
                 result.nodeDiagnostics[node.id],
@@ -3996,6 +4057,7 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                 }
             }
         } else if (node.kind == "threshold" || node.kind == "gate" ||
+                   node.kind == "gap_detect" ||
                    isMarkerOperatorKind(node.kind)) {
             // Everything here publishes a topic, so everything here needs an
             // identifier to publish it under, on the same rules as combine and
@@ -4021,7 +4083,21 @@ StreamGraphValidationResult validateStreamGraphDefinition(
                     "invalid_output_ports",
                     node.kind + " nodes expose exactly one output port.");
             }
-            if (isMarkerOperatorKind(node.kind)) {
+            if (node.kind == "gap_detect") {
+                // Reported rather than corrected, like every other config here:
+                // a gap of zero would fire on every frame, which is silence
+                // reported as continuous failure.
+                if (node.config.is_object() && node.config.contains("gap_ms")) {
+                    const auto value = node.config["gap_ms"];
+                    if (!value.is_number() || value.get<double>() <= 0.0) {
+                        addGraphDiagnostic(
+                            result,
+                            result.nodeDiagnostics[node.id],
+                            "invalid_gap_ms",
+                            "gap_ms must be a positive number of milliseconds.");
+                    }
+                }
+            } else if (isMarkerOperatorKind(node.kind)) {
                 // take-until's two inputs are not interchangeable, and merge
                 // needs something to merge; both are refused here rather than
                 // producing a node that runs and emits nothing.
@@ -6915,6 +6991,8 @@ std::shared_ptr<nat::core::BasicTopicInformation>
 findThresholdMarkerTopicForStream(uint64_t stream_id);
 std::shared_ptr<nat::core::BasicTopicInformation> findMarkerOpTopicForStream(
     uint64_t stream_id);
+std::shared_ptr<nat::core::BasicTopicInformation> findGapMarkerTopicForStream(
+    uint64_t stream_id);
 
 // Buffering policy for graph in-process channels. Graph edges carry real-time
 // signal frames, so a full channel drops its oldest frame (matches the
@@ -7618,6 +7696,12 @@ findGraphInternalMarkerTopicForStream(uint64_t stream_id)
     if (const auto marker_op_topic = findMarkerOpTopicForStream(stream_id)) {
         return marker_op_topic;
     }
+    // A gap detector publishes nothing until the data actually stops, so its
+    // topic is absent from broker metadata for as long as things are healthy --
+    // which is most of the time, and exactly when a downstream gate is bound.
+    if (const auto gap_topic = findGapMarkerTopicForStream(stream_id)) {
+        return gap_topic;
+    }
     return nullptr;
 }
 
@@ -7648,6 +7732,8 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGateWorkerSnapshot(
     uint64_t output_stream_id);
 std::optional<LiveTransformWorkerSnapshot> getLiveMarkerOpWorkerSnapshot(
     uint64_t output_stream_id);
+std::optional<LiveTransformWorkerSnapshot> getLiveGapWorkerSnapshot(
+    uint64_t output_stream_id);
 
 std::optional<LiveTransformWorkerSnapshot> getLiveGraphWorkerSnapshot(
     uint64_t output_stream_id)
@@ -7673,7 +7759,12 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGraphWorkerSnapshot(
     if (gate_snapshot.has_value()) {
         return gate_snapshot;
     }
-    return getLiveMarkerOpWorkerSnapshot(output_stream_id);
+    const auto marker_op_snapshot =
+        getLiveMarkerOpWorkerSnapshot(output_stream_id);
+    if (marker_op_snapshot.has_value()) {
+        return marker_op_snapshot;
+    }
+    return getLiveGapWorkerSnapshot(output_stream_id);
 }
 
 struct CreateCombineWorkerResult {
@@ -8715,6 +8806,320 @@ CreateLaneWorkerResult createGateWorker(
     return result;
 }
 
+// ===== The gap-detector worker (TEC-NATKIT-115) ===========================
+//
+// DATA in -> MARKER out, the second of the two crossings in that direction.
+// Shaped exactly like ThresholdWorker: one data input, one marker output, all
+// the decisions delegated to a transport-free header (GapDetect.hpp).
+
+nat::tools::GapConfig parseGapConfig(const nlohmann::json& config)
+{
+    nat::tools::GapConfig gap;
+    if (config.is_object() && config.contains("gap_ms") &&
+        config["gap_ms"].is_number()) {
+        const double ms = config["gap_ms"].get<double>();
+        if (ms > 0.0) {
+            gap.gapUs = static_cast<uint64_t>(ms * 1000.0);
+        }
+    }
+    return gap;
+}
+
+class GapWorker {
+public:
+    GapWorker(
+        const std::string& output_identifier,
+        size_t slot_index,
+        uint64_t source_stream_id,
+        std::unique_ptr<nat::core::TopicMessenger>&& source_messenger,
+        std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
+            descriptor_maybe,
+        const std::shared_ptr<nat::core::BasicTopicInformation>& marker_output_topic,
+        std::unique_ptr<nat::core::TopicMessenger>&& marker_output_messenger,
+        const nat::tools::GapConfig& gap_config)
+        : outputIdentifier(output_identifier),
+          slotIndex(slot_index),
+          sourceStreamId(source_stream_id),
+          sourceMessenger(std::move(source_messenger)),
+          descriptorMaybe(std::move(descriptor_maybe)),
+          markerOutputTopic(marker_output_topic),
+          markerOutputMessenger(std::move(marker_output_messenger)),
+          gapConfig(gap_config),
+          detector(gap_config)
+    {
+    }
+
+    ~GapWorker() { stop(); }
+
+    void start()
+    {
+        if (workerThread.joinable()) return;
+        active = true;
+        startedAtUs.store(nowUs());
+        workerThread = std::thread(&GapWorker::run, this);
+    }
+
+    void stop()
+    {
+        active = false;
+        if (workerThread.joinable()) workerThread.join();
+    }
+
+    uint64_t getOutputStreamId() const
+    {
+        return markerOutputTopic ? markerOutputTopic->id : 0;
+    }
+    std::string getOutputTopic() const
+    {
+        return markerOutputTopic ? markerOutputTopic->toTopicString() : std::string{};
+    }
+    std::shared_ptr<nat::core::BasicTopicInformation> getMarkerOutputTopicInfo() const
+    {
+        return markerOutputTopic;
+    }
+    const std::string& getOutputIdentifier() const { return outputIdentifier; }
+    size_t getSlotIndex() const { return slotIndex; }
+    std::string getThreadSlotId() const
+    {
+        std::ostringstream stream;
+        stream << "natkit-local-gap-worker:slot-";
+        stream << std::setw(2) << std::setfill('0') << (slotIndex + 1);
+        return stream.str();
+    }
+    uint64_t getStartedAtUs() const { return startedAtUs.load(); }
+    uint64_t getLastFrameAtUs() const { return lastFrameAtUs.load(); }
+    uint64_t getFramesProcessed() const { return framesProcessed.load(); }
+    // Producer restarts, reported through the drop counter. A rising count with
+    // no gaps means a device is rebooting -- which looks nothing like a dropout
+    // but would be indistinguishable if both were counted as gaps.
+    uint64_t getFramesDropped() const { return restarts.load(); }
+
+    // Marble-strip activity (TEC-NATKIT-106) for the marker lane.
+    nat::tools::ActivitySnapshot getMarkerActivity() const
+    {
+        return markerActivity.snapshot(markerActivity.newestUs());
+    }
+
+private:
+    void run()
+    {
+        LOG_INFO << "StreamViewer: Starting gap worker source=" << sourceStreamId
+                 << " output=" << getOutputTopic()
+                 << " gap_us=" << gapConfig.gapUs;
+
+        while (active.load()) {
+            try {
+                const auto message_maybe = sourceMessenger->tryGetNexMessage();
+                if (!message_maybe.has_value()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+                std::unique_ptr<nat::core::Schema> message =
+                    std::move(message_maybe.value());
+                if (!descriptorMaybe.has_value() || !descriptorMaybe.value()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                    continue;
+                }
+                const auto normalized = tryNormalizeNumericChannelFrame(
+                    *message, *descriptorMaybe.value(), std::nullopt,
+                    sourceStreamId);
+                if (!normalized.has_value()) continue;
+
+                const auto& frame = normalized.value();
+                const auto gap = detector.push(
+                    frame.deviceTsUs, frame.sampleRateHz,
+                    frame.samplesPerChannel, frame.seqNo);
+                restarts.store(detector.restarts());
+                if (!gap.has_value()) continue;
+
+                markerOutputMessenger->sendMessage(buildMarker(frame, gap.value()));
+                markerActivity.record(gap->atUs);
+                framesProcessed.fetch_add(1);
+                lastFrameAtUs.store(nowUs());
+            } catch (const std::exception& ex) {
+                LOG_ERROR << "StreamViewer: gap worker error: " << ex.what();
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+
+        LOG_INFO << "StreamViewer: Stopped gap worker output=" << getOutputTopic();
+    }
+
+    nat::core::MarkerEventV1 buildMarker(
+        const NormalizedNumericChannelFrame& frame,
+        const nat::tools::GapEvent& gap)
+    {
+        // `event` carries lost-vs-paused because a downstream marker_filter or
+        // gate can match on label or event and on NOTHING ELSE. Putting the
+        // distinction only in the attributes would make it undetectable by the
+        // operators meant to act on it.
+        nlohmann::json attributes;
+        attributes["gap_us"] = gap.gapUs;
+        attributes["seq_before"] = gap.seqBefore;
+        attributes["seq_after"] = gap.seqAfter;
+        attributes["frames_lost"] = gap.framesLost;
+        attributes["source_device_id"] = frame.deviceId;
+        std::ostringstream marker_id;
+        marker_id << outputIdentifier << "-" << (++markerSeqNo);
+        return nat::core::MarkerEventV1(
+            outputIdentifier,
+            "gap",
+            marker_id.str(),
+            nat::tools::gapCauseEvent(gap.cause),
+            outputIdentifier,
+            gap.atUs,
+            attributes.dump());
+    }
+
+    std::string outputIdentifier;
+    size_t slotIndex;
+    uint64_t sourceStreamId = 0;
+    std::unique_ptr<nat::core::TopicMessenger> sourceMessenger;
+    std::optional<std::shared_ptr<const nat::core::DataSchemaDescriptor>>
+        descriptorMaybe{};
+    std::shared_ptr<nat::core::BasicTopicInformation> markerOutputTopic;
+    std::unique_ptr<nat::core::TopicMessenger> markerOutputMessenger;
+    nat::tools::GapConfig gapConfig{};
+    nat::tools::GapDetector detector;
+    nat::tools::ChannelActivity markerActivity{};
+    uint64_t markerSeqNo = 0;
+    std::atomic<bool> active{false};
+    std::atomic<uint64_t> startedAtUs{0};
+    std::atomic<uint64_t> lastFrameAtUs{0};
+    std::atomic<uint64_t> framesProcessed{0};
+    std::atomic<uint64_t> restarts{0};
+    std::thread workerThread;
+};
+
+std::mutex g_gap_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<GapWorker>> g_gap_workers;
+
+std::optional<LiveTransformWorkerSnapshot> getLiveGapWorkerSnapshot(
+    uint64_t output_stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_gap_mutex);
+    const auto search = g_gap_workers.find(output_stream_id);
+    if (search == g_gap_workers.end() || !search->second) {
+        return std::nullopt;
+    }
+    return LiveTransformWorkerSnapshot{
+        search->second->getFramesProcessed(),
+        search->second->getLastFrameAtUs(),
+        "natkit-local-gap-worker",
+        search->second->getThreadSlotId(),
+        search->second->getFramesDropped(),
+        std::string{},
+        nat::tools::ActivitySnapshot{},
+        search->second->getMarkerActivity(),
+    };
+}
+
+std::shared_ptr<nat::core::BasicTopicInformation> findGapMarkerTopicForStream(
+    uint64_t stream_id)
+{
+    std::lock_guard<std::mutex> lock(g_gap_mutex);
+    const auto search = g_gap_workers.find(stream_id);
+    if (search != g_gap_workers.end() && search->second) {
+        return search->second->getMarkerOutputTopicInfo();
+    }
+    return nullptr;
+}
+
+bool stopGapWorkerByOutputStreamId(uint64_t output_stream_id)
+{
+    std::shared_ptr<GapWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_gap_mutex);
+        const auto search = g_gap_workers.find(output_stream_id);
+        if (search == g_gap_workers.end()) return false;
+        worker = search->second;
+        g_gap_workers.erase(search);
+    }
+    if (worker) worker->stop();
+    return true;
+}
+
+CreateLaneWorkerResult createGapWorker(
+    const std::shared_ptr<nat::kafka::BrokerManager>& broker_manager,
+    uint64_t source_stream_id,
+    const std::string& output_identifier,
+    const nlohmann::json& node_config,
+    bool input_in_process,
+    int64_t source_start_offset)
+{
+    CreateLaneWorkerResult result;
+    result.outputIdentifier = output_identifier;
+    result.workerId = "natkit-local-gap-worker";
+    if (!broker_manager) {
+        result.error = "Broker manager not available";
+        return result;
+    }
+
+    auto source_topic = nat::tools::resolveGraphSourceTopic(
+        source_stream_id,
+        [&](uint64_t id) {
+            return findTransformSourceTopicForStream(broker_manager, id);
+        },
+        findGraphInternalOutputTopicForStream);
+    if (source_topic == nullptr) {
+        result.error = "Could not locate a DATA topic for the gap detector's input";
+        return result;
+    }
+    auto descriptor_maybe =
+        nat::core::DataSchemaDescriptorRegistry::getDefault().findBySchemaName(
+            source_topic->schemaName);
+    if (!descriptor_maybe.has_value()) {
+        result.error = "No descriptor is available for the gap detector's input";
+        return result;
+    }
+
+    const auto marker_output_topic = createTopicInfo(
+        nat::core::StreamType::MARKER, "gap", output_identifier,
+        nat::core::MarkerEventV1::name);
+    if (marker_output_topic == nullptr) {
+        result.error = "Failed to create topic information for the gap detector";
+        return result;
+    }
+    const uint64_t output_stream_id = marker_output_topic->id;
+    result.outputStreamId = output_stream_id;
+
+    std::shared_ptr<GapWorker> worker;
+    {
+        std::lock_guard<std::mutex> lock(g_gap_mutex);
+        const auto duplicate = g_gap_workers.find(output_stream_id);
+        if (duplicate != g_gap_workers.end() && duplicate->second) {
+            result.ok = true;
+            result.alreadyExists = true;
+            result.threadSlotId = duplicate->second->getThreadSlotId();
+            result.outputTopics.push_back(makeChannelTopic(
+                nat::core::StreamType::MARKER, output_stream_id,
+                nat::core::MarkerEventV1::name));
+            return result;
+        }
+        worker = std::make_shared<GapWorker>(
+            output_identifier,
+            g_gap_workers.size(),
+            source_stream_id,
+            makeGraphSourceMessenger(
+                broker_manager, source_topic, input_in_process,
+                source_start_offset),
+            descriptor_maybe.value(),
+            marker_output_topic,
+            makeGraphOutputMessenger(broker_manager, marker_output_topic, false),
+            parseGapConfig(node_config));
+        g_gap_workers.emplace(output_stream_id, worker);
+    }
+    worker->start();
+
+    result.ok = true;
+    result.threadSlotId = worker->getThreadSlotId();
+    result.outputTopics.push_back(makeChannelTopic(
+        nat::core::StreamType::MARKER, output_stream_id,
+        nat::core::MarkerEventV1::name));
+    return result;
+}
+
+
 // ===== The marker-lane operator worker (TEC-NATKIT-105) ===================
 //
 // ONE worker for all four operators, because they are the same shape: N marker
@@ -9136,7 +9541,10 @@ bool stopGraphWorkerByOutputStreamId(uint64_t output_stream_id)
     if (stopGateWorkerByOutputStreamId(output_stream_id)) {
         return true;
     }
-    return stopMarkerOpWorkerByOutputStreamId(output_stream_id);
+    if (stopMarkerOpWorkerByOutputStreamId(output_stream_id)) {
+        return true;
+    }
+    return stopGapWorkerByOutputStreamId(output_stream_id);
 }
 
 } // namespace
@@ -12426,7 +12834,7 @@ void executeStreamGraphStart(
             pushStreamGraphStatusMessage(conn, request_id, graph.graphId);
             continue;
         }
-        if (isMarkerSourceKind(node.kind)) {
+        if (isExperimentMarkerNode(node.kind)) {
             // Recording is driven client-side (the browser runs the protocol
             // timeline and publishes the session bundle via
             // publish_session_bundle). The runtime just marks the node ready. A
@@ -12672,7 +13080,8 @@ void executeStreamGraphStart(
         // Resolved by PORT, not by "the first inbound edge": a gate's two inputs
         // are not interchangeable, and picking whichever edge happened to be
         // stored first would silently swap the signal for the cues.
-        if (node.kind == "threshold" || node.kind == "gate") {
+        if (node.kind == "threshold" || node.kind == "gate" ||
+            node.kind == "gap_detect") {
             const auto resolvePort =
                 [&](const std::string& port_id) -> ResolvedInput {
                 for (const auto& edge : graph.edges) {
@@ -12727,6 +13136,11 @@ void executeStreamGraphStart(
             CreateLaneWorkerResult create_result;
             if (node.kind == "threshold") {
                 create_result = createThresholdWorker(
+                    broker_manager, data_input.streamId.value(), identifier,
+                    node.config, input_in_process,
+                    sourceOffsetFor(data_input.streamId.value()));
+            } else if (node.kind == "gap_detect") {
+                create_result = createGapWorker(
                     broker_manager, data_input.streamId.value(), identifier,
                     node.config, input_in_process,
                     sourceOffsetFor(data_input.streamId.value()));
@@ -12785,6 +13199,8 @@ void executeStreamGraphStart(
                 std::optional<std::string>(
                     node.kind == "threshold"
                         ? "Watching for crossings; markers publish as they occur."
+                        : node.kind == "gap_detect"
+                        ? "Watching for dropouts; silence publishes a marker."
                         : "Gating data on its marker window.")};
             status.outputTopics = create_result.outputTopics;
             if (!commitNodeStatus(
@@ -13480,7 +13896,8 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
         }
         const auto& kind = search->second->kind;
         if (kind != "transform" && kind != "combine" && kind != "threshold" &&
-            kind != "gate" && !isMarkerOperatorKind(kind)) {
+            kind != "gate" && kind != "gap_detect" &&
+            !isMarkerOperatorKind(kind)) {
             continue;
         }
         const auto out_search = output_stream_ids.find(affected_id);
@@ -13624,8 +14041,9 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                     status.outputTopics = create_result.outputTopics;
                 }
             }
-        } else if (node.kind == "threshold" || node.kind == "gate") {
-            // Restart applies a new level/dwell/window in place. The detector
+        } else if (node.kind == "threshold" || node.kind == "gate" ||
+                   node.kind == "gap_detect") {
+            // Restart applies a new level/dwell/window/gap in place. The detector
             // and the gate both carry state (a pending candidate, an open
             // window, buffered frames), and that state belongs to the old
             // settings, so it is discarded with the old worker rather than
@@ -13662,6 +14080,10 @@ void StreamViewerWebSocket::handleRestartStreamGraphNode(
                 bool resolved = true;
                 if (node.kind == "threshold") {
                     create_result = createThresholdWorker(
+                        broker_manager_, data_input.value(), identifier,
+                        node.config, false, -1);
+                } else if (node.kind == "gap_detect") {
+                    create_result = createGapWorker(
                         broker_manager_, data_input.value(), identifier,
                         node.config, false, -1);
                 } else {
