@@ -294,4 +294,64 @@ TEST(ChannelActivityPerInput, InputsDoNotShareState)
     EXPECT_EQ(second.snapshot(1'100'000).total, 1U);
 }
 
+// --- wall-clock liveness (TEC-NATKIT-123) ---------------------------------
+
+// ⚠️ THE BUG THIS EXISTS FOR. Staleness was measured against the graph's own
+// newest event, so when EVERY lane stopped at the same moment none was stale
+// relative to any other and the strips kept reporting their last known rates.
+// A board whose feeds had been dead two and a half hours still read "50.0/s".
+//
+// The data clock cannot answer "is this still alive" — that is a question about
+// the transport, and it needs the wall clock, exactly as
+// classifyTransformWorkerStatus already does for worker state.
+TEST(ChannelActivityLiveness, ADeadLaneIsDetectableEvenWhenEveryLaneIsEquallyDead)
+{
+    ChannelActivity fast;
+    ChannelActivity slow;
+    fast.record(1'000'000);
+    slow.record(1'000'000);
+
+    const uint64_t axis = 1'000'000;
+    const auto a = fast.snapshot(axis);
+    const auto b = slow.snapshot(axis);
+
+    // Relative to each other these two look perfectly healthy — which is the
+    // whole trap: neither is stale, and both report a rate.
+    EXPECT_GT(a.total, 0U);
+    EXPECT_GT(b.total, 0U);
+    EXPECT_EQ(a.baseUs, b.baseUs);
+
+    // The wall-clock stamp is what distinguishes "alive" from "stopped at the
+    // same time as everything else".
+    EXPECT_GT(a.lastSeenWallUs, 0U);
+    EXPECT_GT(b.lastSeenWallUs, 0U);
+    const uint64_t now = nat::tools::nowWallUs();
+    EXPECT_LE(a.lastSeenWallUs, now);
+    // Just recorded, so the lane is young by the wall clock.
+    EXPECT_LT(now - a.lastSeenWallUs, 5'000'000U);
+}
+
+// A lane that never recorded anything reports 0 rather than a spurious "now",
+// so "never started" stays distinguishable from "started and stopped".
+TEST(ChannelActivityLiveness, AnUntouchedLaneHasNoWallClockStamp)
+{
+    ChannelActivity activity;
+    EXPECT_EQ(activity.snapshot(1'000'000).lastSeenWallUs, 0U);
+}
+
+// ⚠️ Stamped on every record, not only when the DATA clock advances. A producer
+// replaying old timestamps, or one whose device clock has not ticked, is still
+// alive and must not be reported as dead.
+TEST(ChannelActivityLiveness, TheStampAdvancesEvenWhenTheDataClockDoesNot)
+{
+    ChannelActivity activity;
+    activity.record(5'000'000);
+    const uint64_t first = activity.snapshot(5'000'000).lastSeenWallUs;
+    // An older timestamp, inside the window: the data clock goes nowhere.
+    activity.record(4'900'000);
+    const uint64_t second = activity.snapshot(5'000'000).lastSeenWallUs;
+    EXPECT_GE(second, first);
+    EXPECT_EQ(activity.snapshot(5'000'000).baseUs, 5'000'000U);
+}
+
 }  // namespace

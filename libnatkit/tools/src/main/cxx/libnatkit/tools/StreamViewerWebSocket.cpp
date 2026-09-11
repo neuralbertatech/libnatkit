@@ -2102,6 +2102,13 @@ inline nlohmann::json activityToJson(const nat::tools::ActivitySnapshot& activit
     json["bucket_us"] = activity.bucketUs;
     json["base_us"] = std::to_string(activity.baseUs);
     json["total"] = activity.total;
+    // ⚠️ The ONE wall-clock field. Everything else here is data-clock, which is
+    // right for positioning a marble and useless for "is this lane still
+    // alive": staleness used to be relative to the graph's own newest event, so
+    // a board where EVERY lane died together reported its last known rates
+    // indefinitely (TEC-NATKIT-123). Compared against the status message's
+    // `now_us` this says the truth.
+    json["last_seen_wall_us"] = std::to_string(activity.lastSeenWallUs);
     if (activity.mode == nat::tools::ActivityMode::Exact) {
         json["mode"] = "exact";
         json["offsets_us"] = activity.offsetsUs;
@@ -12634,6 +12641,9 @@ void pushStreamGraphStatusMessage(
     }
     nlohmann::json response;
     response["type"] = "stream_graph_status";
+    // The backend's clock, so a lane's wall-clock heartbeat is compared
+    // against the clock that stamped it rather than the browser's.
+    response["now_us"] = std::to_string(nat::tools::nowWallUs());
     response["request_id"] = request_id;
     response["graph_id"] = graph_id;
     response["status"] = nlohmann::json::object();
@@ -15680,6 +15690,9 @@ void StreamViewerWebSocket::sendStreamGraphStatus(
 {
     nlohmann::json response;
     response["type"] = "stream_graph_status";
+    // The backend's clock, so a lane's wall-clock heartbeat is compared
+    // against the clock that stamped it rather than the browser's.
+    response["now_us"] = std::to_string(nat::tools::nowWallUs());
     response["request_id"] = request_id;
     response["graph_id"] = graph_id;
     response["status"] = nlohmann::json::object();
