@@ -8640,6 +8640,14 @@ public:
     {
         return dataActivity.snapshot(dataActivity.newestUs());
     }
+    // Frames IN against spans OUT (TEC-NATKIT-121). A gate that never opens
+    // and a gate whose upstream died are the same empty output row; only the
+    // input row above it tells them apart.
+    std::vector<NamedActivitySnapshot> getInputActivities() const
+    {
+        return {NamedActivitySnapshot{
+            "in", inputActivity.snapshot(inputActivity.newestUs())}};
+    }
 private:
     void run()
     {
@@ -8680,6 +8688,12 @@ private:
                             dataSourceStreamId);
                         if (normalized.has_value()) {
                             gate.pushFrame(normalized.value());
+                            // Frames IN, against spans OUT. A gate that
+                            // never opens and one whose upstream died are
+                            // the same empty output row; only the input
+                            // row above it tells them apart.
+                            inputActivity.record(
+                                normalized.value().deviceTsUs);
                         }
                     }
                 }
@@ -8767,6 +8781,7 @@ private:
     GateWorkerSettings settings{};
     nat::tools::SampleGate<NormalizedNumericChannelFrame> gate;
     nat::tools::ChannelActivity dataActivity{};
+    nat::tools::ChannelActivity inputActivity{};
     uint64_t outputSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -8795,6 +8810,11 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGateWorkerSnapshot(
         search->second->getFramesDropped(),
         std::string{},
         search->second->getDataActivity(),
+        // ⚠️ markerActivity explicitly, even though a gate has no marker OUTPUT
+        // lane: these are POSITIONAL aggregate initialisers, so omitting it put
+        // the input rows into the marker lane's slot.
+        nat::tools::ActivitySnapshot{},
+        search->second->getInputActivities(),
     };
 }
 
@@ -9009,6 +9029,14 @@ public:
     {
         return markerActivity.snapshot(markerActivity.newestUs());
     }
+    // Frames IN against gap markers OUT. A healthy detector is a dense input
+    // row above an empty output one -- 'watching, nothing to report' -- which
+    // is a different picture from a dead upstream (TEC-NATKIT-121).
+    std::vector<NamedActivitySnapshot> getInputActivities() const
+    {
+        return {NamedActivitySnapshot{
+            "in", inputActivity.snapshot(inputActivity.newestUs())}};
+    }
 
 private:
     void run()
@@ -9036,6 +9064,10 @@ private:
                 if (!normalized.has_value()) continue;
 
                 const auto& frame = normalized.value();
+                // Every frame in, so a healthy detector is a DENSE input row
+                // above an empty marker row -- 'watching, nothing to report'
+                // -- rather than a bare `quiet` that looks like a dead node.
+                inputActivity.record(frame.deviceTsUs);
                 const auto gap = detector.push(
                     frame.deviceTsUs, frame.sampleRateHz,
                     frame.samplesPerChannel, frame.seqNo);
@@ -9092,6 +9124,7 @@ private:
     nat::tools::GapConfig gapConfig{};
     nat::tools::GapDetector detector;
     nat::tools::ChannelActivity markerActivity{};
+    nat::tools::ChannelActivity inputActivity{};
     uint64_t markerSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -9121,6 +9154,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGapWorkerSnapshot(
         std::string{},
         nat::tools::ActivitySnapshot{},
         search->second->getMarkerActivity(),
+        search->second->getInputActivities(),
     };
 }
 
@@ -9344,6 +9378,23 @@ public:
     {
         return markerActivity.snapshot(markerActivity.newestUs());
     }
+    // Markers IN, and for the rejecting kinds the ones DROPPED, so the card
+    // shows what a filter or a debounce actually did rather than only what
+    // survived it (TEC-NATKIT-121). The rejected row is omitted for kinds
+    // that reject nothing — merge passes everything through.
+    std::vector<NamedActivitySnapshot> getInputActivities() const
+    {
+        std::vector<NamedActivitySnapshot> rows;
+        rows.push_back(NamedActivitySnapshot{
+            "in", inputActivity.snapshot(inputActivity.newestUs())});
+        if (settings.kind == "marker_filter" ||
+            settings.kind == "marker_debounce") {
+            rows.push_back(NamedActivitySnapshot{
+                "dropped",
+                rejectedActivity.snapshot(rejectedActivity.newestUs())});
+        }
+        return rows;
+    }
 private:
     void run()
     {
@@ -9401,6 +9452,12 @@ private:
 
     void consume(size_t lane, const nat::core::MarkerEventV1& marker)
     {
+        // ⚠️ HERE, not in each branch: every kind consumes markers, and the
+        // in:out ratio is the reading for all of them. A filter matching
+        // nothing and a filter whose upstream died are the same empty output
+        // row; only the input row above it tells them apart (TEC-NATKIT-121).
+        inputActivity.record(marker.getEmittedAtUs());
+
         if (settings.kind == "marker_filter") {
             nat::tools::MarkerEventView view;
             view.atUs = marker.getEmittedAtUs();
@@ -9411,6 +9468,7 @@ private:
                 publish(marker);
             } else {
                 dropped.fetch_add(1);
+                rejectedActivity.record(marker.getEmittedAtUs());
             }
             return;
         }
@@ -9419,6 +9477,7 @@ private:
                 publish(marker);
             } else {
                 dropped.store(debounce.suppressed());
+                rejectedActivity.record(marker.getEmittedAtUs());
             }
             return;
         }
@@ -9473,6 +9532,8 @@ private:
     nat::tools::MarkerMerge<nat::core::MarkerEventV1> merge;
     nat::tools::MarkerTakeUntil<nat::core::MarkerEventV1> takeUntil{};
     nat::tools::ChannelActivity markerActivity{};
+    nat::tools::ChannelActivity inputActivity{};
+    nat::tools::ChannelActivity rejectedActivity{};
     uint64_t outputSeqNo = 0;
     std::atomic<bool> active{false};
     std::atomic<uint64_t> startedAtUs{0};
@@ -9502,6 +9563,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveMarkerOpWorkerSnapshot(
         std::string{},
         nat::tools::ActivitySnapshot{},
         search->second->getMarkerActivity(),
+        search->second->getInputActivities(),
     };
 }
 
