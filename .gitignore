@@ -2,7 +2,12 @@
 .idea
 *.log
 tmp/
-build/
+# ⚠️ build*/ rather than build/. A plain `build/` let build-codex/ escape, and
+# 1450 generated files -- CMake caches, compiler-probe a.out binaries, vendored
+# third-party checkouts, _deps -- were tracked for long enough that Syncthing
+# deleted 622 of them out from under git. Untracked 2026-09-11; the glob is what
+# stops the next differently-named build directory doing it again.
+build*/
 /.projectile
 #/third-party/
 .vs/
