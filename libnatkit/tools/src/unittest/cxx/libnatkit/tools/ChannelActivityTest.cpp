@@ -217,4 +217,81 @@ TEST(ChannelActivityTest, TheExactCapIsTheModeBoundary)
         ActivityMode::Density);
 }
 
+// --- per-input rows (TEC-NATKIT-119) -------------------------------------
+
+// ⚠️ THE CASE THE INPUT ROWS EXIST FOR. Before this, a node reported only what
+// came OUT, so a combine whose slow input had died looked identical to one
+// running normally -- the output just got quieter, with nothing on the card
+// saying which input stopped or that one had.
+//
+// Two recorders, one per input, snapshotted against the SHARED axis (the newest
+// event either has seen, which is what the frontend resolves across the whole
+// graph). The starved one must be distinguishable from its busy sibling.
+TEST(ChannelActivityPerInput, AStarvedInputIsDistinguishableFromABusySibling)
+{
+    ChannelActivity fast;   // 400 Hz, still running
+    ChannelActivity slow;   // 20 Hz, stopped early
+
+    constexpr uint64_t kStart = 10'000'000;
+    // The slow input dies a full window before the fast one's newest frame.
+    const uint64_t slow_last = kStart + 100'000;
+    for (uint64_t at = kStart; at <= slow_last; at += 50'000) {
+        slow.record(at);
+    }
+    const uint64_t fast_last = slow_last + kActivityWindowUs + 1'000'000;
+    for (uint64_t at = kStart; at <= fast_last; at += 2'500) {
+        fast.record(at);
+    }
+
+    // One axis for both rows, exactly as the card resolves it.
+    const uint64_t axis_end = fast_last;
+    const auto busy = fast.snapshot(axis_end);
+    const auto starved = slow.snapshot(axis_end);
+
+    EXPECT_GT(busy.total, 0U);
+    // The starved row has fallen entirely out of the shared window: that is what
+    // "this input stopped" looks like, and it is a different claim from "this
+    // input is merely sparse".
+    EXPECT_EQ(starved.total, 0U);
+    EXPECT_LT(starved.baseUs, axis_end - kActivityWindowUs);
+}
+
+// A SPARSE input is not a starved one, and conflating them would make every
+// mixed-cadence graph look broken -- which is the normal case this whole epic
+// exists to support.
+TEST(ChannelActivityPerInput, ASlowButLiveInputStillReportsActivity)
+{
+    ChannelActivity fast;
+    ChannelActivity slow;
+
+    constexpr uint64_t kStart = 10'000'000;
+    const uint64_t end = kStart + 3'000'000;
+    for (uint64_t at = kStart; at <= end; at += 2'500) fast.record(at);   // 400 Hz
+    for (uint64_t at = kStart; at <= end; at += 50'000) slow.record(at);  // 20 Hz
+
+    const auto busy = fast.snapshot(end);
+    const auto sparse = slow.snapshot(end);
+
+    EXPECT_GT(sparse.total, 0U);
+    EXPECT_GT(busy.total, sparse.total);
+    // Both rows are inside the window, so both draw -- the difference the card
+    // shows is DENSITY, not presence.
+    EXPECT_GE(sparse.baseUs, end - kActivityWindowUs);
+}
+
+// Each input owns its own recorder, so one going quiet cannot drag another's
+// row down with it. Worth pinning because a single shared recorder would look
+// correct on a healthy graph and only fail in the starved case.
+TEST(ChannelActivityPerInput, InputsDoNotShareState)
+{
+    ChannelActivity first;
+    ChannelActivity second;
+    first.record(1'000'000);
+    first.record(1'100'000);
+    second.record(1'050'000);
+
+    EXPECT_EQ(first.snapshot(1'100'000).total, 2U);
+    EXPECT_EQ(second.snapshot(1'100'000).total, 1U);
+}
+
 }  // namespace
