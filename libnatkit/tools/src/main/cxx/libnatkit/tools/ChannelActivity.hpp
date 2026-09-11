@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -79,7 +80,26 @@ struct ActivitySnapshot {
     std::vector<uint32_t> buckets{};
     // Events in the window, exact in both modes.
     uint64_t total = 0;
+    // ⚠️ WALL CLOCK, and the only field here that is. Everything else is on the
+    // data clock, which is right for POSITIONING a marble but cannot answer
+    // "is this lane still alive". Staleness was measured relative to the
+    // graph's own newest event, so when every lane died together none was stale
+    // relative to any other and a completely dead board kept reporting its last
+    // known rates -- 50/s, two and a half hours after the feed stopped
+    // (TEC-NATKIT-123). Compared against `nowWallUs()` this says the truth.
+    // 0 when the lane has never recorded anything.
+    uint64_t lastSeenWallUs = 0;
 };
+
+// The wall clock, for staleness only. Deliberately NOT used to position
+// anything: a replay must draw identically to the live run it recorded.
+inline uint64_t nowWallUs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 
 // Records event times and answers "what happened in the last N seconds".
 //
@@ -116,6 +136,9 @@ public:
         if (at_us > newestUs_) {
             newestUs_ = at_us;
         }
+        // Stamped on every record, not only when the data clock advances: a
+        // producer replaying old timestamps is still alive.
+        lastSeenWallUs_ = nowWallUs();
     }
 
     // `now_us` is the time the strip is being drawn AT — on the data clock, not
@@ -126,6 +149,7 @@ public:
         const std::lock_guard<std::mutex> lock(mutex_);
         ActivitySnapshot out;
         out.baseUs = newestUs_;
+        out.lastSeenWallUs = lastSeenWallUs_;
         if (newestUs_ == 0) {
             return out;  // nothing has ever been recorded
         }
@@ -189,6 +213,7 @@ private:
     size_t recentHead_ = 0;
     size_t recentCount_ = 0;
     uint64_t newestUs_ = 0;
+    uint64_t lastSeenWallUs_ = 0;
 };
 
 }  // namespace nat::tools
