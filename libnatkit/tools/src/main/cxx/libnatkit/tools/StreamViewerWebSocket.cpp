@@ -2042,6 +2042,25 @@ struct StreamGraphOutputTopic {
     std::string schemaName{};
 };
 
+// One INPUT's marble-strip activity, named by the port it arrived on
+// (TEC-NATKIT-119).
+//
+// ⚠️ WITHOUT THIS A NODE CARD CANNOT EXPLAIN ITSELF. Both existing lanes are
+// recorded at EMISSION, so a card could only ever say "something came out at
+// these times" -- the identical picture whether the node is a zip, a filter or
+// a threshold. ChannelActivity.hpp's own header promises that "a starved input
+// shows as a nearly empty row beside a dense one" and that a misaligning
+// combine "shows as two input rows whose marbles do not line up above the
+// output row"; neither was possible, because there were no input rows at all.
+//
+// The port id is carried rather than an index so the renderer can label the row
+// with the same name the edge uses, and so a variadic combine's rows survive an
+// input being added or removed.
+struct NamedActivitySnapshot {
+    std::string portId{};
+    nat::tools::ActivitySnapshot activity{};
+};
+
 struct StreamGraphNodeRuntimeStatus {
     std::string state{"draft"};
     std::optional<uint64_t> outputStreamId{};
@@ -2066,6 +2085,11 @@ struct StreamGraphNodeRuntimeStatus {
     // drawing an empty row for one would claim its markers had stopped.
     nat::tools::ActivitySnapshot dataActivity{};
     nat::tools::ActivitySnapshot markerActivity{};
+    // One row per INPUT (TEC-NATKIT-119), so a strip can draw what went in
+    // against what came out. Empty for nodes that have no inputs to report.
+    // ⚠️ Kept LAST, like framesDropped/joinPolicy before it, so the existing
+    // positional aggregate initializers keep compiling.
+    std::vector<NamedActivitySnapshot> inputActivities{};
 };
 
 // One lane's activity as the wire sees it. Offsets and buckets are relative to
@@ -2127,6 +2151,11 @@ struct LiveTransformWorkerSnapshot {
     // drawing an empty row for one would claim its markers had stopped.
     nat::tools::ActivitySnapshot dataActivity{};
     nat::tools::ActivitySnapshot markerActivity{};
+    // One row per INPUT (TEC-NATKIT-119), so a strip can draw what went in
+    // against what came out. Empty for nodes that have no inputs to report.
+    // ⚠️ Kept LAST, like framesDropped/joinPolicy before it, so the existing
+    // positional aggregate initializers keep compiling.
+    std::vector<NamedActivitySnapshot> inputActivities{};
 };
 
 std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
@@ -2430,6 +2459,21 @@ void to_json(nlohmann::json& json, const StreamGraphNodeRuntimeStatus& value)
     if (value.markerActivity.total > 0) {
         json["marker_activity"] = activityToJson(value.markerActivity);
     }
+    // Per-input rows (TEC-NATKIT-119). A row is emitted even when its total is
+    // 0, unlike the output lanes above -- ⚠️ this is the opposite rule on
+    // purpose. An absent OUTPUT lane means "this node has no such lane"; an
+    // input that has gone silent is the single most important thing a strip can
+    // show, so dropping it would erase exactly the starved-input case the rows
+    // exist to reveal.
+    if (!value.inputActivities.empty()) {
+        nlohmann::json rows = nlohmann::json::array();
+        for (const auto& input : value.inputActivities) {
+            nlohmann::json row = activityToJson(input.activity);
+            row["port_id"] = input.portId;
+            rows.push_back(std::move(row));
+        }
+        json["input_activities"] = std::move(rows);
+    }
     if (value.message.has_value()) {
         json["message"] = value.message.value();
     }
@@ -2650,6 +2694,7 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
             status.joinPolicy = live_worker->joinPolicy;
             status.dataActivity = live_worker->dataActivity;
             status.markerActivity = live_worker->markerActivity;
+            status.inputActivities = live_worker->inputActivities;
             status.state =
                 classifyTransformWorkerStatus(1, status.lastFrameAtUs);
         }
@@ -7327,6 +7372,14 @@ public:
           joinConfig(join_config),
           joiner(this->inputs.size(), join_config)
     {
+        // Sized here rather than in the member list: the member is declared
+        // after `joiner`, and one recorder per data input is what lets the card
+        // draw a starved lane beside a busy one (TEC-NATKIT-119).
+        inputActivities.reserve(this->inputs.size());
+        for (size_t index = 0; index < this->inputs.size(); ++index) {
+            inputActivities.push_back(
+                std::make_unique<nat::tools::ChannelActivity>());
+        }
     }
 
     ~CombineWorker()
@@ -7440,6 +7493,22 @@ public:
     {
         return markerActivity.snapshot(markerActivity.newestUs());
     }
+    // One row per data input, in port order (TEC-NATKIT-119). Named `in1`,
+    // `in2`, ... to match the port ids the editor gives a combine node.
+    std::vector<NamedActivitySnapshot> getInputActivities() const
+    {
+        std::vector<NamedActivitySnapshot> rows;
+        rows.reserve(inputActivities.size());
+        for (size_t index = 0; index < inputActivities.size(); ++index) {
+            if (!inputActivities[index]) continue;
+            rows.push_back(NamedActivitySnapshot{
+                "in" + std::to_string(index + 1),
+                inputActivities[index]->snapshot(
+                    inputActivities[index]->newestUs()),
+            });
+        }
+        return rows;
+    }
 private:
     std::string outputIdentifier;
     size_t slotIndex;
@@ -7460,6 +7529,13 @@ private:
     // inputs.size(), and members initialize in declaration order.
     nat::tools::CombineJoinConfig joinConfig{};
     nat::tools::CombineJoiner<NormalizedNumericChannelFrame> joiner;
+    // One activity recorder per DATA input (TEC-NATKIT-119), so the card can
+    // draw each input against the output and a starved lane is visible beside a
+    // busy one.
+    // ⚠️ unique_ptr, not a plain vector: ChannelActivity holds a std::mutex, so
+    // it is neither copyable nor movable and a vector of them cannot be sized
+    // or grown.
+    std::vector<std::unique_ptr<nat::tools::ChannelActivity>> inputActivities;
     // Combine is the one worker with BOTH lanes: it merges data and interleaves
     // markers, and the strip showing them as two rows is how a marker lane's
     // behaviour becomes visible at all.
@@ -7566,6 +7642,15 @@ private:
                         continue;
                     }
                     joiner.push(input_index, normalized.value());
+                    // Recorded on the frame's OWN clock, like every other
+                    // temporal decision in the graph (STREAM_CONTRACT clause 4),
+                    // so an input row and the output row below it are drawn on
+                    // one axis and a replay matches its live run.
+                    if (input_index < inputActivities.size() &&
+                        inputActivities[input_index]) {
+                        inputActivities[input_index]->record(
+                            normalized.value().deviceTsUs);
+                    }
                 }
 
                 // Marker lane (Part B): forward every MarkerEventV1 from each
@@ -7723,6 +7808,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
         search->second->getJoinPolicyName(),
         search->second->getDataActivity(),
         search->second->getMarkerActivity(),
+        search->second->getInputActivities(),
     };
 }
 
@@ -8178,7 +8264,16 @@ public:
     {
         return markerActivity.snapshot(markerActivity.newestUs());
     }
+    // The input row, so the card shows frames IN against crossings OUT
+    // (TEC-NATKIT-119). One row, named for the node's single input port.
+    std::vector<NamedActivitySnapshot> getInputActivities() const
+    {
+        return {NamedActivitySnapshot{
+            "in", inputActivity.snapshot(inputActivity.newestUs())}};
+    }
 private:
+    nat::tools::ChannelActivity inputActivity{};
+
     void run()
     {
         LOG_INFO << "StreamViewer: Starting threshold worker source="
@@ -8219,6 +8314,13 @@ private:
                             ? frame.samples[base + index]
                             : 0.0f);
                 }
+
+                // Every frame IN, not just the crossings out (TEC-NATKIT-119).
+                // The in:out ratio is the whole reading for a threshold: a level
+                // sitting in the noise floor fires constantly and one above the
+                // signal never fires, and both are invisible from the marker row
+                // alone.
+                inputActivity.record(frame.deviceTsUs);
 
                 const auto crossings =
                     detector.push(frame.deviceTsUs, frame.sampleRateHz, channel);
@@ -8309,6 +8411,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveThresholdWorkerSnapshot(
         std::string{},
         nat::tools::ActivitySnapshot{},
         search->second->getMarkerActivity(),
+        search->second->getInputActivities(),
     };
 }
 
