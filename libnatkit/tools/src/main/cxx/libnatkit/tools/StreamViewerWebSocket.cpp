@@ -10,6 +10,7 @@
 #include "MarkerOps.hpp"
 #include "GapDetect.hpp"
 #include "ChannelActivity.hpp"
+#include "WorkerLiveness.hpp"
 #include "CohortExport.hpp"
 #include "DeviceHealth.hpp"
 #include "DeviceControls.hpp"
@@ -136,7 +137,27 @@ std::string classifyTransformWorkerStatus(
     const uint64_t current_us = nowUs();
     const uint64_t age_us =
         current_us > last_heartbeat_us ? current_us - last_heartbeat_us : 0;
-    return age_us >= 3'000'000ULL ? "stalled" : "live";
+    return age_us >= nat::tools::kWorkerStallUs ? "stalled" : "live";
+}
+
+// The per-NODE classifier (TEC-NATKIT-116). The pool-wide function above asks
+// only "has anything come out", which is the right question for a slot pool and
+// the wrong one for a node: WorkerLiveness.hpp owns that decision and is
+// unit-tested against an injected clock.
+std::string classifyGraphNodeStatus(
+    uint64_t last_output_at_wall_us,
+    uint64_t last_input_at_wall_us,
+    uint64_t started_at_wall_us,
+    bool silence_is_normal,
+    bool has_input_signal)
+{
+    return nat::tools::classifyGraphNodeStatusAt(
+        nat::tools::nowWallUs(),
+        last_output_at_wall_us,
+        last_input_at_wall_us,
+        started_at_wall_us,
+        silence_is_normal,
+        has_input_signal);
 }
 
 std::shared_ptr<nat::core::BasicTopicInformation> createTopicInfo(
@@ -2163,6 +2184,12 @@ struct LiveTransformWorkerSnapshot {
     // ⚠️ Kept LAST, like framesDropped/joinPolicy before it, so the existing
     // positional aggregate initializers keep compiling.
     std::vector<NamedActivitySnapshot> inputActivities{};
+    // When the worker started, wall clock (TEC-NATKIT-116). A node that has not
+    // yet had the time to emit anything is `starting`, not `stalled` -- without
+    // it every node reads stalled for the first three seconds of every run,
+    // which is how a state gets ignored. Also kept LAST, for the same reason as
+    // the three fields above.
+    uint64_t startedAtUs = 0;
 };
 
 std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
@@ -2669,6 +2696,16 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
         }
     }
 
+    // Node id -> kind, so a node's status can be judged by what that KIND owes.
+    // The statuses are keyed by the flattened node id (a composite's children
+    // arrive namespaced), which is the same id `graph.nodes` carries, so this
+    // maps one to one.
+    std::unordered_map<std::string, std::string> node_kind_by_id;
+    node_kind_by_id.reserve(graph.nodes.size());
+    for (const auto& node : graph.nodes) {
+        node_kind_by_id.emplace(node.id, node.kind);
+    }
+
     const auto runtime_search = g_stream_graph_runtime.find(graph.graphId);
     if (runtime_search != g_stream_graph_runtime.end()) {
         const auto& runtime = runtime_search->second;
@@ -2702,8 +2739,33 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
             status.dataActivity = live_worker->dataActivity;
             status.markerActivity = live_worker->markerActivity;
             status.inputActivities = live_worker->inputActivities;
-            status.state =
-                classifyTransformWorkerStatus(1, status.lastFrameAtUs);
+
+            // Is anything still ARRIVING? The newest wall-clock stamp across
+            // this node's input lanes -- the signal TEC-NATKIT-119 put there.
+            // A lane that never recorded anything reports 0 and is skipped, so
+            // one dead lane beside a live one does not read as a dead node.
+            uint64_t last_input_at_wall_us = 0;
+            bool has_input_signal = false;
+            for (const auto& input : live_worker->inputActivities) {
+                if (input.activity.lastSeenWallUs == 0) {
+                    continue;
+                }
+                has_input_signal = true;
+                last_input_at_wall_us = std::max(
+                    last_input_at_wall_us, input.activity.lastSeenWallUs);
+            }
+
+            const auto kind_search = node_kind_by_id.find(entry.first);
+            const bool silence_is_normal =
+                kind_search != node_kind_by_id.end() &&
+                nat::tools::silenceIsNormalKind(kind_search->second);
+
+            status.state = classifyGraphNodeStatus(
+                status.lastFrameAtUs,
+                last_input_at_wall_us,
+                live_worker->startedAtUs,
+                silence_is_normal,
+                has_input_signal);
         }
 
         std::string derived_run_state = runtime.runState;
@@ -2719,7 +2781,14 @@ nlohmann::json makeGraphStatusJson(const StreamGraphDefinition& graph)
                 has_stalled_node = true;
             } else if (state == "starting") {
                 has_starting_node = true;
-            } else if (state == "running" || state == "valid") {
+            } else if (state == "running" || state == "valid" ||
+                       state == "live") {
+                // ⚠️ "live" BELONGS HERE. A transform worker says `live` where a
+                // source says `running` (graphRunStateLabel folds the two for
+                // display), so a graph whose transforms were all healthy could
+                // fall through every branch and derive `stopped` while data was
+                // flowing -- the same dialect split that made TEC-NATKIT-127
+                // style half the nodes muted.
                 has_running_node = true;
             }
         }
@@ -7005,6 +7074,15 @@ std::optional<LiveTransformWorkerSnapshot> getLiveTransformWorkerSnapshot(
         0,
         std::string{},
         search->second->getDataActivity(),
+        // ⚠️ POSITIONAL. markerActivity and inputActivities are spelled out
+        // rather than defaulted, because startedAtUs sits after them and
+        // omitting either would slide the start time into the wrong field.
+        // A plain transform genuinely has neither: no marker output lane, and
+        // no per-input activity -- it owes one output per input, so its
+        // liveness is readable from its output alone (TEC-NATKIT-116).
+        nat::tools::ActivitySnapshot{},
+        std::vector<NamedActivitySnapshot>{},
+        search->second->getStartedAtUs(),
     };
 }
 
@@ -7816,6 +7894,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveCombineWorkerSnapshot(
         search->second->getDataActivity(),
         search->second->getMarkerActivity(),
         search->second->getInputActivities(),
+        search->second->getStartedAtUs(),
     };
 }
 
@@ -8419,6 +8498,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveThresholdWorkerSnapshot(
         nat::tools::ActivitySnapshot{},
         search->second->getMarkerActivity(),
         search->second->getInputActivities(),
+        search->second->getStartedAtUs(),
     };
 }
 
@@ -8815,6 +8895,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGateWorkerSnapshot(
         // the input rows into the marker lane's slot.
         nat::tools::ActivitySnapshot{},
         search->second->getInputActivities(),
+        search->second->getStartedAtUs(),
     };
 }
 
@@ -9155,6 +9236,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveGapWorkerSnapshot(
         nat::tools::ActivitySnapshot{},
         search->second->getMarkerActivity(),
         search->second->getInputActivities(),
+        search->second->getStartedAtUs(),
     };
 }
 
@@ -9564,6 +9646,7 @@ std::optional<LiveTransformWorkerSnapshot> getLiveMarkerOpWorkerSnapshot(
         nat::tools::ActivitySnapshot{},
         search->second->getMarkerActivity(),
         search->second->getInputActivities(),
+        search->second->getStartedAtUs(),
     };
 }
 
